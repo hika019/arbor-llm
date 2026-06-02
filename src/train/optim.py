@@ -18,10 +18,16 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
     wd = cfg.get("weight_decay", 0.0)
 
     if name == "bnb_adamw_8bit":
-        import bitsandbytes as bnb
-        return bnb.optim.AdamW8bit(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+        try:
+            import bitsandbytes as bnb
+            return bnb.optim.AdamW8bit(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+        except ImportError:
+            # bnb 不在環境では fused AdamW にフォールバック (smoke / CPU 用).
+            print("[optim] bitsandbytes 未導入: AdamW(fused) にフォールバック")
+            name = "adamw_fused"
     if name == "adamw_fused":
-        return torch.optim.AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=wd, fused=True)
+        fused = torch.cuda.is_available()
+        return torch.optim.AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=wd, fused=fused)
     raise ValueError(f"unknown optimizer: {name}")
 
 

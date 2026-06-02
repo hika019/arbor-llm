@@ -62,4 +62,8 @@ def build_arbor_blt(cfg: dict[str, Any]) -> nn.Module:
     except ImportError:
         # BLT 未取り込み時は stub で smoke test 可能にする
         print("[arbor_blt] BLT 未取り込み: stub モデルで起動")
-        return _StubArborBLT(cfg)
+        model = _StubArborBLT(cfg)
+        if cfg.get("bitlinear_in_global", False):
+            n = swap_linear_to_bitlinear(model.body, skip_names=("embed",))
+            print(f"[arbor_blt] stub の body 内 nn.Linear を BitLinear に置換: {n} 層")
+        return model

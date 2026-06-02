@@ -51,11 +51,12 @@ class _BitLinearSTE(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         x, w = ctx.saved_tensors
-        # STE: treat quantizer as identity for gradient
-        grad_x = grad_out @ w
-        grad_w = grad_out.transpose(-1, -2) @ x if grad_out.dim() == 2 else (
-            grad_out.reshape(-1, grad_out.size(-1)).t() @ x.reshape(-1, x.size(-1))
-        )
+        # STE: 量子化を恒等視して勾配を素通し. autocast 由来の dtype 混在を吸収する.
+        g = grad_out.to(w.dtype)
+        grad_x = (g @ w).to(x.dtype)
+        flat_g = g.reshape(-1, g.size(-1))
+        flat_x = x.reshape(-1, x.size(-1)).to(w.dtype)
+        grad_w = flat_g.t() @ flat_x
         return grad_x, grad_w
 
 
@@ -72,8 +73,11 @@ class BitLinear(nn.Module):
             raise ValueError("BitLinear is bias-free (matches BitNet b1.58 spec).")
         self.in_features = in_features
         self.out_features = out_features
-        # BF16 shadow weight is the trainable master copy.
+        # BF16 シャドウ重みを master とする (学習対象).
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16))
+        # 一部の nn 標準モジュール (MultiheadAttention 等) が .bias を直接参照するため
+        # nn.Linear と同じ属性を None で公開する.
+        self.register_parameter("bias", None)
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

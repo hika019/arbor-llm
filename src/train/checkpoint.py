@@ -153,17 +153,24 @@ class CheckpointManager:
         if missing or unexpected:
             print(f"[checkpoint] missing={len(missing)} unexpected={len(unexpected)}")
 
+        # weights_only=False: RNG/dataloader/optimizer は pickle 由来の Python オブジェクトを含む
         if optimizer is not None and (ckpt_dir / "optimizer.pt").exists():
-            optimizer.load_state_dict(torch.load(ckpt_dir / "optimizer.pt", map_location=map_location))
+            optimizer.load_state_dict(
+                torch.load(ckpt_dir / "optimizer.pt", map_location=map_location, weights_only=False)
+            )
         if scheduler is not None and (ckpt_dir / "scheduler.pt").exists():
-            scheduler.load_state_dict(torch.load(ckpt_dir / "scheduler.pt", map_location=map_location))
+            scheduler.load_state_dict(
+                torch.load(ckpt_dir / "scheduler.pt", map_location=map_location, weights_only=False)
+            )
 
         if (ckpt_dir / "rng.pt").exists():
-            _restore_rng(torch.load(ckpt_dir / "rng.pt", map_location="cpu"))
+            _restore_rng(torch.load(ckpt_dir / "rng.pt", map_location="cpu", weights_only=False))
 
         dataloader_state = None
         if (ckpt_dir / "dataloader.pt").exists():
-            dataloader_state = torch.load(ckpt_dir / "dataloader.pt", map_location="cpu")
+            dataloader_state = torch.load(
+                ckpt_dir / "dataloader.pt", map_location="cpu", weights_only=False
+            )
 
         meta = CheckpointMeta.from_dict(json.loads((ckpt_dir / "meta.json").read_text()))
         return meta, dataloader_state

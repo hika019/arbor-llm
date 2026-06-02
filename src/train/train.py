@@ -151,7 +151,8 @@ def main() -> int:
             cur_loss = accum_loss
             accum_loss = 0.0
 
-            # 定期 / best / 中断要求 / 最終 step のいずれかでセーブ
+            # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
+            # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
             is_best = cur_loss < best_loss
             if is_best:
                 best_loss = cur_loss
@@ -159,7 +160,6 @@ def main() -> int:
                 global_step % save_every == 0
                 or stop.requested
                 or global_step >= total_steps
-                or is_best
             )
             if should_save:
                 meta = CheckpointMeta(
