@@ -121,8 +121,14 @@ def build_arbor_blt(cfg: dict[str, Any]) -> nn.Module:
         print(f"[arbor_blt] BLT 構築に失敗 ({type(e).__name__}: {e}). stub にフォールバック.")
         return build_arbor_blt({**cfg, "backend": "stub"})
 
+    # BitNet 2B4T 整合: SwiGLU を ReLU² に差し替え (Global のみ)
+    if cfg.get("relu2_ffn_in_global", True):
+        from src.model.ffn import swap_swiglu_to_relu2
+        n_ffn = swap_swiglu_to_relu2(blt.global_transformer)
+        print(f"[arbor_blt] BLT global の SwiGLU を ReLU² FFN に置換: {n_ffn} 層")
+
     if cfg.get("bitlinear_in_global", False):
         gt = blt.global_transformer
         n = swap_linear_to_bitlinear(gt, skip_names=("output", "embed", "tok_embeddings"))
-        print(f"[arbor_blt] BLT global_transformer の Linear を BitLinear に置換: {n} 層")
+        print(f"[arbor_blt] BLT global の Linear を BitLinear に置換: {n} 層")
     return _BLTWrapper(blt)
