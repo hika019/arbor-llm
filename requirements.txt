@@ -1,0 +1,27 @@
+# PyTorch (install separately with CUDA index-url):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# torch>=2.3 is assumed but intentionally not pinned here.
+
+# core
+transformers>=4.44
+accelerate>=0.33
+datasets>=2.20
+safetensors>=0.4.3
+bitsandbytes>=0.43
+sentencepiece>=0.2.0
+
+# flash-attn requires `pip install packaging ninja` first, and matching CUDA toolkit
+packaging
+ninja
+# flash-attn>=2.6  # uncomment after toolchain is verified
+
+# logging / utils
+wandb>=0.17
+pyyaml>=6.0
+tqdm>=4.66
+numpy>=1.26
+rich>=13.7
+
+# dev
+pytest>=8.2
+ruff>=0.6

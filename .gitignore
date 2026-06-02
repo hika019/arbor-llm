@@ -1,0 +1,34 @@
+# venv
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# checkpoints / data
+checkpoints/
+wandb/
+data/
+*.safetensors
+*.pt
+*.bin
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+nohup.out
+
+# BLT は third_party/blt 配下に独立 git リポジトリとして clone 済み。
+# サブモジュール化していないので親リポジトリからは無視する。
+third_party/blt/
