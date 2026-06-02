@@ -1,90 +1,85 @@
-# 再起後の続き
+# 次の続き (2026-06-03 更新)
 
 ## 環境立ち上げ
 ```bash
 cd /mnt/d/develop/arbor-llm
-source scripts/env.sh    # venv + micromamba gcc + PYTHONPATH 一発設定
+source scripts/env.sh    # venv + micromamba gcc + PYTHONPATH + expandable_segments
 ```
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` を env.sh と各エントリ
+  (train/bench/check_fallback) の torch import 前に設定済み (VRAM 断片化抑止)。
+- System Memory Fallback は OFF 確定 (超過確保は WSL2 では device-not-ready で失敗)。
 
-## 直前までの状態（コミット履歴）
-```
-b5ff535 FineWeb-Edu streaming + 8bit Adam + 200 step + 1B 試算
-8aaddcc 実 BLT × BitLinear smoke
-c476451 end-to-end smoke (train+resume+eval+SIGINT)
-bd0cd9f initial skeleton
-```
-未コミット: ReLU² FFN (`src/model/ffn.py`)、`arbor_blt.py` の swap 統合、
-bench_1b.py の変更、scripts/size_1b.py。先に一度コミットすると良い。
-
-## 直前までの実測 (RTX 4090, 1B BLT × BitLinear, seq=2048)
+## 確定した実測 (RTX 4090, 1B BLT × BitLinear, seq=2048, grad_ckpt+sdpa)
 | 設定 | tok/s | VRAM |
 |---|---|---|
-| sdpa + grad_ckpt + bs=1 | 9.6k | 5.54 GB |
-| sdpa + grad_ckpt + bs=2 | 16.4k | 7.25 GB |
-| sdpa + grad_ckpt + bs=4 | 25.9k | 10.80 GB |
-| sdpa + grad_ckpt + bs=8 | **33.6k** | **18.17 GB** |
-| sdpa + bs=1 (no ckpt) | 7.0k | 5.50 GB |
-| sdpa + grad_ckpt + bs=1 + compile | 17.1k (+78%) | 5.48 GB |
-| xformers | エラー (sliding_window assert) |
-| bs=12 / compile=max-autotune | 計測中断 (ベンチ kill) |
+| no-compile bs=6 | 33.6k | 14.6 GB |
+| no-compile bs=8 | 35.5k | 18.0 GB (grad_ckpt上限近辺) |
+| **compile=default bs=8** | **59.6k** | **11.1 GB** (採用・効率最良) |
+| compile=default bs=16 | 61.9k | 18.5 GB (最速だが余裕少) |
+| compile=default bs=24 | OOM | — |
+| max-autotune | default 比 +3%のみ・autotune遅い → default 採用 |
 
-## System Memory Fallback の確認結果
-- 26 GB tensor 確保→成功 (fallback 一部効いている可能性)
-- 40 GB tensor 確保→**OOM** (driver メッセージ: "GPU 0 has a total capacity of 22.49 GiB")
-- 再起後にもう一度 `python scripts/check_fallback.py` で再確認するべき
-  (check_fallback.py をこの後作成。再起前のスクリプトを残す)
+- **torch.compile だけで +78% (33.6k→59.6k) かつ VRAM も減** → 目標 50k 達成。
+- bs=10/12/24 は容量不足。grad_ckpt 無し compile 込みの上限は bs=16 (18.5GB)。
 
-## 再起後やること（優先度順）
+## config (確定済み)
+- `arbor_1b.yaml`: compile=default, micro_batch=8, accum=8 (実効64)
+- `run_blt_fineweb.yaml`: compile=default (旧 OFF→ON), micro_batch=8
+  - compile は初回コンパイルで数分待ち。不安定なら false に戻す。
 
-### 1. fallback OFF の再確認
-```bash
-source scripts/env.sh
-python scripts/check_fallback.py
-```
-40GB が即 OOM なら OK。26GB で時間かかるようなら fallback まだ on。
+## flash-attn → 速度目的では不要 (調査結論)
+- 2.8.3 をソースビルド成功・インストール済み (venv)。
+- **SDPA(`F.scaled_dot_product_attention`) が BLT 形状(head_dim=96,bf16,causal)で
+  既に FlashAttention(FA2相当) backend を使用** (`flash_sdp_enabled=True` 確認済)。
+  → 明示 flash_attn を base_transformer に挿しても同カーネルを呼ぶだけで利得ほぼ無し。
+  base_transformer.py は sdpa/xformers/flex のみ対応 (fmha 分岐なし、追加には fork 改造要)。
+- 再検討の価値があるのは varlen packing / sliding window を入れる時だけ。
 
-### 2. 未コミットを保存
-```bash
-git -C /mnt/d/develop/arbor-llm add -A
-git -C /mnt/d/develop/arbor-llm commit -m "feat: ReLU² FFN を BLT global に統合 + 1B bench スクリプト"
-```
+## ビルド環境 (導入済み)
+- nvcc 12.0 (apt `nvidia-cuda-toolkit`), host compiler は gcc-12/g++-12。
+- flash-attn ビルド時の決まり: env.sh は使わず venv だけ activate し
+  `CUDA_HOME=/usr CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12`
+  `NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-12" FLASH_ATTN_CUDA_ARCHS=89 MAX_JOBS=1`
+  (RAM 9GB / swap 9GB なので MAX_JOBS=1 必須。env.sh の gcc15 だと nvcc12 が弾く)
 
-### 3. 1B bench 再走 (compile + bs スケーリングの境界探し)
-```bash
-python scripts/bench_1b.py --seq 2048
-```
-- bs=8 + compile=default
-- bs=8 + compile=max-autotune
-- bs=12 (fallback OFF なら境界)
+## 次にやること（優先度は目的次第）
 
-### 4. xformers attn_impl のエラー原因解消
-`local_models.py:260` で `sliding_window is not None` assert に当たる。
-回避案:
-- BLT の `LocalModelArgs` に `sliding_window=2048` を渡す
-- もしくは `attn_impl="sdpa"` で固定 (現状こちらで動作)
+### A. 学習を回したい → 実走 (FineWeb)
+- **mini 実走 (run_blt_fineweb.yaml, 200 step) 成功済み**:
+  loss 5.49→2.79 と下降、tok/s ~45k、checkpoint/正常終了 OK。
+- 次は **1B 本走** `python -m src.train.train --config configs/arbor_1b.yaml`
+  - 初回 compile の数分待ち。SIGINT で安全保存。HF は初回 shard DL + shuffle
+    buffer 充填で最初の step まで数分の CPU バウンド待ちがある (固まりではない)。
 
-### 5. cross-attention 復活トライ
-FlexAttention 必須なので, BLT 側コードを fork し
-`assert mask is None or isinstance(mask, BlockMask)` を緩める
-or BlockMask を構築する。優先度は速度最適化より下。
+#### 本走前に対処価値のある課題
+1. **torch.compile の動的形状 recompile** (mini で顕在化):
+   BLT の動的パッチング (patching_mode=space) で seq 長が毎 step 変動し、
+   dynamo が `cache_size_limit (8)` に到達して一部 eager fallback
+   (`tensor 'h' size mismatch: expected 52, actual 50`)。mini では 45k 出てるが
+   1B では効率に効く。対策候補:
+   - `torch._dynamo.config.cache_size_limit` を上げる
+   - `pad_to_max_length=True` 等で patch 数を固定
+   - `torch.compile(dynamic=True)` で動的形状を1グラフに
+2. **checkpoint prune バグは修正済み** (b952df3):
+   `_prune` の resolve 不一致で keep 対象を誤削除していた + 終了前に prune
+   daemon を join するよう修正。単体テスト PASS。
 
-### 6. 1B 本走の準備
-- packed ternary kernel (BitLinear の真の利得 8x を取りに行く)
-  現状は BF16 シャドウ→量子化→fp matmul の reference 実装。
-  microsoft/BitNet の C++ kernel を参考に CUDA kernel を書く。
-- flash-attn pip install (SDPA より 1.5-2x 期待)
-  ```bash
-  pip install flash-attn --no-build-isolation
-  ```
+#### 既知の終了時クラッシュ (無害)
+- `--dry-run` (1 step 即終了) 時のみ `PyGILState_Release` Fatal error。
+  HF datasets streaming の非同期スレッドが finalize に残るため。通常の本走
+  (200 step 完走) では発生せず、checkpoint もアトミックなので実害なし。
+
+### B. 推論・省メモリ重視 → packed ternary kernel
+- BitNet b1.58 = 重み ternary {-1,0,+1} (1.58bit)。
+- 現状は reference 実装 (bf16 シャドウ→量子化→通常 bf16 matmul、利得なし)。
+- packed kernel: ternary を ~2bit/5値1byte に詰め、乗算なし(加減算/LUT)の専用
+  CUDA kernel で matmul → VRAM ~8x減・高速。microsoft/BitNet, T-MAC 参考。
+- **注意: 学習は STE で bf16 シャドウ重み必須なので利得は主に推論/メモリ**。
+  学習スループット向上目的なら優先度低い。
 
 ## 既知の落とし穴
-- /mnt/d は Windows ファイルシステム → torch import 遅い (10-20s)
-- `tee /tmp/file.log` は block buffering で、終わるまで file は空
-- 学習中の signal は CUDA カーネルでブロックされるため、handler 起動は数 step 遅延 (許容)
-- BLT は `non_linearity="swiglu"` 固定 (param のみ。実装は `F.silu(x1)*x3` ハード) →
-  ReLU² 化は `src/model/ffn.swap_swiglu_to_relu2` で構築後に差し替える
-
-## GPU 効率の評価メモ
-- bs=8 で 33.6k tok/s → 約 50 TFLOPS → 4090 BF16 peak 165 TFLOPS の **MFU 30%**
-- 改善余地: torch.compile (×1.5-2)、flash-attn (×1.2-1.5)、packed ternary (×2-4)
-- 目標 20k tok/s は既に達成。50k tok/s が次の目安
+- /mnt/d は Windows FS → torch import 遅い (10-20s)
+- `tee` は block buffering。background は `python -u` + redirect。
+- 学習中の signal は CUDA カーネルでブロックされ handler 起動が数 step 遅延 (許容)
+- BLT は `non_linearity="swiglu"` 固定 → ReLU² は `src/model/ffn.swap_swiglu_to_relu2` で差し替え
+- WSL2 で VRAM 超過確保は OOM ではなく `device not ready` で出る
