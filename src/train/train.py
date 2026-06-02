@@ -185,6 +185,8 @@ def main() -> int:
             data_iter = iter(train_loader)
             continue
 
+    # 最終 prune の daemon スレッドが途中終了して checkpoint を部分削除しないよう待つ
+    ckpt._await_thread()
     return 0
 
 

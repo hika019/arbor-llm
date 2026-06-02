@@ -199,7 +199,7 @@ class CheckpointManager:
             link = self.root / link_name
             if link.is_symlink():
                 protected.add((self.root / os.readlink(link)).resolve())
-        protected.update(steps[-self.keep_last_k :])
+        protected.update(p.resolve() for p in steps[-self.keep_last_k :])
         # Long-term keeps: every N steps.
         if self.keep_every_n_steps:
             for p in steps:
