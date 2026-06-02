@@ -11,10 +11,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# checkpoints / data
-checkpoints/
-wandb/
-data/
+# checkpoints / data (src/data/ は除外しない: パターンを /data/ に限定)
+/checkpoints/
+/wandb/
+/data/
 *.safetensors
 *.pt
 *.bin
