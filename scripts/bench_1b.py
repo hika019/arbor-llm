@@ -15,12 +15,15 @@ import time
 import traceback
 from pathlib import Path
 
+# torch import / CUDA 初期化より前に効かせる必要がある env (env.sh と二重で保険).
+os.environ.setdefault("BLT_SUPPRESS_ATTN_ERROR", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "third_party" / "blt"))
-os.environ.setdefault("BLT_SUPPRESS_ATTN_ERROR", "1")
 
 
 def _gb(x: int) -> str:

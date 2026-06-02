@@ -47,8 +47,8 @@ speed:
   cudnn_benchmark: true
   torch_compile: true
   compile_mode: max-autotune  # 静的 shape 前提
-  micro_batch_size: 4
-  grad_accum_steps: 16        # 実効バッチ = 64
+  micro_batch_size: 6         # bench: bs=6 で 14.5GB/34.3k tok/s (bs=8 は18GB/上限近辺)
+  grad_accum_steps: 11        # 実効バッチ = 66 (旧 4×16=64 を維持)
   flash_attention: true
   fused_rmsnorm: true
   fused_swiglu: false         # FFN は squared ReLU なので未使用

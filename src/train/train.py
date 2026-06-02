@@ -18,6 +18,9 @@ import os
 import sys
 from pathlib import Path
 
+# torch import / CUDA 初期化より前に効かせる必要がある env (env.sh と二重で保険).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import yaml
 

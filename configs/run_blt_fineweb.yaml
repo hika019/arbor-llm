@@ -48,7 +48,7 @@ speed:
   cudnn_benchmark: true
   torch_compile: false       # 安定性優先で OFF (後で有効化を試す)
   compile_mode: default
-  micro_batch_size: 8
+  micro_batch_size: 6        # bench: bs=6 で 14.5GB/34.3k tok/s, 安全マージン約8GB
   grad_accum_steps: 1
   flash_attention: false
   fused_rmsnorm: false

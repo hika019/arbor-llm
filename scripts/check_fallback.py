@@ -6,7 +6,10 @@ VRAM を超える tensor 確保を試し:
 """
 from __future__ import annotations
 
+import os
 import time
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -33,6 +36,12 @@ def main() -> int:
         return 2
     except torch.cuda.OutOfMemoryError as e:
         print("OOM (期待挙動): System Memory Fallback OFF 確定")
+        print(f"  msg: {str(e)[:200]}")
+        return 0
+    except RuntimeError as e:
+        # WSL2 + expandable_segments では超過確保が cudaErrorNotReady 等の
+        # driver error になることがある. RAM へ溢れていない＝fallback OFF と判断.
+        print("RuntimeError (RAM へ溢れず失敗): System Memory Fallback OFF と判断")
         print(f"  msg: {str(e)[:200]}")
         return 0
 
