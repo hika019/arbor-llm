@@ -46,9 +46,9 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: true
-  compile_mode: max-autotune  # 静的 shape 前提
-  micro_batch_size: 6         # bench: bs=6 で 14.5GB/34.3k tok/s (bs=8 は18GB/上限近辺)
-  grad_accum_steps: 11        # 実効バッチ = 66 (旧 4×16=64 を維持)
+  compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
+  micro_batch_size: 8         # bench: compile=default bs=8 で 59.6k tok/s / 11.1GB (余裕大)
+  grad_accum_steps: 8         # 実効バッチ = 64
   flash_attention: true
   fused_rmsnorm: true
   fused_swiglu: false         # FFN は squared ReLU なので未使用

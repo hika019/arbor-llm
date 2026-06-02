@@ -46,9 +46,9 @@ speed:
   precision: bf16
   tf32_matmul: true
   cudnn_benchmark: true
-  torch_compile: false       # 安定性優先で OFF (後で有効化を試す)
-  compile_mode: default
-  micro_batch_size: 6        # bench: bs=6 で 14.5GB/34.3k tok/s, 安全マージン約8GB
+  torch_compile: true        # bench: compile=default で 33k→59k tok/s (1.8x) & VRAM減. 動作確認済
+  compile_mode: default      # 初回のみコンパイルで数分待ち. 不安定なら false に戻す
+  micro_batch_size: 8        # bench: compile=default bs=8 で 59.6k tok/s / 11.1GB
   grad_accum_steps: 1
   flash_attention: false
   fused_rmsnorm: false
