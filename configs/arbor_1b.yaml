@@ -47,7 +47,7 @@ speed:
   cudnn_benchmark: true
   torch_compile: true         # compile 有効. 初回のみコンパイル (以降キャッシュ, 再起動も inductor disk cache で短縮)
   compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
-  compile_dynamic: false      # dynamic=True は1Bで初回compile 15分超だったため static に. 形状ごとcompile (cache64で吸収)
+  compile_dynamic: true       # 1B本走実測: static は patch_lengths 形状(~200種)で recompile地獄→cache64溢れ→step20未到達. 形状非依存の dynamic に確定 (2026-06-03)
   dynamo_cache_size_limit: 64
   micro_batch_size: 8         # bench: compile=default bs=8 で 59.6k tok/s / 11.1GB (余裕大)
   grad_accum_steps: 8         # 実効バッチ = 64
