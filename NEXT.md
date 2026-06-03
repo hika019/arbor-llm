@@ -1,59 +1,93 @@
 # 次の続き (2026-06-03 更新)
 
-## ★最優先: WSL 再起動 + RAM 増設後の続き (1B 本走)
+## ★解決済み: 1B 本走 起動成功 (RAM 17GB + dynamic compile)
 
-### 経緯 (なぜ中断したか)
-1B 本走 (arbor_1b.yaml) 起動を試みたが **RAM 9GB がボトルネック**で頓挫:
-1. `num_workers=4 + shuffle_buffer 10000 + persistent_workers` → 各 worker が
-   バッファ複製で RAM 9GB 枯渇 → swap thrashing で step 0。
-   → 暫定で `num_workers=0, shuffle_buffer 4000` に下げ枯渇は解消。
-2. torch.compile 初回コンパイルが激重 (**dynamic=True で 15分超でも step 1 出ず**)。
-   原因疑い: inductor が **20 並列** (`TORCHINDUCTOR_COMPILE_THREADS` 既定=min(32,コア20))
-   で C++ コンパイラ起動 → RAM 枯渇 → swap で激遅。
-→ **RAM を .wslconfig で増設してから再挑戦**することにした (この作業の直前で中断)。
+### 結論 (2026-06-03 実走で確定)
+RAM を 9GB→**17GB** に増設後、`compile_dynamic: true` で **1B 本走の起動に成功**。
+- loss 下降確認: step20=5.76 → step160=2.94 (順調)
+- 定常 **~31k tok/s** / RAM 空き ~1.5GB で安定 / recompile 1件で固定 / GPU util ~89%
+- VRAM ~15.6GB (dynamic は static より多いが 24GB 内で余裕)
 
-### 手順1: RAM 増設 (Windows 側)
-`C:\Users\<user>\.wslconfig` を作成/編集:
-```
-[wsl2]
-memory=24GB
-swap=16GB
-```
-保存後 PowerShell で `wsl --shutdown` → WSL 再起動。
+### ★compile 戦略の実測結論 (重要・旧教訓を更新)
+1B BLT では下記が確定。**起動env**: `TORCHINDUCTOR_COMPILE_THREADS=12` + `TORCHINDUCTOR_FX_GRAPH_CACHE=1`。
+| 戦略 | 結果 |
+|---|---|
+| **static** (compile_dynamic:false) | **起動不能**。`patch_ids_from_lengths` 等が patch_lengths 形状(~200種)で毎step recompile → cache64 溢れ → **step20 すら未到達** |
+| **dynamic** (compile_dynamic:true) | **○ 起動成功・定常 ~31k tok/s**。symbolic shape で recompile ほぼ消滅(1件のみ eager fallback)。**現行採用** |
+| **eager** (torch_compile:false) | 未実走だが bench no-compile bs=8 = **35.5k** → dynamic より速い見込み。待ちゼロ・最シンプル |
 
-### 手順2: 再起動後の確認
+- 旧教訓「dynamic は初回15分超で非現実的」は **9GB/20スレ時代の話**。17GB/12スレでは数分で起動でき逆転。
+- **意外な点: dynamic(31k) は eager(35.5k bench) より遅い**。symbolic kernel が static特化より非最適 + 1フレーム eager fallback のため。
+  → **次に速度を詰めるなら eager を実走比較する価値あり** (compile 待ちもゼロ)。bench 59.6k は固定形状での値で BLT 動的patchingでは出ない。
+- mini (run_blt_fineweb.yaml) は hidden256 と小さく既に学習成功済み (loss 5.49→2.79)。
+
+### 起動コマンド (再現用)
 ```bash
-cd /mnt/d/develop/arbor-llm
-source scripts/env.sh
-free -g                  # total が 24 付近になったか確認
-```
-
-### 手順3: RAM が増えたら config を戻す (arbor_1b.yaml, 任意)
-- data: `num_workers 0→4`, `shuffle_buffer 4000→10000` (RAM 余裕あれば spec 通り)
-- speed: **compile は当面 static (`compile_dynamic: false`) 推奨** (dynamic は初回が重すぎた)
-
-### 手順4: compile 高速化 env を付けて 1B 起動
-```bash
-export TORCHINDUCTOR_COMPILE_THREADS=12   # RAM 24GB なら 12-16 (9GBでは20が枯渇主因だった)
+cd /mnt/d/develop/arbor-llm && source scripts/env.sh
+export TORCHINDUCTOR_COMPILE_THREADS=12   # 9GB時代に20が枯渇主因。17GBでは12が安全
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1     # 2回目以降の起動を短縮 (/tmp/torchinductor_hi)
-python -u -m src.train.train --config configs/arbor_1b.yaml > /tmp/run_1b.log 2>&1 &
+python -u -m src.train.train --config configs/arbor_1b.yaml > /tmp/run_1b_dyn.log 2>&1 &
 ```
-確認ポイント:
-- `step=` ログが出るか (= compile 完了し step 1 到達)
-- VRAM peak (bs=8/hidden2048 で OOM しないか。前回 forward 開始で 13GB まで増えた)
-- RAM が枯渇しないか (`free -g`)、tok/s
+確認ポイント: `step=` 出力 / RAM 空き(`free -g`、~1.5GB は正常) / recompile 数(`grep -c cache_size_limit`、1で固定が正常) / tok/s。
 
-### 現状の arbor_1b.yaml (コミット済み)
+### 現状の arbor_1b.yaml (要コミット)
 - model: hidden 2048 / 22層 / GQA(kv4) / context 2048
-- data: num_workers 0, shuffle 4000 (RAM 暫定値)
-- speed: torch_compile true / mode default / **compile_dynamic false** / cache 64 / bs 8 / accum 8
+- data: num_workers 0, shuffle 4000 (RAM 17GB でも暫定維持中。余裕あれば 4→2workers / shuffle 上げ検証可)
+- speed: torch_compile true / mode default / **compile_dynamic true** / cache 64 / bs 8 / accum 8
 - optim: 8bit adamw, lr 3e-4, total_steps 200000
 
-### 1B compile の教訓
-- **dynamic=True は 1B では初回 compile 15分超で非現実的** → static を使う。
-- compile が辛ければ **eager (`torch_compile: false`) で即学習可** (待ちゼロ・tok/s は bench比 約1/1.8)。
-  まず eager で loss 下降を確認 → compile は RAM 増設後に詰める、でも可。
-- mini (run_blt_fineweb.yaml) は hidden256 と小さく既に学習成功済み (loss 5.49→2.79)。
+### 残課題
+- RAM 17GB は spec 目標 24GB に未達。`num_workers>0` を試すなら 1.5GB しか空きが無い点に注意 (枯渇リスク)。
+- 速度を詰めるなら **eager 実走で dynamic(31k) と比較** → 速ければ eager に切替。
+
+---
+
+## ★データ構成: 日本語主軸の混合に変更 (2026-06-03)
+
+### 方針 (ユーザ指示)
+**日本語を半分以上 + news を含める**。蒸留は別フェーズ (教師選定が前提) として後回し。
+
+### 確定した混合 (configs/arbor_1b.yaml の `data.sources`)
+| ソース | 言語/種別 | weight | 備考 |
+|---|---|---|---|
+| `HuggingFaceFW/fineweb-2` (name `jpn_Jpan`) | 日本語 web | **0.60** | NHK等 news 含む・高品質 |
+| `vblagoje/cc_news` | 英語 news | 0.15 | CommonCrawl News |
+| `HuggingFaceFW/fineweb-edu` | 英語 edu | 0.25 | 高品質土台 |
+
+- weight は確率に正規化し `interleave_datasets(probabilities=..., stopping_strategy="all_exhausted")` で**行レベル混合** (byte_dataset.py)。
+- **実測 byte 比率: 日本語 66.1%** (row重み60%より高い。日本語UTF-8が約3byte/文字でバイト寄与大)。狙い通り半分以上。
+- バイト直読みなので **vocab 変更不要** (日本語UTF-8も 0-255 バイトに収まる)。
+
+### 実装 (src/data/byte_dataset.py)
+- `ByteStreamDataset` に `sources: list[dict]` を追加 (単一 `source` str も後方互換)。
+- 各ソースを `rename_column→select_columns(["text"])` で正規化してから interleave (スキーマ衝突回避)。
+- 各 dict は `{path, name?, weight?, text_column?, split?}`。
+- `build_byte_dataloader` は `cfg.get("sources")` 優先、無ければ従来 `cfg["source"]`。
+- seed=42 固定なので skip ベース resume でも同じ混合順序を再現。
+
+### smoke test 済み (認証不要 streaming OK)
+- ✅ fineweb-edu / fineweb-2 jpn_Jpan / cc_news / range3/cc100-ja
+- ❌ llm-jp-corpus-v3 (存在せず) / OSCAR-2301 (gated 要認証) / izumi-lab/cc100-ja (存在せず)
+- 注: cc_news で稀に `[Errno 9] Bad file descriptor` → HF datasets が自動リトライ(5回)で無害。
+
+### RAM 注意
+- 3ソース分の shuffle バッファを持つため `shuffle_buffer 4000→2000` に縮小。`num_workers 0` 維持。
+- 起動後 `free -g` で枯渇しないか要確認 (日本語ページは1行が大きい)。
+
+### 起動 (英語版を停止してから fresh restart)
+```bash
+pkill -9 -f src.train.train; pkill -9 -f compile_worker   # 英語版停止
+source scripts/env.sh
+export TORCHINDUCTOR_COMPILE_THREADS=12 TORCHINDUCTOR_FX_GRAPH_CACHE=1
+python -u -m src.train.train --config configs/arbor_1b.yaml > /tmp/run_1b_ja.log 2>&1 &
+```
+- checkpoint dir は `./checkpoints` (flat, 元のまま)。英語版 step_1000 は削除済みなので衝突しない。
+- 英語版は step1080 (loss 1.44, 英語のみ) で停止・破棄 (checkpoint 5GB も削除)。checkpoint保存/prune は step1000 で正常動作を確認済み。
+
+### 未実施 / 次の判断
+- **日本語版 1B 本走の起動はまだ (ユーザ確認待ち)**。起動可なら上記コマンド。
+- 蒸留 (distillation): 教師モデル未選定 (spec: Qwen/Gemma系が license寛容)。やるなら別途 KD パイプライン実装が必要。
+- 日本語 news 専用コーパスは streaming 可能な ungated なものが見つからず → 日本語 news は fineweb-2 ja 内に含まれる web news で代替。
 
 ---
 

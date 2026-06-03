@@ -34,17 +34,32 @@ class ByteStreamDataset(IterableDataset):
     全件メモリ展開しない。
     """
 
-    def __init__(self, source: str, context_length: int, split: str = "train",
-                 shuffle_buffer: int = 0, text_column: str = "text",
-                 byte_offset: int = 4) -> None:
+    def __init__(self, source: str | None = None, context_length: int = 2048,
+                 split: str = "train", shuffle_buffer: int = 0,
+                 text_column: str = "text", byte_offset: int = 4,
+                 sources: list[dict[str, Any]] | None = None) -> None:
         """byte_offset: バイト値 b を token id (b + offset) に写す.
 
         BLT は 0..3 を BOE/BOS/EOS/BPE の特殊 ID として使い, 生バイトは
         OFFSET=4 から始まる (vocab_size = OFFSET + 256 = 260). stub model
         ではこの分離が不要なので 0 でも回るが, 実 BLT を使う場合は 4 にする.
+
+        ソース指定は 2 通り:
+        - `source`: 単一データセット (str). `file:` prefix でローカル mmap.
+        - `sources`: 複数データセットを重み付き混合 (list[dict]). 各要素は
+          `{path, name?, weight?, text_column?, split?}`. weight は確率に正規化し
+          datasets.interleave_datasets で行レベルに混ぜる (例: 日本語 60% + 英語 40%).
+          ローカル file: は混合対象外 (HF streaming のみ).
         """
         super().__init__()
-        self.source = source
+        if sources:
+            self.sources = [dict(s) for s in sources]
+            self.source = None
+        else:
+            if not source:
+                raise ValueError("source または sources のどちらかが必要")
+            self.sources = None
+            self.source = source
         self.context_length = context_length
         self.split = split
         self.shuffle_buffer = shuffle_buffer
@@ -62,20 +77,55 @@ class ByteStreamDataset(IterableDataset):
     # --- iterator: 1 サンプル = context_length+1 バイト ------------------
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         # backend は source の prefix で判定: 'file:' で始まればローカル mmap.
-        if self.source.startswith("file:"):
+        if self.source is not None and self.source.startswith("file:"):
             yield from self._iter_local_file(self.source[len("file:"):])
             return
         yield from self._iter_hf_stream()
 
+    def _build_hf_stream(self):
+        """単一/複数ソースを HF streaming の行イテレータに組み立てる.
+
+        複数の場合は各ソースを "text" 列に正規化してから weight を確率に
+        正規化し interleave_datasets で混ぜる. seed 固定なので skip ベースの
+        resume でも同じ順序を再現できる.
+        """
+        from datasets import load_dataset
+
+        def _one(path, name, col, split):
+            ds = load_dataset(path, name=name, split=split, streaming=True)
+            if col != "text":
+                ds = ds.rename_column(col, "text")
+            ds = ds.select_columns(["text"])  # スキーマ衝突回避 (混合時)
+            if self.shuffle_buffer > 0:
+                ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=42)
+            return ds
+
+        if not self.sources:
+            return _one(self.source, None, self.text_column, self.split)
+
+        from datasets import interleave_datasets
+
+        streams, weights = [], []
+        for s in self.sources:
+            streams.append(_one(
+                s["path"], s.get("name"),
+                s.get("text_column", self.text_column),
+                s.get("split", self.split),
+            ))
+            weights.append(float(s.get("weight", 1.0)))
+        total = sum(weights) or 1.0
+        probs = [w / total for w in weights]
+        # all_exhausted: 巨大コーパスでは実質無限。比率を保ちつつ枯渇分は再サンプル.
+        return interleave_datasets(
+            streams, probabilities=probs, seed=42,
+            stopping_strategy="all_exhausted",
+        )
+
     def _iter_hf_stream(self) -> Iterator[dict[str, torch.Tensor]]:
         try:
-            from datasets import load_dataset
+            ds = self._build_hf_stream()
         except ImportError as e:
             raise RuntimeError("`datasets` が必要 (pip install datasets)") from e
-
-        ds = load_dataset(self.source, split=self.split, streaming=True)
-        if self.shuffle_buffer > 0:
-            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=42)
 
         ring = bytearray()
         block = self.context_length + 1
@@ -83,7 +133,7 @@ class ByteStreamDataset(IterableDataset):
         off = self.byte_offset
 
         for row in ds:
-            text = row.get(self.text_column)
+            text = row.get("text")
             if not text:
                 continue
             ring.extend(text.encode("utf-8", errors="ignore"))
@@ -147,7 +197,8 @@ class _ResumableLoader(DataLoader):
 
 def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
     ds = ByteStreamDataset(
-        source=cfg["source"],
+        source=cfg.get("source"),
+        sources=cfg.get("sources"),
         context_length=cfg["context_length"],
         split=split,
         shuffle_buffer=cfg.get("shuffle_buffer", 0),

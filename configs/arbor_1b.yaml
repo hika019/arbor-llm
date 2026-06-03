@@ -19,12 +19,22 @@ model:
   fp_in_local: true           # Local Encoder/Decoder は FP 維持
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
+# 日本語主軸の混合 (2026-06-03): 日本語 60% + 英語 40%(うち news 15%).
+# weight は確率に正規化し interleave_datasets で行レベルに混合 (byte_dataset.py).
+# 全ソース smoke test 済み (認証不要 streaming OK). バイト直なので vocab 変更不要.
 data:
-  source: "HuggingFaceFW/fineweb-edu"
+  sources:
+    - path: "HuggingFaceFW/fineweb-2"   # 日本語 web (NHK 等 news 含む). 高品質
+      name: "jpn_Jpan"
+      weight: 0.60
+    - path: "vblagoje/cc_news"          # 英語 news (CommonCrawl News)
+      weight: 0.15
+    - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
+      weight: 0.25
   streaming: true             # メモリに全部載せない
-  shuffle_buffer: 4000        # RAM 9GB 制約で縮小 (旧 10000 は枯渇)
+  shuffle_buffer: 2000        # 複数ソース分のバッファを持つため 1ソースより縮小 (RAM 17GB)
   context_length: 2048        # bytes
-  num_workers: 0              # RAM 9GB: num_workers>0 は persistent_workers でバッファ複製→枯渇
+  num_workers: 0              # RAM 制約: num_workers>0 は persistent_workers でバッファ複製→枯渇
   prefetch_factor: 4          # num_workers>0 時のみ有効 (現状 num_workers=0 で無視)
   pin_memory: true
 
