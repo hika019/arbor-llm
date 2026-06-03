@@ -22,10 +22,10 @@ model:
 data:
   source: "HuggingFaceFW/fineweb-edu"
   streaming: true             # メモリに全部載せない
-  shuffle_buffer: 10000       # streaming shuffle のバッファ件数
+  shuffle_buffer: 4000        # RAM 9GB 制約で縮小 (旧 10000 は枯渇)
   context_length: 2048        # bytes
-  num_workers: 4
-  prefetch_factor: 4
+  num_workers: 0              # RAM 9GB: num_workers>0 は persistent_workers でバッファ複製→枯渇
+  prefetch_factor: 4          # num_workers>0 時のみ有効 (現状 num_workers=0 で無視)
   pin_memory: true
 
 # ---- 最適化 ----
@@ -45,9 +45,9 @@ speed:
   precision: bf16             # マスター重みも BF16
   tf32_matmul: true
   cudnn_benchmark: true
-  torch_compile: true
+  torch_compile: true         # compile 有効. 初回のみコンパイル (以降キャッシュ, 再起動も inductor disk cache で短縮)
   compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
-  compile_dynamic: true       # BLT 動的パッチングの recompile 抑止 (1B本走時に static と速度比較)
+  compile_dynamic: false      # dynamic=True は1Bで初回compile 15分超だったため static に. 形状ごとcompile (cache64で吸収)
   dynamo_cache_size_limit: 64
   micro_batch_size: 8         # bench: compile=default bs=8 で 59.6k tok/s / 11.1GB (余裕大)
   grad_accum_steps: 8         # 実効バッチ = 64
