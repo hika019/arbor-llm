@@ -47,6 +47,8 @@ speed:
   cudnn_benchmark: true
   torch_compile: true
   compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
+  compile_dynamic: true       # BLT 動的パッチングの recompile 抑止 (1B本走時に static と速度比較)
+  dynamo_cache_size_limit: 64
   micro_batch_size: 8         # bench: compile=default bs=8 で 59.6k tok/s / 11.1GB (余裕大)
   grad_accum_steps: 8         # 実効バッチ = 64
   flash_attention: true

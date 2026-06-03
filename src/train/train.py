@@ -22,6 +22,7 @@ from pathlib import Path
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+import torch._dynamo
 import yaml
 
 # プロジェクト root を import path に追加
@@ -80,7 +81,15 @@ def main() -> int:
 
     if cfg["speed"].get("torch_compile", False):
         mode = cfg["speed"].get("compile_mode", "default")
-        model = torch.compile(model, mode=mode)
+        # BLT の動的パッチングで seq 長が毎 step 変動し dynamo が recompile を繰り返す
+        # (cache_size_limit 既定 8 に到達→eager fallback) のを抑える:
+        #   dynamo_cache_size_limit: cache 上限 (recompile を許容する形状数)
+        #   compile_dynamic: None=auto / True=seq 次元を symbolic に1グラフ / False=静的
+        csl = cfg["speed"].get("dynamo_cache_size_limit")
+        if csl:
+            torch._dynamo.config.cache_size_limit = int(csl)
+        dynamic = cfg["speed"].get("compile_dynamic", None)
+        model = torch.compile(model, mode=mode, dynamic=dynamic)
 
     # ---- データ (streaming, メモリに全部載せない) ----
     from src.data.byte_dataset import build_byte_dataloader

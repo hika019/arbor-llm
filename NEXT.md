@@ -52,14 +52,16 @@ source scripts/env.sh    # venv + micromamba gcc + PYTHONPATH + expandable_segme
     buffer 充填で最初の step まで数分の CPU バウンド待ちがある (固まりではない)。
 
 #### 本走前に対処価値のある課題
-1. **torch.compile の動的形状 recompile** (mini で顕在化):
+1. **torch.compile の動的形状 recompile** (mini で顕在化 → 機能対策済み):
    BLT の動的パッチング (patching_mode=space) で seq 長が毎 step 変動し、
-   dynamo が `cache_size_limit (8)` に到達して一部 eager fallback
-   (`tensor 'h' size mismatch: expected 52, actual 50`)。mini では 45k 出てるが
-   1B では効率に効く。対策候補:
-   - `torch._dynamo.config.cache_size_limit` を上げる
-   - `pad_to_max_length=True` 等で patch 数を固定
-   - `torch.compile(dynamic=True)` で動的形状を1グラフに
+   dynamo が `cache_size_limit (8)` に到達して一部 eager fallback していた。
+   対策を config 化 (train.py): `compile_dynamic` (None/true/false) と
+   `dynamo_cache_size_limit`。両 config を **compile_dynamic: true / cache 64** に確定。
+   - mini 検証: dynamic=true / static+cache64 とも **recompile 警告 0・loss 同一・正常終了**。
+   - ただし mini の tok/s は **HF streaming の I/O 律速でノイズだらけ**(3パターン
+     とも似た乱高下波形)で、compile 戦略の速度差は判定不能。
+   - **速度の最終判断は 1B 本走 (計算律速) で dynamic vs static を実測して決める**。
+     1B は patch 数の値域が広い(~300-512≈200種)ので形状非依存の dynamic が有利な見込み。
 2. **checkpoint prune バグは修正済み** (b952df3):
    `_prune` の resolve 不一致で keep 対象を誤削除していた + 終了前に prune
    daemon を join するよう修正。単体テスト PASS。
