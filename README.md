@@ -23,7 +23,7 @@ stub は `model.backend: stub` を明示した smoke 用、または `model.allo
 ```bash
 # 0. OS パッケージ (Ubuntu / WSL)
 sudo apt update
-sudo apt install -y git python3 python3-venv python3-dev build-essential ninja-build ripgrep
+sudo apt install -y git python3 python3-venv python3-dev python3.12-dev build-essential ninja-build ripgrep
 
 # CUDA forward / flash-attn を使う場合は nvcc も必要。
 # nvidia-smi と nvcc --version で CUDA の major version が合うことを確認する。
