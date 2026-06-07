@@ -112,8 +112,8 @@ if triton is not None:
                 mask=(offs_n[None, :] < n) & (k_idxs[:, None] < k),
                 other=1,
             )
-            codes = (packed >> shifts[:, None]) & 3
-            w = codes.to(tl.int8) - 1
+            codes = ((packed >> shifts[:, None]) & 3).to(tl.int32)
+            w = (codes - 1).to(tl.int8)
             acc += tl.dot(x, w, out_dtype=tl.float32)
 
         sx = tl.load(sx_ptr + offs_m, mask=offs_m < m, other=0.0).to(tl.float32)

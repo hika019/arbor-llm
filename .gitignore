@@ -32,3 +32,4 @@ nohup.out
 # BLT は third_party/blt 配下に独立 git リポジトリとして clone 済み。
 # サブモジュール化していないので親リポジトリからは無視する。
 third_party/blt/
+.deps/*

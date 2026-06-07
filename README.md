@@ -21,8 +21,15 @@ stub は `model.backend: stub` を明示した smoke 用、または `model.allo
 ## セットアップ
 
 ```bash
-# 1. venv
-python3.10 -m venv .venv
+# 0. OS パッケージ (Ubuntu / WSL)
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-dev build-essential ninja-build ripgrep
+
+# CUDA forward / flash-attn を使う場合は nvcc も必要。
+# nvidia-smi と nvcc --version で CUDA の major version が合うことを確認する。
+
+# 1. venv (Python 3.10-3.12)
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip wheel setuptools
 
@@ -32,17 +39,28 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 # 3. 依存
 pip install -r requirements.txt
 
-# 4. flash-attn (toolchain 確認後)
+# 4. flash-attn (任意; toolchain 確認後)
 pip install flash-attn --no-build-isolation
 
-# 5. BLT は third_party/blt に clone 済み (upstream=facebookresearch/blt)
-#    自分の fork を origin として設定:
-#      ./scripts/setup_blt_fork.sh git@github.com:<you>/blt.git
+# 5. BLT 本体
+git clone https://github.com/facebookresearch/blt third_party/blt
+git -C third_party/blt remote rename origin upstream
+
+# 6. 自分の BLT fork を origin として設定する場合
+./scripts/setup_blt_fork.sh git@github.com:<you>/blt.git
 ```
+
+`third_party/blt` は親リポジトリでは submodule 化しておらず、`.gitignore` で無視している。
+clone 済みかは `test -d third_party/blt/.git` で確認できる。既に clone 済みの場合は手順 5 を飛ばす。
+
+`scripts/env.sh` を source すると `.venv` を有効化し、`PYTHONPATH` に親プロジェクトと
+`third_party/blt` を追加する。
 
 ## 学習
 
 ```bash
+source scripts/env.sh
+
 # smoke 確認
 python -m src.train.train --config configs/smoke.yaml --dry-run
 
