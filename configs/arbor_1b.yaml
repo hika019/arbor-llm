@@ -71,7 +71,7 @@ checkpoint:
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000   # 長期保存は 1万 step 毎
-  async_save: true            # 学習スレッドをブロックしない
+  async_save: false           # 安全優先: 保存と prune は同期実行
 
 # ---- ログ ----
 logging:

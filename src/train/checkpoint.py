@@ -11,20 +11,20 @@ Layout (per spec):
         meta.json              # global_step, wandb_run_id, config_hash, git_sha
       step_0000010000.tmp/     # in-progress write (renamed on success)
       latest/                  # symlink to most recent finished checkpoint
-      best/                    # symlink to lowest-val-loss checkpoint
+      best/                    # symlink to lowest-loss checkpoint
+      final/                   # symlink to the last planned checkpoint
 
-Saves are atomic: everything is written into ``<dir>.tmp/`` first, then
-``os.replace`` swaps it into place. A kill at any point leaves either the
-previous checkpoint intact or the .tmp dir (which is cleaned up on resume).
-
-Async-save is supported (off the training thread) so the GPU does not idle
-during a heavy disk write.
+Saves are staged into ``<step>.tmp/`` first and then renamed into the final
+step directory only after all files are written. Existing step directories are
+never deleted as part of save; attempting to write the same step twice is an
+error. This keeps interrupted saves from destroying the last good checkpoint.
 """
 from __future__ import annotations
 
 import json
 import os
 import random
+import re
 import shutil
 import threading
 from dataclasses import dataclass, field
@@ -39,6 +39,9 @@ from safetensors.torch import save_file as safe_save
 
 def _step_name(step: int) -> str:
     return f"step_{step:010d}"
+
+
+_STEP_RE = re.compile(r"^step_(\d{10})$")
 
 
 @dataclass
@@ -86,13 +89,21 @@ class CheckpointManager:
         dataloader_state: dict[str, Any] | None,
         meta: CheckpointMeta,
         is_best: bool = False,
+        is_final: bool = False,
     ) -> Path:
-        """Save synchronously, then (optionally) prune in a background thread."""
+        """Save a checkpoint and update retention symlinks.
+
+        The write path is synchronous even when ``async_save`` is true. The
+        option is kept for config compatibility, but checkpoint correctness
+        takes precedence over overlapping filesystem mutations.
+        """
         # Wait for prior async-prune to finish so we don't race symlinks.
         self._await_thread()
 
         step_dir = self.root / _step_name(meta.global_step)
         tmp_dir = self.root / f"{_step_name(meta.global_step)}.tmp"
+        if step_dir.exists() or step_dir.is_symlink():
+            raise FileExistsError(f"checkpoint already exists: {step_dir}")
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         tmp_dir.mkdir(parents=True)
@@ -109,23 +120,21 @@ class CheckpointManager:
             torch.save(dataloader_state, tmp_dir / "dataloader.pt")
         torch.save(_snapshot_rng(), tmp_dir / "rng.pt")
         (tmp_dir / "meta.json").write_text(json.dumps(meta.to_dict(), indent=2))
+        _fsync_tree(tmp_dir)
 
-        # 3) atomic rename
-        if step_dir.exists():
-            shutil.rmtree(step_dir)
-        os.replace(tmp_dir, step_dir)
+        # 3) publish. ``step_dir`` was checked above; do not remove old data here.
+        os.rename(tmp_dir, step_dir)
+        _fsync_dir(self.root)
 
         # 4) update symlinks
         _atomic_symlink(self.root / "latest", step_dir.name)
         if is_best:
             _atomic_symlink(self.root / "best", step_dir.name)
+        if is_final:
+            _atomic_symlink(self.root / "final", step_dir.name)
 
-        # 5) prune old (in background if requested)
-        if self.async_save:
-            self._thread = threading.Thread(target=self._prune, daemon=True)
-            self._thread.start()
-        else:
-            self._prune()
+        # 5) prune old checkpoints after symlinks point at protected targets.
+        self._prune()
 
         return step_dir
 
@@ -140,7 +149,7 @@ class CheckpointManager:
     ) -> tuple[CheckpointMeta, dict[str, Any] | None]:
         """Restore from a checkpoint.
 
-        ``which`` can be 'latest', 'best', a step number, or an absolute path.
+        ``which`` can be 'latest', 'best', 'final', a step number, or an absolute path.
         Returns (meta, dataloader_state).
         """
         ckpt_dir = self.resolve(which)
@@ -179,7 +188,7 @@ class CheckpointManager:
     def resolve(self, which: str | int) -> Path | None:
         if isinstance(which, int):
             return self.root / _step_name(which)
-        if which in ("latest", "best"):
+        if which in ("latest", "best", "final"):
             link = self.root / which
             if link.is_symlink():
                 return (self.root / os.readlink(link)).resolve()
@@ -189,13 +198,15 @@ class CheckpointManager:
 
     # -------------------------------------------------------------- prune
     def _prune(self) -> None:
-        steps = sorted(
-            (p for p in self.root.iterdir() if p.is_dir() and p.name.startswith("step_")),
-            key=lambda p: int(p.name.split("_", 1)[1]),
-        )
+        steps = []
+        for p in self.root.iterdir():
+            m = _STEP_RE.match(p.name)
+            if p.is_dir() and m:
+                steps.append((int(m.group(1)), p))
+        steps = [p for _, p in sorted(steps, key=lambda item: item[0])]
         # Always keep latest K and best/latest symlink targets.
         protected: set[Path] = set()
-        for link_name in ("latest", "best"):
+        for link_name in ("latest", "best", "final"):
             link = self.root / link_name
             if link.is_symlink():
                 protected.add((self.root / os.readlink(link)).resolve())
@@ -203,7 +214,7 @@ class CheckpointManager:
         # Long-term keeps: every N steps.
         if self.keep_every_n_steps:
             for p in steps:
-                step = int(p.name.split("_", 1)[1])
+                step = int(_STEP_RE.match(p.name).group(1))  # type: ignore[union-attr]
                 if step % self.keep_every_n_steps == 0:
                     protected.add(p.resolve())
         for p in steps:
@@ -223,6 +234,26 @@ def _atomic_symlink(link: Path, target_name: str) -> None:
         tmp.unlink()
     tmp.symlink_to(target_name)
     os.replace(tmp, link)
+    _fsync_dir(link.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_tree(path: Path) -> None:
+    for p in path.iterdir():
+        if p.is_file():
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    _fsync_dir(path)
 
 
 def _snapshot_rng() -> dict[str, Any]:

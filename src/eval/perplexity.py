@@ -19,7 +19,7 @@ def byte_perplexity(model: torch.nn.Module, loader: Iterable[dict[str, torch.Ten
             break
         inputs = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             out = model(inputs)
         loss = F.cross_entropy(
             out.logits.flatten(0, 1), labels.flatten(),

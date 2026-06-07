@@ -93,7 +93,9 @@ def main() -> int:
 
     # ---- データ (streaming, メモリに全部載せない) ----
     from src.data.byte_dataset import build_byte_dataloader
-    train_loader = build_byte_dataloader(cfg["data"], split="train")
+    data_cfg = dict(cfg["data"])
+    data_cfg.setdefault("micro_batch_size", cfg.get("speed", {}).get("micro_batch_size", 4))
+    train_loader = build_byte_dataloader(data_cfg, split="train")
 
     # ---- optimizer / scheduler ----
     optimizer = build_optimizer(model.parameters(), cfg["optim"])
@@ -140,7 +142,7 @@ def main() -> int:
                 batch = next(data_iter)
                 inputs = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     out = model(inputs)
                     loss = torch.nn.functional.cross_entropy(
                         out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
@@ -181,7 +183,11 @@ def main() -> int:
                     wandb_run_id=os.environ.get("WANDB_RUN_ID"),
                 )
                 dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None
-                ckpt.save(model, optimizer, scheduler, dl_state, meta, is_best=is_best)
+                ckpt.save(
+                    model, optimizer, scheduler, dl_state, meta,
+                    is_best=is_best,
+                    is_final=global_step >= total_steps,
+                )
                 print(f"[train] saved checkpoint @ step={global_step}{' (best)' if is_best else ''}")
 
             if stop.requested:

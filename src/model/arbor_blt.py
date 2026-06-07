@@ -42,10 +42,15 @@ class _StubArborBLT(nn.Module):
         )
         self.body = nn.TransformerEncoder(layer, num_layers=1)
         self.head = nn.Linear(h, v, bias=False)
+        self.gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
 
     def forward(self, input_ids: torch.Tensor) -> ArborOutput:
         x = self.embed(input_ids)
-        x = self.body(x)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            x = checkpoint(self.body, x, use_reentrant=False)
+        else:
+            x = self.body(x)
         return ArborOutput(logits=self.head(x))
 
 
@@ -106,7 +111,11 @@ def _build_blt(cfg: dict[str, Any]) -> nn.Module:
 
 
 def build_arbor_blt(cfg: dict[str, Any]) -> nn.Module:
-    """設定からモデルを構築. BLT が import 可なら BLT、不可なら stub."""
+    """設定からモデルを構築.
+
+    ``backend: stub`` は明示的な smoke/fallback 用。``backend: blt`` で BLT の
+    import や構築に失敗した場合は、既定では例外を再送出して設定ミスを隠さない。
+    """
     backend = cfg.get("backend", "blt")
     if backend == "stub":
         model = _StubArborBLT(cfg)
@@ -114,12 +123,23 @@ def build_arbor_blt(cfg: dict[str, Any]) -> nn.Module:
             n = swap_linear_to_bitlinear(model.body, skip_names=("embed",))
             print(f"[arbor_blt] stub body の Linear を BitLinear に置換: {n} 層")
         return model
+    if backend != "blt":
+        raise ValueError(f"unknown model backend: {backend}")
 
     try:
         blt = _build_blt(cfg)
     except Exception as e:
-        print(f"[arbor_blt] BLT 構築に失敗 ({type(e).__name__}: {e}). stub にフォールバック.")
-        return build_arbor_blt({**cfg, "backend": "stub"})
+        if cfg.get("allow_stub_fallback", False):
+            print(f"[arbor_blt] BLT 構築に失敗 ({type(e).__name__}: {e}). stub にフォールバック.")
+            return build_arbor_blt({**cfg, "backend": "stub"})
+        raise RuntimeError(
+            "BLT backend requested but third_party/blt could not be built. "
+            "Use model.backend=stub only for explicit smoke tests, or set "
+            "model.allow_stub_fallback=true if silent fallback is acceptable."
+        ) from e
+
+    if cfg.get("gradient_checkpointing", False) and hasattr(blt, "gradient_checkpointing_enable"):
+        blt.gradient_checkpointing_enable()
 
     # BitNet 2B4T 整合: SwiGLU を ReLU² に差し替え (Global のみ)
     if cfg.get("relu2_ffn_in_global", True):

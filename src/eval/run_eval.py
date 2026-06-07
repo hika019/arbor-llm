@@ -40,7 +40,9 @@ def main() -> int:
     meta, _ = ckpt.load(args.ckpt, model, map_location=device)
     print(f"[eval] loaded {args.ckpt}: step={meta.global_step} best_loss={meta.best_loss:.4f}")
 
-    loader = build_byte_dataloader(cfg["data"], split="train")
+    data_cfg = dict(cfg["data"])
+    data_cfg.setdefault("micro_batch_size", cfg.get("speed", {}).get("micro_batch_size", 4))
+    loader = build_byte_dataloader(data_cfg, split="train")
     ppl = byte_perplexity(model, loader, device, max_batches=args.max_batches)
     print(f"[eval] byte_perplexity ({args.max_batches} batches) = {ppl:.4f}")
     return 0
