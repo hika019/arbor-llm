@@ -49,3 +49,20 @@ def test_multi_worker_iterable_requires_explicit_opt_in(tmp_path):
                 "pin_memory": False,
             }
         )
+
+
+def test_local_file_resume_uses_byte_offset_without_double_skip(tmp_path):
+    data_file = tmp_path / "bytes.txt"
+    data_file.write_text("abcdefghijklmnopqrstuvwxyz")
+    ds = ByteStreamDataset(source=f"file:{data_file}", context_length=3, byte_offset=0)
+    iterator = iter(ds)
+
+    first = next(iterator)
+    state = ds.state_dict()
+
+    restored = ByteStreamDataset(source=f"file:{data_file}", context_length=3, byte_offset=0)
+    restored.load_state_dict(state)
+    second = next(iter(restored))
+
+    assert first["input_ids"].tolist() == [ord("a"), ord("b"), ord("c")]
+    assert second["input_ids"].tolist() == [ord("b"), ord("c"), ord("d")]

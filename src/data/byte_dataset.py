@@ -160,7 +160,10 @@ class ByteStreamDataset(IterableDataset):
         if not path.is_file():
             raise FileNotFoundError(path)
         block = self.context_length + 1
-        skip = self._state.samples_emitted
+        # byte_offset is exact for in-process local iteration. If it is missing
+        # (for example a parent DataLoader tracking worker output), fall back to
+        # samples_emitted-based skipping.
+        skip = self._state.samples_emitted if self._state.byte_offset == 0 else 0
 
         off = self.byte_offset
         with path.open("rb") as f, mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ) as mm:
