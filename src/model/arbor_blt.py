@@ -83,6 +83,12 @@ def _build_blt(cfg: dict[str, Any]) -> nn.Module:
 
     h = cfg["hidden_size"]
     n_heads = cfg["num_attention_heads"]
+    n_kv_heads = cfg.get("num_key_value_heads", n_heads)
+    if n_heads % n_kv_heads != 0:
+        raise ValueError(
+            "num_attention_heads must be divisible by num_key_value_heads: "
+            f"{n_heads=} {n_kv_heads=}"
+        )
     n_layers = cfg["num_hidden_layers"]
     max_seq = cfg.get("max_position_embeddings", 256)
     patch_size = cfg.get("patch_size", 4)
@@ -97,6 +103,7 @@ def _build_blt(cfg: dict[str, Any]) -> nn.Module:
         n_layers_local_decoder=cfg.get("num_local_layers", 1),
         n_heads=n_heads, n_heads_global=n_heads,
         n_heads_local_encoder=n_heads, n_heads_local_decoder=n_heads,
+        n_kv_heads=n_kv_heads, n_kv_heads_global=n_kv_heads,
         patch_size=patch_size, patching_mode=cfg.get("patching_mode", "space"),
         max_encoder_seq_length=max_seq, max_seqlen=max_seq, max_length=max_seq // patch_size,
         use_local_encoder_transformer=True,
