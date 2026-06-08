@@ -204,6 +204,7 @@ def main() -> int:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     accum_loss_tensor: torch.Tensor | None = None
+    best_loss_tensor = torch.tensor(best_loss, device=device, dtype=torch.float32)
 
     data_iter = iter(train_loader)
     while global_step < total_steps:
@@ -228,35 +229,47 @@ def main() -> int:
                 )
 
             if cfg["optim"].get("grad_clip"):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["optim"]["grad_clip"])
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg["optim"]["grad_clip"], foreach=True
+                )
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             meter.step(tokens_this_step)
 
-            cur_loss = (
-                float(accum_loss_tensor.float().cpu())
+            loss_for_step = (
+                accum_loss_tensor.detach().float()
                 if accum_loss_tensor is not None
-                else 0.0
+                else torch.tensor(0.0, device=device)
             )
-            if global_step % log_every == 0:
-                print(f"step={global_step} loss={cur_loss:.4f} "
-                      f"tok/s={meter.tokens_per_sec():.0f} lr={scheduler.get_last_lr()[0]:.2e}")
-            accum_loss_tensor = None
+            is_best_tensor = loss_for_step < best_loss_tensor
+            best_loss_tensor = torch.minimum(best_loss_tensor, loss_for_step)
 
-            # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
-            # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
-            is_best = cur_loss < best_loss
-            if is_best:
-                best_loss = cur_loss
             should_save = (
                 global_step % save_every == 0
                 or stop.requested
                 or global_step >= total_steps
             )
+            need_loss_scalar = global_step % log_every == 0 or should_save or args.dry_run
+            cur_loss = float(loss_for_step.cpu()) if need_loss_scalar else None
+
+            if global_step % log_every == 0:
+                assert cur_loss is not None
+                print(
+                    f"step={global_step} loss={cur_loss:.4f} "
+                    f"tok/s={meter.tokens_per_sec():.0f} lr={scheduler.get_last_lr()[0]:.2e}"
+                )
+            accum_loss_tensor = None
+
+            # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
+            # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
             if should_save:
+                best_loss = float(best_loss_tensor.cpu())
+                is_best = bool(is_best_tensor.cpu())
                 meta = CheckpointMeta(
                     global_step=global_step,
                     best_loss=best_loss,

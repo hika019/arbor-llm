@@ -144,8 +144,9 @@ class ByteStreamDataset(IterableDataset):
                 if skip > 0:
                     skip -= 1
                     continue
-                ids = torch.tensor([b + off for b in chunk[:-1]], dtype=torch.long)
-                tgt = torch.tensor([b + off for b in chunk[1:]], dtype=torch.long)
+                buf = torch.frombuffer(bytearray(chunk), dtype=torch.uint8).long() + off
+                ids = buf[:-1]
+                tgt = buf[1:]
                 self._state.samples_emitted += 1
                 yield {"input_ids": ids, "labels": tgt}
 
