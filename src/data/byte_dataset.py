@@ -186,12 +186,25 @@ class ByteStreamDataset(IterableDataset):
 class _ResumableLoader(DataLoader):
     """DataLoader に state_dict / load_state_dict を生やしたラッパ."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._samples_emitted = 0
+
+    def __iter__(self):
+        for batch in super().__iter__():
+            if isinstance(batch, dict) and "input_ids" in batch:
+                self._samples_emitted += int(batch["input_ids"].shape[0])
+            yield batch
+
     def state_dict(self) -> dict[str, Any]:
         ds = self.dataset
-        return ds.state_dict() if hasattr(ds, "state_dict") else {}
+        state = ds.state_dict() if hasattr(ds, "state_dict") else {}
+        state["samples_emitted"] = self._samples_emitted
+        return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         ds = self.dataset
+        self._samples_emitted = int(state.get("samples_emitted", 0))
         if hasattr(ds, "load_state_dict"):
             ds.load_state_dict(state)
 
@@ -207,6 +220,11 @@ def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
         byte_offset=cfg.get("byte_offset", 4),
     )
     num_workers = cfg.get("num_workers", 4)
+    if num_workers > 1 and not cfg.get("allow_multi_worker_iterable", False):
+        raise ValueError(
+            "ByteStreamDataset is resumable only with num_workers <= 1. "
+            "Set allow_multi_worker_iterable=true only for non-resumable throughput experiments."
+        )
     kwargs: dict[str, Any] = dict(
         batch_size=cfg.get("micro_batch_size", 4),
         num_workers=num_workers,
