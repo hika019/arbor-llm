@@ -63,6 +63,12 @@ def apply_speed_settings(speed: dict) -> None:
     if speed.get("cudnn_benchmark", False):
         torch.backends.cudnn.benchmark = True
 
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 # ------------------------------------------------------------------- main
 def main() -> int:
@@ -72,7 +78,7 @@ def main() -> int:
     torch.manual_seed(cfg.get("seed", 42))
     apply_speed_settings(cfg.get("speed", {}))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = pick_device()
     print(f"[train] device={device} torch={torch.__version__}")
 
     # ---- モデル組み立て (BLT + BitLinear) は src.model.arbor_blt に集約 ----
