@@ -17,6 +17,8 @@ model:
   gradient_checkpointing: true
   bitlinear_in_global: true   # Global Latent のみ BitLinear 化
   fp_in_local: true           # Local Encoder/Decoder は FP 維持
+  patching_mode: space
+  patch_size: 4
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
 # 日本語主軸の混合 (2026-06-03): 日本語 60% + 英語 40%(うち news 15%).
@@ -55,12 +57,12 @@ speed:
   precision: bf16             # マスター重みも BF16
   tf32_matmul: true
   cudnn_benchmark: true
-  torch_compile: true         # compile 有効. 初回のみコンパイル (以降キャッシュ, 再起動も inductor disk cache で短縮)
+  torch_compile: false        # 現行実測: dynamic compile は追加compile頻発で平均が崩れるため eager 採用
   compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
   compile_dynamic: true       # 1B本走実測: static は patch_lengths 形状(~200種)で recompile地獄→cache64溢れ→step20未到達. 形状非依存の dynamic に確定 (2026-06-03)
   dynamo_cache_size_limit: 64
-  micro_batch_size: 8         # bench: compile=default bs=8 で 59.6k tok/s / 11.1GB (余裕大)
-  grad_accum_steps: 8         # 実効バッチ = 64
+  micro_batch_size: 2         # 4090/WSL実測の安全最速。4/16は遅く、8/8はdevice-not-readyで危険
+  grad_accum_steps: 32        # 実効バッチ = 64 を維持
   flash_attention: true
   fused_rmsnorm: true
   fused_swiglu: false         # FFN は squared ReLU なので未使用

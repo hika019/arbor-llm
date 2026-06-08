@@ -17,6 +17,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from src.model.bitlinear import BitLinear
 from src.model.global_latent import swap_linear_to_bitlinear
 
 _BLT_PATH = Path(__file__).resolve().parents[2] / "third_party" / "blt"
@@ -65,6 +66,10 @@ class _BLTWrapper(nn.Module):
         out = self.blt(input_ids)
         logits = out if isinstance(out, torch.Tensor) else out[0]
         return ArborOutput(logits=logits)
+
+
+def _count_modules(module: nn.Module, cls: type[nn.Module]) -> int:
+    return sum(1 for m in module.modules() if isinstance(m, cls))
 
 
 def _build_blt(cfg: dict[str, Any]) -> nn.Module:
@@ -122,6 +127,14 @@ def build_arbor_blt(cfg: dict[str, Any]) -> nn.Module:
         if cfg.get("bitlinear_in_global", False):
             n = swap_linear_to_bitlinear(model.body, skip_names=("embed",))
             print(f"[arbor_blt] stub body の Linear を BitLinear に置換: {n} 層")
+            print(
+                "[arbor_blt] bitnet_status="
+                f"ON scope=stub_body bitlinear_layers={_count_modules(model, BitLinear)} "
+                f"global_replaced={n} local_bitlinear_layers=0 "
+                "weights=W1.58 activations=A8 forward=ternary/int8 backward=STE"
+            )
+        else:
+            print("[arbor_blt] bitnet_status=OFF bitlinear_layers=0")
         return model
     if backend != "blt":
         raise ValueError(f"unknown model backend: {backend}")
@@ -151,4 +164,19 @@ def build_arbor_blt(cfg: dict[str, Any]) -> nn.Module:
         gt = blt.global_transformer
         n = swap_linear_to_bitlinear(gt, skip_names=("output", "embed", "tok_embeddings"))
         print(f"[arbor_blt] BLT global の Linear を BitLinear に置換: {n} 層")
+        local_names = ("local_encoder", "local_decoder")
+        local_bitlinear = sum(
+            _count_modules(getattr(blt, name), BitLinear)
+            for name in local_names
+            if hasattr(blt, name)
+        )
+        total_bitlinear = _count_modules(blt, BitLinear)
+        print(
+            "[arbor_blt] bitnet_status="
+            f"ON scope=global bitlinear_layers={total_bitlinear} "
+            f"global_replaced={n} local_bitlinear_layers={local_bitlinear} "
+            "weights=W1.58 activations=A8 forward=ternary/int8 backward=STE"
+        )
+    else:
+        print("[arbor_blt] bitnet_status=OFF bitlinear_layers=0")
     return _BLTWrapper(blt)

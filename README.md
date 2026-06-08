@@ -74,6 +74,29 @@ python -m src.train.train --config configs/arbor_1b.yaml --resume latest
 python -m src.train.train --config configs/arbor_1b.yaml --resume best
 ```
 
+### 1B の速度について
+
+README の 1B コマンドは「起動方法」であり、短時間で 1B を十分に学習できる保証ではない。
+現状の BitLinear は backward / optimizer まで fused した BitNet training stack ではないため、
+1B 設定の速度は通常の大規模 BF16 学習に近い。
+
+RTX 4090 の実測メモでは、固定形状 bench は `compile=default bs=8` で約 59.6k tok/s。
+ただし現行の 1B 本走は BLT の動的 patching で系列形状が揺れるため、この値は出ない。
+2026-06-08 の再測定では、`torch_compile: true` / `compile_dynamic: true` は追加 compile が
+頻発し、速い step だけでも 14-16k tok/s、compile 待ち込み平均は大きく崩れた。
+`torch_compile: false` / `micro_batch_size: 2` / `grad_accum_steps: 32` が現時点の安全な実測最速で、
+ローカルデータ上の定常は約 13k tok/s。
+
+1B 本走では `source scripts/env.sh` により以下を既定で入れる。
+
+```bash
+TORCHINDUCTOR_COMPILE_THREADS=12
+TORCHINDUCTOR_FX_GRAPH_CACHE=1
+```
+
+速度設定は `configs/arbor_1b.yaml` の `speed` が正で、現在は
+`torch_compile: false` / `micro_batch_size: 2` / `grad_accum_steps: 32`。
+
 学習中 `Ctrl+C` (SIGINT) または `kill -TERM <pid>` で次 step 境界にて
 安全保存して終了する。二度押しで強制終了。
 

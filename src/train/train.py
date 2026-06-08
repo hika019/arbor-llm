@@ -80,6 +80,9 @@ def main() -> int:
 
     device = pick_device()
     print(f"[train] device={device} torch={torch.__version__}")
+    if device.type == "cuda":
+        free, total = torch.cuda.mem_get_info()
+        print(f"[train] cuda_mem_free={free / 2**30:.2f}GiB total={total / 2**30:.2f}GiB")
 
     # ---- モデル組み立て (BLT + BitLinear) は src.model.arbor_blt に集約 ----
     from src.model.arbor_blt import build_arbor_blt  # 遅延 import (BLT 取り込み後に有効化)
@@ -95,12 +98,25 @@ def main() -> int:
         if csl:
             torch._dynamo.config.cache_size_limit = int(csl)
         dynamic = cfg["speed"].get("compile_dynamic", None)
+        print(f"[train] torch_compile=ON mode={mode} dynamic={dynamic} cache_size_limit={csl}")
         model = torch.compile(model, mode=mode, dynamic=dynamic)
+    else:
+        print("[train] torch_compile=OFF")
 
     # ---- データ (streaming, メモリに全部載せない) ----
     from src.data.byte_dataset import build_byte_dataloader
     data_cfg = dict(cfg["data"])
-    data_cfg.setdefault("micro_batch_size", cfg.get("speed", {}).get("micro_batch_size", 4))
+    speed_micro_batch = cfg.get("speed", {}).get("micro_batch_size")
+    if speed_micro_batch is not None:
+        data_micro_batch = data_cfg.get("micro_batch_size")
+        if data_micro_batch is not None and int(data_micro_batch) != int(speed_micro_batch):
+            print(
+                "[train] data.micro_batch_size="
+                f"{data_micro_batch} overridden by speed.micro_batch_size={speed_micro_batch}"
+            )
+        data_cfg["micro_batch_size"] = speed_micro_batch
+    else:
+        data_cfg.setdefault("micro_batch_size", 4)
     train_loader = build_byte_dataloader(data_cfg, split="train")
 
     # ---- optimizer / scheduler ----
@@ -136,25 +152,54 @@ def main() -> int:
     grad_accum = cfg["speed"].get("grad_accum_steps", 1)
     log_every = cfg["logging"].get("log_every_steps", 20)
     total_steps = cfg["optim"]["total_steps"]
+    micro_batch = data_cfg.get("micro_batch_size")
+    context_length = data_cfg.get("context_length")
+    if micro_batch and context_length:
+        tokens_per_update = int(micro_batch) * int(context_length) * int(grad_accum)
+        print(
+            "[train] throughput_meter="
+            f"optimizer_step rolling_window={meter.window} log_every={log_every} "
+            f"micro_batch={micro_batch} grad_accum={grad_accum} "
+            f"context_length={context_length} tokens_per_update={tokens_per_update}"
+        )
+        if int(micro_batch) < 4:
+            print(
+                "[train] speed_profile=low_vram "
+                "micro_batch<4 lowers GPU occupancy; README steady-state notes assume a larger micro-batch"
+            )
+    else:
+        print(
+            "[train] throughput_meter="
+            f"optimizer_step rolling_window={meter.window} log_every={log_every} "
+            f"grad_accum={grad_accum}"
+        )
+    print("[train] note=early tok/s includes compile/warmup; use logs after the rolling window fills for steady throughput")
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    accum_loss = 0.0
+    accum_loss_tensor: torch.Tensor | None = None
 
     data_iter = iter(train_loader)
     while global_step < total_steps:
         try:
+            tokens_this_step = 0
             for micro in range(grad_accum):
                 batch = next(data_iter)
                 inputs = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
+                tokens_this_step += inputs.numel()
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     out = model(inputs)
                     loss = torch.nn.functional.cross_entropy(
                         out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
                     ) / grad_accum
                 loss.backward()
-                accum_loss += loss.item()
+                detached_loss = loss.detach()
+                accum_loss_tensor = (
+                    detached_loss
+                    if accum_loss_tensor is None
+                    else accum_loss_tensor + detached_loss
+                )
 
             if cfg["optim"].get("grad_clip"):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["optim"]["grad_clip"])
@@ -163,13 +208,17 @@ def main() -> int:
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
-            meter.step(inputs.numel() * grad_accum)
+            meter.step(tokens_this_step)
 
+            cur_loss = (
+                float(accum_loss_tensor.float().cpu())
+                if accum_loss_tensor is not None
+                else 0.0
+            )
             if global_step % log_every == 0:
-                print(f"step={global_step} loss={accum_loss:.4f} "
+                print(f"step={global_step} loss={cur_loss:.4f} "
                       f"tok/s={meter.tokens_per_sec():.0f} lr={scheduler.get_last_lr()[0]:.2e}")
-            cur_loss = accum_loss
-            accum_loss = 0.0
+            accum_loss_tensor = None
 
             # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
             # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
