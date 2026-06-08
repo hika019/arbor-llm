@@ -57,7 +57,8 @@ speed:
   precision: bf16             # マスター重みも BF16
   tf32_matmul: true
   cudnn_benchmark: true
-  torch_compile: false        # 現行実測: dynamic compile は追加compile頻発で平均が崩れるため eager 採用
+  torch_compile: false        # 実測: global/model compile とも patch 数変動で総学習時間が悪化
+  compile_scope: global       # 有効化する場合: model=従来の全体 compile / global=BLT global_transformer のみ
   compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
   compile_dynamic: true       # 1B本走実測: static は patch_lengths 形状(~200種)で recompile地獄→cache64溢れ→step20未到達. 形状非依存の dynamic に確定 (2026-06-03)
   dynamo_cache_size_limit: 64

@@ -70,6 +70,46 @@ def pick_device() -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
+
+def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Module:
+    """Apply torch.compile according to speed config and return the trainable model."""
+    if not speed.get("torch_compile", False):
+        print("[train] torch_compile=OFF")
+        return model
+
+    mode = speed.get("compile_mode", "default")
+    # BLT の動的パッチングで seq 長が毎 step 変動し dynamo が recompile を繰り返す
+    # (cache_size_limit 既定 8 に到達→eager fallback) のを抑える:
+    #   dynamo_cache_size_limit: cache 上限 (recompile を許容する形状数)
+    #   compile_dynamic: None=auto / True=seq 次元を symbolic に1グラフ / False=静的
+    csl = speed.get("dynamo_cache_size_limit")
+    if csl:
+        torch._dynamo.config.cache_size_limit = int(csl)
+    dynamic = speed.get("compile_dynamic", None)
+    scope = speed.get("compile_scope", "model")
+
+    if scope == "off":
+        print("[train] torch_compile=OFF scope=off")
+        return model
+    if scope == "model":
+        print(
+            "[train] torch_compile=ON "
+            f"scope=model mode={mode} dynamic={dynamic} cache_size_limit={csl}"
+        )
+        return torch.compile(model, mode=mode, dynamic=dynamic)
+    if scope == "global":
+        blt = getattr(model, "blt", None)
+        global_transformer = getattr(blt, "global_transformer", None)
+        if global_transformer is None:
+            raise ValueError("compile_scope=global requires a BLT wrapper with blt.global_transformer")
+        print(
+            "[train] torch_compile=ON "
+            f"scope=global_transformer mode={mode} dynamic={dynamic} cache_size_limit={csl}"
+        )
+        blt.global_transformer = torch.compile(global_transformer, mode=mode, dynamic=dynamic)
+        return model
+    raise ValueError(f"unknown compile_scope: {scope}")
+
 # ------------------------------------------------------------------- main
 def main() -> int:
     args = parse_args()
@@ -87,21 +127,7 @@ def main() -> int:
     # ---- モデル組み立て (BLT + BitLinear) は src.model.arbor_blt に集約 ----
     from src.model.arbor_blt import build_arbor_blt  # 遅延 import (BLT 取り込み後に有効化)
     model = build_arbor_blt(cfg["model"]).to(device=device, dtype=torch.bfloat16)
-
-    if cfg["speed"].get("torch_compile", False):
-        mode = cfg["speed"].get("compile_mode", "default")
-        # BLT の動的パッチングで seq 長が毎 step 変動し dynamo が recompile を繰り返す
-        # (cache_size_limit 既定 8 に到達→eager fallback) のを抑える:
-        #   dynamo_cache_size_limit: cache 上限 (recompile を許容する形状数)
-        #   compile_dynamic: None=auto / True=seq 次元を symbolic に1グラフ / False=静的
-        csl = cfg["speed"].get("dynamo_cache_size_limit")
-        if csl:
-            torch._dynamo.config.cache_size_limit = int(csl)
-        dynamic = cfg["speed"].get("compile_dynamic", None)
-        print(f"[train] torch_compile=ON mode={mode} dynamic={dynamic} cache_size_limit={csl}")
-        model = torch.compile(model, mode=mode, dynamic=dynamic)
-    else:
-        print("[train] torch_compile=OFF")
+    model = apply_compile_settings(model, cfg["speed"])
 
     # ---- データ (streaming, メモリに全部載せない) ----
     from src.data.byte_dataset import build_byte_dataloader

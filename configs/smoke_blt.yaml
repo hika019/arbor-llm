@@ -54,6 +54,7 @@ speed:
   flash_attention: false
   fused_rmsnorm: false
   fused_swiglu: false
+  compile_scope: global
 
 checkpoint:
   dir: ./checkpoints/smoke_blt

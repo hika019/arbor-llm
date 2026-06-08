@@ -46,7 +46,8 @@ speed:
   precision: bf16
   tf32_matmul: true
   cudnn_benchmark: true
-  torch_compile: true        # bench: compile=default で 33k→59k tok/s (1.8x) & VRAM減. 動作確認済
+  torch_compile: false       # 実測: global/model compile とも patch 数変動で総学習時間が悪化
+  compile_scope: global      # 有効化する場合: model=従来の全体 compile / global=BLT global_transformer のみ
   compile_mode: default      # 初回のみコンパイルで数分待ち. 不安定なら false に戻す
   compile_dynamic: true      # BLT 動的パッチング: 動的1グラフで recompile 抑止 (mini で機能確認済)
   dynamo_cache_size_limit: 64
