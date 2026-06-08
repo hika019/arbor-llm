@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import os
 import sys
@@ -71,6 +72,17 @@ def pick_device() -> torch.device:
     return torch.device("cpu")
 
 
+def resolve_precision(name: str) -> tuple[torch.dtype, bool]:
+    normalized = name.lower()
+    if normalized in ("bf16", "bfloat16"):
+        return torch.bfloat16, True
+    if normalized in ("fp16", "float16"):
+        return torch.float16, True
+    if normalized in ("fp32", "float32"):
+        return torch.float32, False
+    raise ValueError(f"unknown speed.precision: {name}")
+
+
 def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Module:
     """Apply torch.compile according to speed config and return the trainable model."""
     if not speed.get("torch_compile", False):
@@ -126,7 +138,9 @@ def main() -> int:
 
     # ---- モデル組み立て (BLT + BitLinear) は src.model.arbor_blt に集約 ----
     from src.model.arbor_blt import build_arbor_blt  # 遅延 import (BLT 取り込み後に有効化)
-    model = build_arbor_blt(cfg["model"]).to(device=device, dtype=torch.bfloat16)
+    compute_dtype, use_autocast = resolve_precision(cfg.get("speed", {}).get("precision", "bf16"))
+    print(f"[train] precision={compute_dtype} autocast={use_autocast}")
+    model = build_arbor_blt(cfg["model"]).to(device=device, dtype=compute_dtype)
     model = apply_compile_settings(model, cfg["speed"])
 
     # ---- データ (streaming, メモリに全部載せない) ----
@@ -215,7 +229,12 @@ def main() -> int:
                 inputs = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
                 tokens_this_step += inputs.numel()
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                amp_context = (
+                    torch.autocast(device_type=device.type, dtype=compute_dtype)
+                    if use_autocast
+                    else nullcontext()
+                )
+                with amp_context:
                     out = model(inputs)
                     loss = torch.nn.functional.cross_entropy(
                         out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
