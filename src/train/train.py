@@ -142,6 +142,14 @@ def main() -> int:
     print(f"[train] precision={compute_dtype} autocast={use_autocast}")
     model = build_arbor_blt(cfg["model"]).to(device=device, dtype=compute_dtype)
     bitlinear_weight_cache = bool(cfg.get("speed", {}).get("bitlinear_weight_cache", False))
+    bitlinear_backward = cfg.get("speed", {}).get("bitlinear_backward", "ste")
+    if bitlinear_backward != "ste":
+        from src.model.bitlinear import set_bitlinear_backward_mode
+
+        n_backward = set_bitlinear_backward_mode(model, bitlinear_backward)
+        print(f"[train] bitlinear_backward={bitlinear_backward} layers={n_backward}")
+    else:
+        print("[train] bitlinear_backward=ste")
     if bitlinear_weight_cache:
         from src.model.bitlinear import set_bitlinear_weight_cache
 

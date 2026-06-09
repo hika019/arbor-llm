@@ -11,6 +11,7 @@ from src.model.bitlinear import (
     pack_ternary_weight,
     quantize_activation_int8,
     quantize_weight_ternary,
+    set_bitlinear_backward_mode,
     set_bitlinear_weight_cache,
     unpack_ternary_weight,
 )
@@ -58,6 +59,32 @@ def test_bitlinear_weight_cache_helpers_toggle_modules():
     assert clear_bitlinear_weight_cache(model) == 2
     assert set_bitlinear_weight_cache(model, False) == 2
     assert not any(m.cache_packed_weight for m in model.modules() if isinstance(m, BitLinear))
+
+
+def test_bitlinear_quantized_grad_x_backward_mode_cpu_fallback():
+    layer = BitLinear(7, 5)
+    layer.set_backward_mode("quantized_grad_x")
+    x = torch.randn(3, 4, 7, dtype=torch.bfloat16, requires_grad=True)
+
+    y = layer(x)
+    y.float().sum().backward()
+
+    assert y.shape == (3, 4, 5)
+    assert x.grad is not None
+    assert layer.weight.grad is not None
+
+
+def test_bitlinear_backward_mode_helper_validates_mode():
+    model = torch.nn.Sequential(BitLinear(7, 5), BitLinear(5, 3))
+
+    assert set_bitlinear_backward_mode(model, "quantized_grad_x") == 2
+    assert all(
+        m.backward_mode == "quantized_grad_x"
+        for m in model.modules()
+        if isinstance(m, BitLinear)
+    )
+    with pytest.raises(ValueError, match="backward_mode"):
+        set_bitlinear_backward_mode(model, "unknown")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton kernel")

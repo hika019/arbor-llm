@@ -178,6 +178,42 @@ def _packed_bitlinear_forward(
     )
 
 
+def _quantized_grad_x(
+    grad_out: torch.Tensor,
+    w_q: torch.Tensor,
+    sw: torch.Tensor,
+    out_dtype: torch.dtype,
+    w_t_packed: torch.Tensor | None = None,
+) -> torch.Tensor:
+    orig_shape = grad_out.shape[:-1]
+    g_q, sg = quantize_activation_int8(grad_out)
+    g_q_2d = g_q.reshape(-1, g_q.size(-1))
+    sg_2d = sg.reshape(-1, 1)
+    if w_t_packed is not None:
+        y = _packed_bitlinear_forward_from_packed(
+            x_q=g_q_2d,
+            sx=sg_2d,
+            w_packed=w_t_packed,
+            k=w_q.size(0),
+            n=w_q.size(1),
+            sw=sw,
+            out_dtype=out_dtype,
+        )
+    else:
+        y = _packed_bitlinear_forward(
+            x_q=g_q_2d,
+            sx=sg_2d,
+            w_q=w_q.t().contiguous(),
+            sw=sw,
+            out_dtype=out_dtype,
+        )
+    if y is None:
+        y = F.linear(g_q.to(out_dtype), w_q.t().to(out_dtype)) * sg.to(out_dtype) * sw.to(out_dtype)
+    else:
+        y = y.reshape(*orig_shape, w_q.size(1))
+    return y.to(out_dtype)
+
+
 class _BitLinearSTE(torch.autograd.Function):
     """STE wrapper: forward uses quantized w & x, backward passes grads through."""
 
@@ -189,6 +225,8 @@ class _BitLinearSTE(torch.autograd.Function):
         w_q_cached: torch.Tensor | None = None,
         sw_cached: torch.Tensor | None = None,
         w_packed_cached: torch.Tensor | None = None,
+        w_t_packed_cached: torch.Tensor | None = None,
+        backward_mode: str = "ste",
     ):
         orig_shape = x.shape[:-1]
         x_q, sx = quantize_activation_int8(x)
@@ -214,19 +252,32 @@ class _BitLinearSTE(torch.autograd.Function):
             y = F.linear(x_q.to(x.dtype), w_q.to(x.dtype)) * sx * sw
         else:
             y = y.reshape(*orig_shape, w.size(0))
-        ctx.save_for_backward(x, w)
+        ctx.save_for_backward(x, w, w_q, sw)
+        ctx.w_t_packed = w_t_packed_cached
+        ctx.backward_mode = backward_mode
         return y
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x, w = ctx.saved_tensors
+        x, w, w_q, sw = ctx.saved_tensors
         # STE: 量子化を恒等視して勾配を素通し. autocast 由来の dtype 混在を吸収する.
         g = grad_out.to(w.dtype)
-        grad_x = (g @ w).to(x.dtype)
+        if ctx.backward_mode == "quantized_grad_x":
+            grad_x = _quantized_grad_x(
+                grad_out=g,
+                w_q=w_q,
+                sw=sw,
+                out_dtype=x.dtype,
+                w_t_packed=ctx.w_t_packed,
+            )
+        elif ctx.backward_mode == "ste":
+            grad_x = (g @ w).to(x.dtype)
+        else:
+            raise ValueError(f"unknown BitLinear backward_mode: {ctx.backward_mode}")
         flat_g = g.reshape(-1, g.size(-1))
         flat_x = x.reshape(-1, x.size(-1)).to(w.dtype)
         grad_w = flat_g.t() @ flat_x
-        return grad_x, grad_w, None, None, None
+        return grad_x, grad_w, None, None, None, None, None
 
 
 class BitLinear(nn.Module):
@@ -242,6 +293,7 @@ class BitLinear(nn.Module):
         out_features: int,
         bias: bool = False,
         cache_packed_weight: bool = False,
+        backward_mode: str = "ste",
     ):
         super().__init__()
         if bias:
@@ -249,12 +301,14 @@ class BitLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.cache_packed_weight = cache_packed_weight
+        self.backward_mode = backward_mode
         self._cache_weight_version: int | None = None
         self._cache_device: torch.device | None = None
         self._cache_dtype: torch.dtype | None = None
         self._cache_w_q: torch.Tensor | None = None
         self._cache_sw: torch.Tensor | None = None
         self._cache_w_packed: torch.Tensor | None = None
+        self._cache_w_t_packed: torch.Tensor | None = None
         # BF16 シャドウ重みを master とする (学習対象).
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16))
         # 一部の nn 標準モジュール (MultiheadAttention 等) が .bias を直接参照するため
@@ -269,17 +323,23 @@ class BitLinear(nn.Module):
         self._cache_w_q = None
         self._cache_sw = None
         self._cache_w_packed = None
+        self._cache_w_t_packed = None
 
     def set_weight_cache_enabled(self, enabled: bool) -> None:
         self.cache_packed_weight = enabled
         if not enabled:
             self.clear_weight_cache()
 
+    def set_backward_mode(self, mode: str) -> None:
+        if mode not in ("ste", "quantized_grad_x"):
+            raise ValueError(f"unknown BitLinear backward_mode: {mode}")
+        self.backward_mode = mode
+
     def _cached_quantized_weight(
         self,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if not self.cache_packed_weight or triton is None or not self.weight.is_cuda:
-            return None, None, None
+            return None, None, None, None
         version = self.weight._version
         if (
             self._cache_weight_version == version
@@ -288,29 +348,41 @@ class BitLinear(nn.Module):
             and self._cache_w_q is not None
             and self._cache_sw is not None
             and self._cache_w_packed is not None
+            and self._cache_w_t_packed is not None
         ):
-            return self._cache_w_q, self._cache_sw, self._cache_w_packed
+            return self._cache_w_q, self._cache_sw, self._cache_w_packed, self._cache_w_t_packed
 
         with torch.no_grad():
             w_q, sw = quantize_weight_ternary(self.weight)
             w_packed = pack_ternary_weight(w_q).contiguous()
+            w_t_packed = pack_ternary_weight(w_q.t().contiguous()).contiguous()
         self._cache_weight_version = version
         self._cache_device = self.weight.device
         self._cache_dtype = self.weight.dtype
         self._cache_w_q = w_q
         self._cache_sw = sw
         self._cache_w_packed = w_packed
-        return w_q, sw, w_packed
+        self._cache_w_t_packed = w_t_packed
+        return w_q, sw, w_packed, w_t_packed
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_q, sw, w_packed = self._cached_quantized_weight()
-        return _BitLinearSTE.apply(x, self.weight, w_q, sw, w_packed)
+        w_q, sw, w_packed, w_t_packed = self._cached_quantized_weight()
+        return _BitLinearSTE.apply(
+            x,
+            self.weight,
+            w_q,
+            sw,
+            w_packed,
+            w_t_packed,
+            self.backward_mode,
+        )
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias=False, w_dtype={self.weight.dtype}, "
-            f"cache_packed_weight={self.cache_packed_weight}"
+            f"cache_packed_weight={self.cache_packed_weight}, "
+            f"backward_mode={self.backward_mode}"
         )
 
 
@@ -328,5 +400,14 @@ def clear_bitlinear_weight_cache(module: nn.Module) -> int:
     for child in module.modules():
         if isinstance(child, BitLinear):
             child.clear_weight_cache()
+            count += 1
+    return count
+
+
+def set_bitlinear_backward_mode(module: nn.Module, mode: str) -> int:
+    count = 0
+    for child in module.modules():
+        if isinstance(child, BitLinear):
+            child.set_backward_mode(mode)
             count += 1
     return count

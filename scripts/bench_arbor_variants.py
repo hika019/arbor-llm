@@ -28,7 +28,11 @@ if str(_ROOT / "third_party" / "blt") not in sys.path:
     sys.path.insert(0, str(_ROOT / "third_party" / "blt"))
 
 from src.model.arbor_blt import build_arbor_blt  # noqa: E402
-from src.model.bitlinear import clear_bitlinear_weight_cache, set_bitlinear_weight_cache  # noqa: E402
+from src.model.bitlinear import (  # noqa: E402
+    clear_bitlinear_weight_cache,
+    set_bitlinear_backward_mode,
+    set_bitlinear_weight_cache,
+)
 from src.train.optim import build_optimizer  # noqa: E402
 from src.train.train import apply_compile_settings, apply_speed_settings, resolve_precision  # noqa: E402
 
@@ -71,6 +75,33 @@ def _variant_cfg(base: dict[str, Any], variant: str) -> dict[str, Any]:
             local_num_attention_heads=8,
             local_num_key_value_heads=4,
         )
+    elif variant == "ffn6528_local1024_qgx":
+        cfg["model"].update(
+            intermediate_size=6528,
+            local_hidden_size=1024,
+            local_num_attention_heads=8,
+            local_num_key_value_heads=4,
+        )
+        cfg["speed"]["bitlinear_backward"] = "quantized_grad_x"
+    elif variant == "ffn6528_local1024_lion":
+        cfg["model"].update(
+            intermediate_size=6528,
+            local_hidden_size=1024,
+            local_num_attention_heads=8,
+            local_num_key_value_heads=4,
+        )
+        cfg["optim"]["optimizer"] = "lion"
+        cfg["optim"]["betas"] = (0.9, 0.99)
+    elif variant == "ffn6528_local1024_qgx_lion":
+        cfg["model"].update(
+            intermediate_size=6528,
+            local_hidden_size=1024,
+            local_num_attention_heads=8,
+            local_num_key_value_heads=4,
+        )
+        cfg["speed"]["bitlinear_backward"] = "quantized_grad_x"
+        cfg["optim"]["optimizer"] = "lion"
+        cfg["optim"]["betas"] = (0.9, 0.99)
     else:
         raise ValueError(f"unknown variant: {variant}")
 
@@ -143,10 +174,15 @@ def run_one(
     print(
         f"[bench] variant={variant} batch={batch_size} seq={seq_len} "
         f"grad_accum={grad_accum} cache={speed.get('bitlinear_weight_cache', False)} "
+        f"backward={speed.get('bitlinear_backward', 'ste')} "
+        f"optimizer={cfg['optim'].get('optimizer')} "
         f"hidden={cfg['model']['hidden_size']} inter={cfg['model']['intermediate_size']} "
         f"local={cfg['model'].get('local_hidden_size', cfg['model']['hidden_size'])}"
     )
     model = build_arbor_blt(cfg["model"]).to(device=device, dtype=compute_dtype)
+    backward_mode = speed.get("bitlinear_backward", "ste")
+    if backward_mode != "ste":
+        print(f"[bench] backward_layers={set_bitlinear_backward_mode(model, backward_mode)}")
     cache_enabled = bool(speed.get("bitlinear_weight_cache", False))
     if cache_enabled:
         print(f"[bench] cache_layers={set_bitlinear_weight_cache(model, True)}")
