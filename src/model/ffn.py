@@ -57,12 +57,16 @@ class ReLU2FeedForward(nn.Module):
             nn.init.trunc_normal_(w.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
 
-def swap_swiglu_to_relu2(module: nn.Module) -> int:
+def swap_swiglu_to_relu2(module: nn.Module, hidden_dim: int | None = None) -> int:
     """module 配下の BLT FeedForward (SwiGLU) を ReLU2FeedForward に再帰置換.
 
     BLT 側の `FeedForward` 子モジュールを名前で発見し, 同等の (dim, hidden_dim)
-    で ReLU2 版を組み立てて差し替える. 戻り値は置換した層数.
+    で ReLU2 版を組み立てて差し替える. ``hidden_dim`` が指定された場合は
+    global FFN の intermediate 幅として明示的に使う. 戻り値は置換した層数.
     """
+    if hidden_dim is not None and hidden_dim <= 0:
+        raise ValueError(f"hidden_dim must be positive: {hidden_dim}")
+
     # 遅延 import で third_party 依存をモジュール読込時に走らせない.
     from bytelatent.base_transformer import FeedForward as BLTFeedForward  # type: ignore
 
@@ -71,7 +75,7 @@ def swap_swiglu_to_relu2(module: nn.Module) -> int:
         if isinstance(child, BLTFeedForward):
             new = ReLU2FeedForward(
                 dim=child.dim,
-                hidden_dim=child.hidden_dim,
+                hidden_dim=hidden_dim if hidden_dim is not None else child.hidden_dim,
                 multiple_of=1,  # 既に揃った hidden_dim をそのまま使う
                 ffn_dim_multiplier=None,
             )
@@ -79,5 +83,5 @@ def swap_swiglu_to_relu2(module: nn.Module) -> int:
             setattr(module, name, new)
             count += 1
         else:
-            count += swap_swiglu_to_relu2(child)
+            count += swap_swiglu_to_relu2(child, hidden_dim=hidden_dim)
     return count

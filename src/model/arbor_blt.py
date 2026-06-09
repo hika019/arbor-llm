@@ -164,8 +164,14 @@ def build_arbor_blt(cfg: dict[str, Any]) -> nn.Module:
     # BitNet 2B4T 整合: SwiGLU を ReLU² に差し替え (Global のみ)
     if cfg.get("relu2_ffn_in_global", True):
         from src.model.ffn import swap_swiglu_to_relu2
-        n_ffn = swap_swiglu_to_relu2(blt.global_transformer)
-        print(f"[arbor_blt] BLT global の SwiGLU を ReLU² FFN に置換: {n_ffn} 層")
+        intermediate_size = cfg.get("intermediate_size")
+        n_ffn = swap_swiglu_to_relu2(blt.global_transformer, hidden_dim=intermediate_size)
+        width_msg = (
+            f" intermediate_size={intermediate_size}"
+            if intermediate_size is not None
+            else ""
+        )
+        print(f"[arbor_blt] BLT global の SwiGLU を ReLU² FFN に置換: {n_ffn} 層{width_msg}")
 
     if cfg.get("bitlinear_in_global", False):
         gt = blt.global_transformer

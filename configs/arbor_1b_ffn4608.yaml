@@ -1,0 +1,74 @@
+# Arbor-LLM 1B FFN 4608 comparison config.
+
+run_name: arbor_1b_ffn4608_v0
+seed: 42
+
+model:
+  vocab_size: 260
+  hidden_size: 2048
+  intermediate_size: 4608
+  num_hidden_layers: 22
+  num_attention_heads: 16
+  num_key_value_heads: 4
+  max_position_embeddings: 2048
+  rope_theta: 500000.0
+  use_flash_attention: true
+  gradient_checkpointing: true
+  bitlinear_in_global: true
+  fp_in_local: true
+  patching_mode: space
+  patch_size: 4
+
+data:
+  sources:
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      weight: 0.60
+    - path: "vblagoje/cc_news"
+      weight: 0.15
+    - path: "HuggingFaceFW/fineweb-edu"
+      weight: 0.25
+  streaming: true
+  shuffle_buffer: 2000
+  context_length: 2048
+  num_workers: 0
+  prefetch_factor: 4
+  pin_memory: true
+
+optim:
+  optimizer: bnb_adamw_8bit
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  warmup_steps: 2000
+  total_steps: 200000
+
+speed:
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: true
+  torch_compile: false
+  compile_scope: global
+  compile_mode: default
+  compile_dynamic: true
+  dynamo_cache_size_limit: 64
+  micro_batch_size: 2
+  grad_accum_steps: 32
+  flash_attention: true
+  fused_rmsnorm: true
+  fused_swiglu: false
+
+checkpoint:
+  dir: ./checkpoints/arbor_1b_ffn4608
+  save_every_steps: 1000
+  keep_last_k: 3
+  keep_every_n_steps: 10000
+  async_save: false
+
+logging:
+  wandb_project: arbor-llm
+  log_every_steps: 5
+  throughput_window: 50

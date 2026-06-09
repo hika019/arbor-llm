@@ -46,6 +46,18 @@ def test_blt_uses_configured_kv_heads():
     assert model.local_decoder.layers[0].attention.n_kv_heads == 2
 
 
+def test_blt_uses_configured_relu2_intermediate_size():
+    model = arbor_blt.build_arbor_blt(
+        _cfg(
+            intermediate_size=24,
+            max_position_embeddings=64,
+            relu2_ffn_in_global=True,
+        )
+    )
+
+    assert model.blt.global_transformer.layers[0].feed_forward.hidden_dim == 24
+
+
 def test_blt_rejects_invalid_kv_heads():
     with pytest.raises(ValueError, match="num_attention_heads"):
         arbor_blt._build_blt(_cfg(num_key_value_heads=3))
