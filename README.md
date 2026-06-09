@@ -96,7 +96,8 @@ TORCHINDUCTOR_FX_GRAPH_CACHE=1
 
 速度設定は `configs/arbor_1b.yaml` の `speed` が正で、現在は
 `torch_compile: false` / `bitlinear_weight_cache: true` /
-`micro_batch_size: 4` / `grad_accum_steps: 16`。
+`bitlinear_backward: ste` / `micro_batch_size: 4` / `grad_accum_steps: 16`。
+optimizer は synthetic bench で軽かった `lion`。
 
 2026-06-09 の synthetic 1B bench (RTX 4090 / WSL, data I/O 除外, `batch=4`
 `seq=2048` `grad_accum=4`) では以下。
@@ -106,6 +107,15 @@ base arbor_1b          23.5k tok/s  13.5GiB
 BitLinear weight cache 24.7k tok/s  14.4GiB
 local_hidden_size=1024 29.5k tok/s  12.0GiB
 1.00B fast config      27.7k tok/s  13.0GiB
+```
+
+backward / optimizer 実験 (`batch=4` `seq=2048` `grad_accum=4`, 同日) では以下。
+
+```text
+1.00B fast + AdamW8bit          24.9k tok/s
+quantized_grad_x + AdamW8bit    22.4k tok/s
+1.00B fast + Lion               26.5k tok/s
+quantized_grad_x + Lion         21.5k tok/s
 ```
 
 `configs/arbor_1b_fast.yaml` は `hidden_size=2048` / `num_hidden_layers=22` を維持し、
@@ -118,9 +128,10 @@ grad accumulation 中の packed ternary weight を再利用する。
 `compile_scope=global` が 369 tok/s、`compile_scope=model` が 158 tok/s まで落ちたため、
 現状は無効化が妥当。
 
-`f16` や `f4` だけに寄せても、現状は backward / optimizer が BF16/8bit Adam 経路に残るため
+`f16` や `f4` だけに寄せても、現状は backward の大半が dense BF16 matmul に残るため
 学習速度は単純には伸びない。今効いているのは「forward packed weight の再利用」と
-「FP local 部の縮小」。
+「FP local 部の縮小」と「Lion optimizer」。`quantized_grad_x` は実装済みだが、
+現状のkernel粒度では追加量子化/Triton呼び出しのコストが勝つため既定では使わない。
 
 学習中 `Ctrl+C` (SIGINT) または `kill -TERM <pid>` で次 step 境界にて
 安全保存して終了する。二度押しで強制終了。

@@ -48,9 +48,9 @@ data:
   pin_memory: true
 
 optim:
-  optimizer: bnb_adamw_8bit
+  optimizer: lion
   lr: 3.0e-4
-  betas: [0.9, 0.95]
+  betas: [0.9, 0.99]
   eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
@@ -68,6 +68,7 @@ speed:
   compile_dynamic: true
   dynamo_cache_size_limit: 64
   bitlinear_weight_cache: true
+  bitlinear_backward: ste
   micro_batch_size: 4
   grad_accum_steps: 16
   flash_attention: true

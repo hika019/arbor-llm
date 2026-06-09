@@ -45,9 +45,9 @@ data:
 
 # ---- 最適化 ----
 optim:
-  optimizer: bnb_adamw_8bit   # bitsandbytes 8bit Adam (state を 1/4 に圧縮)
+  optimizer: lion              # 1 momentum tensor + sign update. synthetic benchでAdamW8bitより軽い
   lr: 3.0e-4
-  betas: [0.9, 0.95]
+  betas: [0.9, 0.99]
   eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
@@ -66,6 +66,7 @@ speed:
   compile_dynamic: true       # 1B本走実測: static は patch_lengths 形状(~200種)で recompile地獄→cache64溢れ→step20未到達. 形状非依存の dynamic に確定 (2026-06-03)
   dynamo_cache_size_limit: 64
   bitlinear_weight_cache: true # grad accumulation 中は packed ternary weight を再利用
+  bitlinear_backward: ste      # quantized_grad_x は現状benchで遅いため無効
   micro_batch_size: 4         # 4090/WSL実測の安全最速。VRAMを抑えてPCIe退避を避ける
   grad_accum_steps: 16        # 実効バッチ = 64 を維持
   flash_attention: true
