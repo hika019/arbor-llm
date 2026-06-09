@@ -82,6 +82,7 @@ def _build_blt(cfg: dict[str, Any]) -> nn.Module:
     from bytelatent.model.blt import ByteLatentTransformer, ByteLatentTransformerArgs
 
     h = cfg["hidden_size"]
+    local_h = cfg.get("local_hidden_size", h)
     n_heads = cfg["num_attention_heads"]
     n_kv_heads = cfg.get("num_key_value_heads", n_heads)
     if n_heads % n_kv_heads != 0:
@@ -89,21 +90,33 @@ def _build_blt(cfg: dict[str, Any]) -> nn.Module:
             "num_attention_heads must be divisible by num_key_value_heads: "
             f"{n_heads=} {n_kv_heads=}"
         )
+    local_heads = cfg.get("local_num_attention_heads", n_heads)
+    local_kv_heads = cfg.get("local_num_key_value_heads", min(n_kv_heads, local_heads))
+    if local_h % local_heads != 0:
+        raise ValueError(
+            "local_hidden_size must be divisible by local_num_attention_heads: "
+            f"{local_h=} {local_heads=}"
+        )
+    if local_heads % local_kv_heads != 0:
+        raise ValueError(
+            "local_num_attention_heads must be divisible by local_num_key_value_heads: "
+            f"{local_heads=} {local_kv_heads=}"
+        )
     n_layers = cfg["num_hidden_layers"]
     max_seq = cfg.get("max_position_embeddings", 256)
     patch_size = cfg.get("patch_size", 4)
 
     args = ByteLatentTransformerArgs(
         vocab_size=cfg["vocab_size"],
-        dim=h, dim_global=h, dim_token=h,
-        dim_local_encoder=h, dim_local_decoder=h,
+        dim=h, dim_global=h, dim_token=local_h,
+        dim_local_encoder=local_h, dim_local_decoder=local_h,
         n_layers=n_layers,
         n_layers_global=n_layers,
         n_layers_local_encoder=cfg.get("num_local_layers", 1),
         n_layers_local_decoder=cfg.get("num_local_layers", 1),
         n_heads=n_heads, n_heads_global=n_heads,
-        n_heads_local_encoder=n_heads, n_heads_local_decoder=n_heads,
-        n_kv_heads=n_kv_heads, n_kv_heads_global=n_kv_heads,
+        n_heads_local_encoder=local_heads, n_heads_local_decoder=local_heads,
+        n_kv_heads=local_kv_heads, n_kv_heads_global=n_kv_heads,
         patch_size=patch_size, patching_mode=cfg.get("patching_mode", "space"),
         max_encoder_seq_length=max_seq, max_seqlen=max_seq, max_length=max_seq // patch_size,
         use_local_encoder_transformer=True,
