@@ -3,6 +3,32 @@
 run_name: arbor_1b_v0
 seed: 42
 
+# ---- 文字列で指定する主な選択肢 ----
+# model.patching_mode:
+#   space              空白優先の動的patching。現状の推奨
+#   static             固定長patching
+#   byte               1 byte = 1 patch
+#   entropy/bpe/...    upstream BLT用。追加モデル/前処理が必要な場合があるため未推奨
+# optim.optimizer:
+#   lion               軽量。現状の推奨
+#   bnb_adamw_8bit     bitsandbytes AdamW8bit。安定寄り
+#   adamw_fused        torch AdamW fallback/smoke用
+# speed.precision:
+#   bf16               推奨
+#   fp16               試験用
+#   fp32               smoke/debug用。遅い
+# speed.compile_scope:
+#   global             global_transformerだけcompile対象にする設定値
+#   model              model全体
+#   off                compile_scopeだけで無効化
+# speed.compile_mode:
+#   default            推奨
+#   reduce-overhead    torch.compile標準mode
+#   max-autotune       autotuneが重い。現状非推奨
+# speed.bitlinear_backward:
+#   ste                推奨。通常のSTE backward
+#   quantized_grad_x   実験用。grad_xだけ量子化近似。現状benchでは遅い
+
 # ---- モデル (Global Latent Transformer; BLT 全体は別途構築) ----
 model:
   vocab_size: 260           # 256 バイト + 特殊トークン少数
@@ -20,7 +46,7 @@ model:
   gradient_checkpointing: true
   bitlinear_in_global: true   # Global Latent のみ BitLinear 化
   fp_in_local: true           # Local Encoder/Decoder は FP 維持
-  patching_mode: space
+  patching_mode: space        # choices: space | static | byte | entropy | bpe | bpe_patcher
   patch_size: 4
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
@@ -45,28 +71,28 @@ data:
 
 # ---- 最適化 ----
 optim:
-  optimizer: lion              # 1 momentum tensor + sign update. synthetic benchでAdamW8bitより軽い
+  optimizer: lion              # choices: lion | bnb_adamw_8bit | adamw_fused
   lr: 3.0e-4
   betas: [0.9, 0.99]
   eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
-  scheduler: cosine_warmup
+  scheduler: cosine_warmup     # choices: cosine_warmup
   warmup_steps: 2000
   total_steps: 200000
 
 # ---- スループット最適化 ----
 speed:
-  precision: bf16             # マスター重みも BF16
+  precision: bf16             # choices: bf16 | fp16 | fp32
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: false        # 実測: global/model compile とも patch 数変動で総学習時間が悪化
-  compile_scope: global       # 有効化する場合: model=従来の全体 compile / global=BLT global_transformer のみ
-  compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
+  compile_scope: global       # choices: global | model | off
+  compile_mode: default       # choices: default | reduce-overhead | max-autotune
   compile_dynamic: true       # 1B本走実測: static は patch_lengths 形状(~200種)で recompile地獄→cache64溢れ→step20未到達. 形状非依存の dynamic に確定 (2026-06-03)
   dynamo_cache_size_limit: 64
   bitlinear_weight_cache: true # grad accumulation 中は packed ternary weight を再利用
-  bitlinear_backward: ste      # quantized_grad_x は現状benchで遅いため無効
+  bitlinear_backward: ste # choices: ste | quantized_grad_x
   micro_batch_size: 4         # 4090/WSL実測の安全最速。VRAMを抑えてPCIe退避を避ける
   grad_accum_steps: 16        # 実効バッチ = 64 を維持
   flash_attention: true
