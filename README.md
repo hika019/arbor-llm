@@ -95,7 +95,8 @@ TORCHINDUCTOR_FX_GRAPH_CACHE=1
 ```
 
 速度設定は `configs/arbor_1b.yaml` の `speed` が正で、現在は
-`torch_compile: false` / `micro_batch_size: 2` / `grad_accum_steps: 32`。
+`torch_compile: false` / `bitlinear_weight_cache: true` /
+`micro_batch_size: 4` / `grad_accum_steps: 16`。
 
 2026-06-09 の synthetic 1B bench (RTX 4090 / WSL, data I/O 除外, `batch=4`
 `seq=2048` `grad_accum=4`) では以下。
@@ -111,6 +112,11 @@ local_hidden_size=1024 29.5k tok/s  12.0GiB
 FP の Local Encoder/Decoder を `1024` 幅に縮小、Global FFN を `6528` に広げて約
 1.00B params に合わせた速度実験用 config。`speed.bitlinear_weight_cache: true` で
 grad accumulation 中の packed ternary weight を再利用する。
+同じ形状を現在の `configs/arbor_1b.yaml` にも反映済み。
+
+部分 compile は mini bench (`batch=8` `seq=256`, 2026-06-09) でも eager 3.9k tok/s に対し
+`compile_scope=global` が 369 tok/s、`compile_scope=model` が 158 tok/s まで落ちたため、
+現状は無効化が妥当。
 
 `f16` や `f4` だけに寄せても、現状は backward / optimizer が BF16/8bit Adam 経路に残るため
 学習速度は単純には伸びない。今効いているのは「forward packed weight の再利用」と

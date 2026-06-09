@@ -7,10 +7,13 @@ seed: 42
 model:
   vocab_size: 260           # 256 バイト + 特殊トークン少数
   hidden_size: 2048
-  intermediate_size: 5632   # FFN: squared ReLU
+  intermediate_size: 6528   # FFN: squared ReLU. local縮小後も約1.00B paramsに合わせる
   num_hidden_layers: 22     # BitNet 2B4T=24 を 1B 用に縮小
   num_attention_heads: 16
   num_key_value_heads: 4    # GQA
+  local_hidden_size: 1024   # FP Local Encoder/Decoder を縮小して速度・VRAMを改善
+  local_num_attention_heads: 8
+  local_num_key_value_heads: 4
   max_position_embeddings: 2048
   rope_theta: 500000.0
   use_flash_attention: true
@@ -62,8 +65,9 @@ speed:
   compile_mode: default       # bench: max-autotune は default 比 +3%のみ・autotune遅いので default
   compile_dynamic: true       # 1B本走実測: static は patch_lengths 形状(~200種)で recompile地獄→cache64溢れ→step20未到達. 形状非依存の dynamic に確定 (2026-06-03)
   dynamo_cache_size_limit: 64
-  micro_batch_size: 2         # 4090/WSL実測の安全最速。4/16は遅く、8/8はdevice-not-readyで危険
-  grad_accum_steps: 32        # 実効バッチ = 64 を維持
+  bitlinear_weight_cache: true # grad accumulation 中は packed ternary weight を再利用
+  micro_batch_size: 4         # 4090/WSL実測の安全最速。VRAMを抑えてPCIe退避を避ける
+  grad_accum_steps: 16        # 実効バッチ = 64 を維持
   flash_attention: true
   fused_rmsnorm: true
   fused_swiglu: false         # FFN は squared ReLU なので未使用
@@ -79,5 +83,5 @@ checkpoint:
 # ---- ログ ----
 logging:
   wandb_project: arbor-llm
-  log_every_steps: 20
+  log_every_steps: 1
   throughput_window: 50       # tokens/sec を直近 N step で平均
