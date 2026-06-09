@@ -64,6 +64,13 @@ def _variant_cfg(base: dict[str, Any], variant: str) -> dict[str, Any]:
             local_num_attention_heads=8,
             local_num_key_value_heads=4,
         )
+    elif variant == "ffn6528_local1024":
+        cfg["model"].update(
+            intermediate_size=6528,
+            local_hidden_size=1024,
+            local_num_attention_heads=8,
+            local_num_key_value_heads=4,
+        )
     else:
         raise ValueError(f"unknown variant: {variant}")
 
