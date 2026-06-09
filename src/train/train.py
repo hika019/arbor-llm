@@ -141,6 +141,14 @@ def main() -> int:
     compute_dtype, use_autocast = resolve_precision(cfg.get("speed", {}).get("precision", "bf16"))
     print(f"[train] precision={compute_dtype} autocast={use_autocast}")
     model = build_arbor_blt(cfg["model"]).to(device=device, dtype=compute_dtype)
+    bitlinear_weight_cache = bool(cfg.get("speed", {}).get("bitlinear_weight_cache", False))
+    if bitlinear_weight_cache:
+        from src.model.bitlinear import set_bitlinear_weight_cache
+
+        n_cached = set_bitlinear_weight_cache(model, True)
+        print(f"[train] bitlinear_weight_cache=ON layers={n_cached}")
+    else:
+        print("[train] bitlinear_weight_cache=OFF")
     model = apply_compile_settings(model, cfg["speed"])
 
     # ---- データ (streaming, メモリに全部載せない) ----
@@ -253,6 +261,10 @@ def main() -> int:
                 )
             optimizer.step()
             scheduler.step()
+            if bitlinear_weight_cache:
+                from src.model.bitlinear import clear_bitlinear_weight_cache
+
+                clear_bitlinear_weight_cache(model)
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1

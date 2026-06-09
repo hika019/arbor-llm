@@ -7,9 +7,11 @@ import torch.nn.functional as F
 from src.model.bitlinear import (
     BitLinear,
     _packed_bitlinear_forward,
+    clear_bitlinear_weight_cache,
     pack_ternary_weight,
     quantize_activation_int8,
     quantize_weight_ternary,
+    set_bitlinear_weight_cache,
     unpack_ternary_weight,
 )
 
@@ -41,6 +43,21 @@ def test_bitlinear_forward_backward_cpu_fallback():
     assert y.shape == (3, 4, 5)
     assert x.grad is not None
     assert layer.weight.grad is not None
+
+
+def test_bitlinear_weight_cache_helpers_toggle_modules():
+    model = torch.nn.Sequential(BitLinear(7, 5), torch.nn.ReLU(), BitLinear(5, 3))
+
+    assert set_bitlinear_weight_cache(model, True) == 2
+    assert all(m.cache_packed_weight for m in model.modules() if isinstance(m, BitLinear))
+
+    x = torch.randn(2, 7, dtype=torch.bfloat16, requires_grad=True)
+    y = model(x)
+    y.float().sum().backward()
+
+    assert clear_bitlinear_weight_cache(model) == 2
+    assert set_bitlinear_weight_cache(model, False) == 2
+    assert not any(m.cache_packed_weight for m in model.modules() if isinstance(m, BitLinear))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton kernel")
