@@ -13,9 +13,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import nullcontext
 import hashlib
 import os
+import platform
+import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -53,6 +57,46 @@ def load_config(path: Path) -> dict:
 
 def config_hash(cfg: dict) -> str:
     return hashlib.sha256(yaml.safe_dump(cfg, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def _git_output(args: list[str], cwd: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip()
+
+
+def git_metadata(repo_root: Path) -> dict[str, object]:
+    status = _git_output(["status", "--porcelain=v1"], repo_root)
+    return {
+        "sha": _git_output(["rev-parse", "HEAD"], repo_root),
+        "branch": _git_output(["rev-parse", "--abbrev-ref", "HEAD"], repo_root),
+        "dirty": None if status is None else bool(status),
+        "status_porcelain": status.splitlines() if status else [],
+    }
+
+
+def run_metadata(args: argparse.Namespace, device: torch.device) -> dict[str, object]:
+    return {
+        "argv": list(sys.argv),
+        "config_path": str(args.config),
+        "resume": args.resume,
+        "dry_run": bool(args.dry_run),
+        "hostname": socket.gethostname(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "device": str(device),
+    }
 
 
 # ---------------------------------------------------------- グローバル最適化
@@ -126,6 +170,7 @@ def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Modu
 def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
+    git_info = git_metadata(_ROOT)
 
     torch.manual_seed(cfg.get("seed", 42))
     apply_speed_settings(cfg.get("speed", {}))
@@ -203,7 +248,12 @@ def main() -> int:
     # ---- 学習ループ ----
     stop = StopFlag()
     meter = ThroughputMeter(window=cfg["logging"].get("throughput_window", 50))
-    cfg_hash = config_hash(cfg)
+    effective_cfg = copy.deepcopy(cfg)
+    effective_cfg["data"] = dict(data_cfg)
+    effective_cfg["checkpoint"] = dict(ckpt_cfg)
+    effective_cfg["checkpoint"]["dir"] = str(ckpt_dir)
+    cfg_hash = config_hash(effective_cfg)
+    run_info = run_metadata(args, device)
     save_every = ckpt_cfg["save_every_steps"]
     grad_accum = cfg["speed"].get("grad_accum_steps", 1)
     log_every = cfg["logging"].get("log_every_steps", 20)
@@ -313,11 +363,19 @@ def main() -> int:
                     global_step=global_step,
                     best_loss=best_loss,
                     config_hash=cfg_hash,
+                    git_sha=git_info.get("sha") if isinstance(git_info.get("sha"), str) else None,
+                    git_dirty=(
+                        git_info.get("dirty") if isinstance(git_info.get("dirty"), bool) else None
+                    ),
                     wandb_run_id=os.environ.get("WANDB_RUN_ID"),
+                    extra={
+                        "git": git_info,
+                        "run": run_info,
+                    },
                 )
                 dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None
                 ckpt.save(
-                    model, optimizer, scheduler, dl_state, meta,
+                    model, optimizer, scheduler, dl_state, meta, config=effective_cfg,
                     is_best=is_best,
                     is_final=global_step >= total_steps,
                 )

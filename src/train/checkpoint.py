@@ -27,12 +27,13 @@ import random
 import re
 import shutil
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import yaml
 from safetensors.torch import load_file as safe_load
 from safetensors.torch import save_file as safe_save
 
@@ -52,14 +53,22 @@ class CheckpointMeta:
     wandb_run_id: str | None = None
     config_hash: str | None = None
     git_sha: str | None = None
+    git_dirty: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return self.__dict__
+        return dict(self.__dict__)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CheckpointMeta":
-        return cls(**d)
+        known = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in d.items() if k in known}
+        unknown = {k: v for k, v in d.items() if k not in known}
+        if unknown:
+            extra = dict(kwargs.get("extra") or {})
+            extra.update(unknown)
+            kwargs["extra"] = extra
+        return cls(**kwargs)
 
 
 class CheckpointManager:
@@ -88,6 +97,7 @@ class CheckpointManager:
         scheduler: Any | None,
         dataloader_state: dict[str, Any] | None,
         meta: CheckpointMeta,
+        config: dict[str, Any] | None = None,
         is_best: bool = False,
         is_final: bool = False,
     ) -> Path:
@@ -120,6 +130,10 @@ class CheckpointManager:
             torch.save(dataloader_state, tmp_dir / "dataloader.pt")
         torch.save(_snapshot_rng(), tmp_dir / "rng.pt")
         (tmp_dir / "meta.json").write_text(json.dumps(meta.to_dict(), indent=2))
+        if config is not None:
+            (tmp_dir / "config.yaml").write_text(
+                yaml.safe_dump(config, sort_keys=True, allow_unicode=True)
+            )
         _fsync_tree(tmp_dir)
 
         # 3) publish. ``step_dir`` was checked above; do not remove old data here.
