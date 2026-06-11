@@ -1,143 +1,123 @@
 # arbor-llm
 
-BLT (Byte Latent Transformer) を fork し、Global Latent Transformer に BitNet b1.58
-(W1.58A8 ternary) 風の BitLinear を統合する実験プロジェクト。
+バイトレベル階層 Transformer × **BitNet b1.58** の LLM (約 0.95B params) を
+RTX 4090 単機で学習するプロジェクト。自己完結実装 (モデルの依存は torch のみ)。
 
-現状の BitLinear は CUDA forward に Triton の packed ternary/int8 kernel を持つ。
-CPU または Triton 不可の環境では PyTorch 参照実装へ fallback する。backward はまだ
-STE の参照実装で、optimizer state や勾配まで含めた完全な fused BitNet training stack
-ではない。1B 設定は目標設定であり、現在の smoke 検証は小モデル・短ステップで
-学習ループと checkpoint を確認する段階です。
+## アーキテクチャ (Arbor v2)
 
-現時点ではコードを正とする。`bitnet_blt_project_spec.md` には目標・未実装項目も含まれるため、
-実装済みの挙動は README と `src/` / `configs/` を優先して確認する。
+```
+bytes (T=2048)                          token = byte + 4, vocab 260, tokenizer 不要
+  └ byte embedding (FP)
+  └ Local Encoder ×2      … patch 内 attention (BitLinear)
+  └ 静的 patching          … 4 bytes/patch → 512 patches
+  └ Global Transformer ×20 … d=2048, GQA, causal (BitLinear)   ← パラメータの 95%
+  └ Local Decoder ×4      … patch 内 causal (BitLinear)
+  └ byte logits (FP head)
+```
 
-`model.backend: blt` が既定。BLT 本体の import / 構築に失敗した場合、既定ではエラーにする。
-stub は `model.backend: stub` を明示した smoke 用、または `model.allow_stub_fallback: true` を
-明示した場合だけ使う。
+- **BitNet b1.58 公式レシピ準拠** (Microsoft "The Era of 1-bit LLMs" / 2B4T):
+  - 重み: per-tensor absmean で ternary {-1,0,+1} (W1.58)
+  - 活性: per-token absmax で int8 (A8)
+  - STE は detach トリック (勾配は量子化後の値で計算)
+  - SubLN: 全 BitLinear の入力は直前に RMSNorm を通る
+    (q/k/v ← input_norm, o ← attn_sub_norm, gate/up ← ffn_norm, down ← ffn_sub_norm)
+  - FFN は ReLU² gated、Linear は全て bias 無し
+  - Embedding / patch 射影 / 出力 head / RMSNorm は FP (これも仕様どおり)
+- **静的 patching (MegaByte 方式)**: 形状が完全に固定なので torch.compile が常時効く。
+  旧 BLT 流の動的 patching は recompile 地獄で compile を使えなかった。
+- 学習は BF16 シャドウ重みの QAT。BitNet の推論側の利点 (packed ternary kernel に
+  よる省メモリ・高速化) は未実装で、現状の推論は bf16 で on-the-fly 量子化する。
 
-詳細は [`bitnet_blt_project_spec.md`](./bitnet_blt_project_spec.md) を参照。
+実測 (RTX 4090 / WSL2, synthetic, `micro_batch=8` `T=2048` compile 込み):
+**51.2k tok/s, VRAM 16.1 GiB** (旧 BLT 版の本走実測 ~13k tok/s から大幅改善)。
+
+データは日本語 60% (fineweb-2 ja) + 英語 news 15% (cc_news) + 英語 edu 25%
+(fineweb-edu) の streaming 行レベル混合。
 
 ## セットアップ
 
 ```bash
-# 0. OS パッケージ (Ubuntu / WSL)
-sudo apt update
-sudo apt install -y git python3 python3-venv python3-dev python3.12-dev build-essential ninja-build ripgrep
+sudo apt install -y git python3 python3-venv python3-dev build-essential
 
-# CUDA forward / flash-attn を使う場合は nvcc も必要。
-# nvidia-smi と nvcc --version で CUDA の major version が合うことを確認する。
-
-# 1. venv (Python 3.10-3.12)
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip wheel setuptools
-
-# 2. PyTorch (CUDA 12.1)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# 3. 依存
+pip install torch --index-url https://download.pytorch.org/whl/cu121   # CUDA 12.1
 pip install -r requirements.txt
-
-# 4. flash-attn (任意; toolchain 確認後)
-pip install flash-attn --no-build-isolation
-
-# 5. BLT 本体
-git clone https://github.com/facebookresearch/blt third_party/blt
-git -C third_party/blt remote rename origin upstream
-
-# 6. 自分の BLT fork を origin として設定する場合
-./scripts/setup_blt_fork.sh git@github.com:<you>/blt.git
 ```
 
-`third_party/blt` は親リポジトリでは submodule 化しておらず、`.gitignore` で無視している。
-clone 済みかは `test -d third_party/blt/.git` で確認できる。既に clone 済みの場合は手順 5 を飛ばす。
-
-`scripts/env.sh` を source すると `.venv` を有効化し、`PYTHONPATH` に親プロジェクトと
-`third_party/blt` を追加する。
+検証済み環境: Python 3.12 / torch 2.5.1+cu121 / transformers 4.57+ / datasets 4.8 /
+bitsandbytes 0.49 (RTX 4090, WSL2)。`source scripts/env.sh` で venv +
+CUDA アロケータ設定 (expandable_segments) + inductor 設定が入る。
+third_party は不要 (旧 BLT fork 依存は廃止)。
 
 ## 学習
 
 ```bash
 source scripts/env.sh
 
-# smoke 確認
-python -m src.train.train --config configs/smoke.yaml --dry-run
+# smoke 確認 (小モデル・ローカルデータ・50 step, CPU でも可)
+python -m src.train.train --config configs/smoke.yaml
 
-# 新規学習
+# 1B 本走 (初回は torch.compile に ~2 分)
 python -m src.train.train --config configs/arbor_1b.yaml
 
 # 最新 checkpoint から再開
 python -m src.train.train --config configs/arbor_1b.yaml --resume latest
-
-# best loss から再開
-python -m src.train.train --config configs/arbor_1b.yaml --resume best
 ```
 
-### 1B の速度について
+- `Ctrl+C` (SIGINT) / `kill -TERM` で次 step 境界に安全保存して終了。二度押しで強制終了。
+- checkpoint は 1000 step ごとに `./checkpoints/step_XXXXXXXXXX/` へアトミック保存
+  (weights safetensors + optimizer + scheduler + RNG + dataloader 位置 + 実効 config)。
+  `latest` / `best` / `final` symlink は prune から保護される。
+- **resume の正確性**: HF streaming の位置は `datasets` の state_dict API で復元する
+  (最初から流し直して skip しない)。RNG・dataloader 位置も復元。
+- **resume 時の config 不一致はエラー** (checkpoint 内 config.yaml と model 節を照合)。
+  意図的に変える場合のみ `--allow-config-mismatch`。
+- checkpoint のロードは strict (部分ロードを黙って通さない)。保存は compile 前の
+  モデルで行うので `_orig_mod.` prefix 問題も起きない。
+- `best` は **train loss の EMA** が最良だった checkpoint (validation best ではない)。
 
-README の 1B コマンドは「起動方法」であり、短時間で 1B を十分に学習できる保証ではない。
-現状の BitLinear は backward / optimizer まで fused した BitNet training stack ではないため、
-1B 設定の速度は通常の大規模 BF16 学習に近い。
+### checkpoint 時の自動サンプル生成
 
-RTX 4090 の実測メモでは、固定形状 bench は `compile=default bs=8` で約 59.6k tok/s。
-ただし現行の 1B 本走は BLT の動的 patching で系列形状が揺れるため、この値は出ない。
-2026-06-08 の再測定では、`torch_compile: true` / `compile_dynamic: true` は追加 compile が
-頻発し、速い step だけでも 14-16k tok/s、compile 待ち込み平均は大きく崩れた。
-`torch_compile: false` / `micro_batch_size: 2` / `grad_accum_steps: 32` が現時点の安全な実測最速で、
-ローカルデータ上の定常は約 13k tok/s。
+`sampling.enabled: true` で、checkpoint 保存のたびに固定プロンプト・固定 seed で
+短文を生成し、ログ + checkpoint dir の `samples.txt` に保存する。step 間で
+出力品質の変化を同条件比較できる。
 
-1B 本走では `source scripts/env.sh` により以下を既定で入れる。
+## 推論 (checkpoint を試す)
 
 ```bash
-TORCHINDUCTOR_COMPILE_THREADS=12
-TORCHINDUCTOR_FX_GRAPH_CACHE=1
+python -m src.infer.generate --ckpt latest --prompt "日本の四季は" --max-new-bytes 200
+python -m src.infer.generate --ckpt best --interactive    # 対話モード
+python -m src.infer.generate --ckpt 5000                  # 特定 step
 ```
 
-速度設定は `configs/arbor_1b.yaml` の `speed` が正で、現在は
-`torch_compile: false` / `bitlinear_weight_cache: true` /
-`bitlinear_backward: ste` / `micro_batch_size: 4` / `grad_accum_steps: 16`。
-optimizer は synthetic bench で軽かった `lion`。
+モデル構成は checkpoint 内の `config.yaml` から自動復元される。
+KV cache は未実装 (1 バイトごとに全再フォワード。動作確認・品質評価用)。
 
-2026-06-09 の synthetic 1B bench (RTX 4090 / WSL, data I/O 除外, `batch=4`
-`seq=2048` `grad_accum=4`) では以下。
+## HuggingFace 形式エクスポート
 
-```text
-base arbor_1b          23.5k tok/s  13.5GiB
-BitLinear weight cache 24.7k tok/s  14.4GiB
-local_hidden_size=1024 29.5k tok/s  12.0GiB
-1.00B fast config      27.7k tok/s  13.0GiB
+```bash
+python scripts/export_hf.py --ckpt latest --verify
+# -> export/<run_name>-step<N>/。--verify は学習スタックとのロジットビット一致を確認
 ```
 
-backward / optimizer 実験 (`batch=4` `seq=2048` `grad_accum=4`, 同日) では以下。
-
-```text
-1.00B fast + AdamW8bit          24.9k tok/s
-quantized_grad_x + AdamW8bit    22.4k tok/s
-1.00B fast + Lion               26.5k tok/s
-quantized_grad_x + Lion         21.5k tok/s
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+path = "export/arbor2_1b-step10000"
+model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, dtype="auto").cuda()
+tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+ids = tok("日本の四季は", return_tensors="pt").input_ids.cuda()
+print(tok.decode(model.generate(ids, max_new_tokens=100)[0]))
 ```
 
-`configs/arbor_1b_fast.yaml` は `hidden_size=2048` / `num_hidden_layers=22` を維持し、
-FP の Local Encoder/Decoder を `1024` 幅に縮小、Global FFN を `6528` に広げて約
-1.00B params に合わせた速度実験用 config。`speed.bitlinear_weight_cache: true` で
-grad accumulation 中の packed ternary weight を再利用する。
-同じ形状を現在の `configs/arbor_1b.yaml` にも反映済み。
+モデル定義 (`arbor_model/`, torch のみ依存) とバイト tokenizer を同梱した
+`trust_remote_code` 形式。
 
-部分 compile は mini bench (`batch=8` `seq=256`, 2026-06-09) でも eager 3.9k tok/s に対し
-`compile_scope=global` が 369 tok/s、`compile_scope=model` が 158 tok/s まで落ちたため、
-現状は無効化が妥当。
+### ollama / LM Studio について
 
-`f16` や `f4` だけに寄せても、現状は backward の大半が dense BF16 matmul に残るため
-学習速度は単純には伸びない。今効いているのは「forward packed weight の再利用」と
-「FP local 部の縮小」と「Lion optimizer」。`quantized_grad_x` は実装済みだが、
-現状のkernel粒度では追加量子化/Triton呼び出しのコストが勝つため既定では使わない。
-
-学習中 `Ctrl+C` (SIGINT) または `kill -TERM <pid>` で次 step 境界にて
-安全保存して終了する。二度押しで強制終了。
-
-Checkpoint は `<step>.tmp/` に同期保存してから step ディレクトリへ publish する。
-同じ step の上書きは拒否し、`latest` / `best` / `final` symlink の参照先は prune から保護する。
+**非対応。** これらは llama.cpp (GGUF) の既知アーキテクチャ専用で、バイトレベル
+階層構造 + BitLinear の変換器は存在しない。transformers (Python) から利用すること。
 
 ## テスト
 
@@ -145,18 +125,21 @@ Checkpoint は `<step>.tmp/` に同期保存してから step ディレクトリ
 python -m pytest
 ```
 
-親プロジェクトの pytest は `tests/` のみを対象にする。`third_party/blt` の upstream テストは
-追加依存を要求するため、通常の収集対象から外している。
+因果性テスト (未来バイトの変更が過去の logits に漏れないこと)、BitLinear の
+量子化/STE 勾配の正しさ、checkpoint の保存/再開、HF tokenizer 往復などを含む。
 
 ## ディレクトリ
 
 ```
 src/
-  model/   BitLinear, Global Latent Transformer, Local Enc/Dec, 全体組立
-  data/    バイト直 dataset, packing
+  model/   bitlinear.py (BitNet b1.58), arbor.py (モデル本体, 自己完結)
+  data/    バイト直 streaming dataset (HF interleave / local mmap), 正確 resume
   train/   train.py, checkpoint, signals, optim
+  infer/   generate.py (checkpoint からの生成 CLI / 学習中サンプル生成)
+  hf/      HF エクスポートに同梱する modeling / tokenizer テンプレート
   eval/    perplexity 他
-configs/   arbor_1b.yaml 等
-third_party/blt/  facebookresearch/blt の fork (submodule)
-checkpoints/      既定の外部保存先 (.gitignore)
+scripts/   export_hf.py, env.sh
+configs/   arbor_1b.yaml (本走), smoke.yaml
+checkpoints/   学習 checkpoint (.gitignore)
+export/        HF 形式エクスポート先 (.gitignore)
 ```
