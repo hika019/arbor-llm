@@ -115,6 +115,51 @@ def test_boundary_min_max_enforcement():
     assert starts[0].nonzero().flatten().tolist() == [0, 4, 8]
 
 
+def _space_raw(ids: torch.Tensor) -> torch.Tensor:
+    """実装と同じ空白系バイト (space/tab/LF/CR) で境界候補を作る."""
+    raw = torch.zeros_like(ids, dtype=torch.bool)
+    for sb in (0x20, 0x09, 0x0A, 0x0D):
+        raw[:, 1:] |= (ids[:, :-1] - 4) == sb
+    return raw
+
+
+def _reference_patch_starts(raw: torch.Tensor, min_len: int, max_len: int) -> torch.Tensor:
+    """旧実装 (バイト毎の逐次ループ)。ジャンプ版の等価性検証用リファレンス."""
+    b, t = raw.shape
+    starts = torch.zeros(b, t, dtype=torch.bool)
+    run = torch.zeros(b, dtype=torch.long)
+    for i in range(t):
+        s = (run >= max_len) | (raw[:, i] & (run >= min_len)) if i > 0 \
+            else torch.ones(b, dtype=torch.bool)
+        starts[:, i] = s
+        run = torch.where(s, torch.ones_like(run), run + 1)
+    return starts
+
+
+@pytest.mark.parametrize("min_len,max_len", [(1, 16), (2, 16), (3, 4), (2, 2), (4, 8)])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_patch_starts_matches_sequential_reference(min_len, max_len, seed):
+    """ジャンプ版 compute_patch_starts が旧逐次実装と完全一致すること."""
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.randint(4, 260, (3, 97), generator=g)
+    ids[torch.rand(ids.shape, generator=g) < 0.15] = 0x20 + 4  # 空白を散らす
+    raw = _space_raw(ids)
+    got = compute_patch_starts(ids, "space", min_len=min_len, max_len=max_len)
+    want = _reference_patch_starts(raw, min_len, max_len)
+    assert torch.equal(got, want)
+
+
+def test_patch_starts_edge_cases():
+    # 全バイト空白 / 候補ゼロ / T=1
+    all_space = torch.full((1, 10), 0x20 + 4)
+    no_space = torch.full((1, 10), ord("a") + 4)
+    for ids in (all_space, no_space, torch.full((1, 1), ord("a") + 4)):
+        raw = _space_raw(ids)
+        got = compute_patch_starts(ids, "space", min_len=2, max_len=5)
+        want = _reference_patch_starts(raw, 2, 5)
+        assert torch.equal(got, want)
+
+
 @pytest.mark.parametrize("mode", ["static", "space", "entropy"])
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""

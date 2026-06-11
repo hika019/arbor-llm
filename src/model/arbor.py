@@ -339,8 +339,12 @@ def compute_patch_starts(
 
     - space:   直前バイトが空白系なら新 patch を開始
     - entropy: 直前位置での次バイト予測エントロピーが threshold 超なら開始
-    その後 min_len (それ未満では区切らない) / max_len (達したら強制区切り) を
-    逐次適用する。逐次処理のため compile 対象外 (CPU で実行)。
+    その後 min_len (それ未満では区切らない) / max_len (達したら強制区切り) を適用。
+
+    min/max 制約は「境界 s の次の境界 = min(s+min_len 以降で最初の候補, s+max_len)」
+    というジャンプ過程なので、候補位置の事前計算 (ベクトル化) + patch 単位の整数
+    ジャンプで計算する (バイト毎の tensor 演算ループは T=8k で ~0.3s/batch かかり
+    entropy 学習のボトルネックになる)。データ依存の分岐を含むため compile 対象外。
     """
     b, t = input_ids.shape
     if mode == "space":
@@ -359,15 +363,22 @@ def compute_patch_starts(
     else:
         raise ValueError(f"unknown dynamic patching mode: {mode}")
 
-    raw_cpu = raw.cpu()
-    starts = torch.zeros(b, t, dtype=torch.bool)
-    run = torch.zeros(b, dtype=torch.long)
-    for i in range(t):
-        s = (run >= max_len) | (raw_cpu[:, i] & (run >= min_len)) if i > 0 \
-            else torch.ones(b, dtype=torch.bool)
-        starts[:, i] = s
-        run = torch.where(s, torch.ones_like(run), run + 1)
-    return starts.to(input_ids.device)
+    import numpy as np
+
+    raw_np = raw.cpu().numpy()
+    starts_np = np.zeros((b, t), dtype=bool)
+    pos = np.arange(t)
+    for r in range(b):
+        # nxt[p] = p 以降で最初の境界候補の位置 (無ければ t)。後ろからの累積 min
+        cand = np.where(raw_np[r], pos, t)
+        nxt = np.minimum.accumulate(cand[::-1])[::-1]
+        i = 0
+        while i < t:
+            starts_np[r, i] = True
+            lo = i + min_len
+            j = int(nxt[lo]) if lo < t else t
+            i = min(j, i + max_len)
+    return torch.from_numpy(starts_np).to(input_ids.device)
 
 
 # ------------------------------------------------------------------ KV cache
