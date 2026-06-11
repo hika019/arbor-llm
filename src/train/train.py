@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True, type=Path)
     p.add_argument("--resume", default=None, help="'latest' | 'best' | step | path")
+    p.add_argument(
+        "--init-from", default=None,
+        help="checkpoint dir から重みのみ読み込んで step 0 の新規 run を開始する "
+             "(optimizer/scheduler/dataloader は初期化。長コンテキスト拡張などの continued pretraining 用)",
+    )
     p.add_argument("--dry-run", action="store_true", help="1 step だけ走らせて即終了")
     p.add_argument(
         "--allow-config-mismatch", action="store_true",
@@ -172,6 +177,26 @@ def main() -> int:
     # checkpoint 保存とサンプル生成は compile 前のモデルで行う
     # (compile wrapper を保存すると state dict が _orig_mod. 付きになる)
     base_model = model
+
+    # ---- 重みのみの初期化 (--init-from): 長コンテキスト拡張などの continued pretraining ----
+    # RoPE バッファは非永続 (config から再計算) なので max_bytes / rope_theta が
+    # 違う checkpoint でも strict ロードできる。step/optimizer/scheduler は新規。
+    if args.init_from:
+        if args.resume:
+            raise SystemExit("[train] ERROR: --init-from と --resume は併用できない")
+        from safetensors.torch import load_file as safe_load
+
+        init_path = Path(args.init_from).resolve()
+        if init_path.is_dir():
+            init_path = init_path / "model.safetensors"
+        if not init_path.exists():
+            raise SystemExit(f"[train] ERROR: --init-from に model.safetensors が無い: {init_path}")
+        weights = safe_load(str(init_path), device=str(device))
+        if any(k.startswith("_orig_mod.") for k in weights):
+            weights = {k.removeprefix("_orig_mod."): v for k, v in weights.items()}
+        base_model.load_state_dict(weights, strict=True)
+        print(f"[train] init_from={init_path} (weights only; optimizer/scheduler/step は新規)")
+
     model = apply_compile_settings(model, cfg["speed"])
 
     # ---- データ (streaming, メモリに全部載せない) ----

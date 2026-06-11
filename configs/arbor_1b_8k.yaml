@@ -1,0 +1,111 @@
+# Arbor v2 1B / 8192 bytes ベース学習 (arbor_1b.yaml の長コンテキスト + code/math 入り版)
+#
+# 新規:   python -m src.train.train --config configs/arbor_1b_8k.yaml
+# 再開:   python -m src.train.train --config configs/arbor_1b_8k.yaml --resume latest
+# 終了後: configs/arbor_1b_32k.yaml で 32k bytes へ拡張 (--init-from)
+#
+# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (4 bytes/patch)
+# なので global は 2048 patches。実効バッチは arbor_1b.yaml と同じ 131k bytes/update
+# (micro_batch 8→2, grad_accum 8→32 で相殺)。
+
+run_name: arbor2_1b_8k
+seed: 42
+
+model:
+  vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
+  patching_mode: static
+  patch_size: 4                 # 1 patch = 4 bytes (静的)
+  max_bytes: 8192               # 学習 context (bytes) = 2048 patches
+  # ---- global (patch 階層, BitLinear) ----
+  hidden_size: 2048
+  num_heads: 16
+  num_kv_heads: 4               # GQA
+  intermediate_size: 5632       # ReLU² gated FFN
+  num_hidden_layers: 20
+  # ---- local (byte 階層, BitLinear) ----
+  local_hidden_size: 768
+  local_num_heads: 12
+  local_num_kv_heads: 12
+  local_intermediate_size: 2048
+  num_local_encoder_layers: 2
+  num_local_decoder_layers: 4
+  # ---- 共通 ----
+  rope_theta: 500000.0
+  norm_eps: 1.0e-5
+  bitnet: true
+  gradient_checkpointing: false # OOM 時のみ true
+
+# ---- データ (streaming 前提; 一括ロードは禁止) ----
+# 日本語主軸 + 英語 + code/math (能力の土台はベースで仕込む)。
+# 注: gated の bigcode/the-stack-dedup (多言語 code) を使う場合は HF login +
+#     規約同意の上で codeparrot-clean と差し替え (text_column: content)。
+data:
+  sources:
+    - path: "HuggingFaceFW/fineweb-2"   # 日本語 web
+      name: "jpn_Jpan"
+      weight: 0.45
+    - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
+      weight: 0.20
+    - path: "vblagoje/cc_news"          # 英語 news
+      weight: 0.05
+    - path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
+      name: "finemath-4plus"
+      weight: 0.10
+    - path: "codeparrot/codeparrot-clean"  # Python 実コード (非 gated)
+      text_column: "content"
+      weight: 0.12
+    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
+      weight: 0.08
+  streaming: true
+  shuffle_buffer: 2000
+  context_length: 8192          # bytes。patch_size の倍数にする
+  num_workers: 0                # 正確 resume は単一プロセス前提
+  prefetch_factor: 4
+  pin_memory: true
+
+# ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
+optim:
+  optimizer: bnb_adamw_8bit     # choices: lion | bnb_adamw_8bit | adamw_fused
+  lr: 8.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  warmup_steps: 1000
+  total_steps: 200000
+
+# ---- スループット ----
+speed:
+  precision: bf16               # choices: bf16 | fp16 | fp32
+  tf32_matmul: true
+  cudnn_benchmark: true
+  torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
+  compile_mode: default         # choices: default | reduce-overhead | max-autotune
+  micro_batch_size: 2           # T=8192 なので 2 (bytes/micro は arbor_1b と同じ 16k)
+  grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 131k bytes/update)
+
+checkpoint:
+  dir: ./checkpoints/arbor2_1b_8k
+  save_every_steps: 1000
+  keep_last_k: 3
+  keep_every_n_steps: 10000
+  async_save: false
+
+# ---- checkpoint 時のサンプル生成 (checkpoint dir に samples.txt を保存) ----
+sampling:
+  enabled: true
+  prompts:
+    - "日本の四季は"
+    - "The most important thing in life is"
+    - "def fibonacci(n):"
+  max_new_bytes: 100
+  temperature: 0.8
+  top_p: 0.95
+  seed: 42
+
+logging:
+  wandb_project: arbor-llm
+  log_every_steps: 5
+  throughput_window: 50
+  best_ema_decay: 0.98
