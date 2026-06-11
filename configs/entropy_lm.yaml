@@ -76,6 +76,7 @@ optim:
   weight_decay: 0.0
   grad_clip: 1.0
   scheduler: cosine_warmup
+  min_lr_ratio: 0.1            # 最終 step の lr = ピークの 10% (0 で従来の完全減衰)
   warmup_steps: 100
   total_steps: 5000
 
@@ -84,7 +85,7 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: false
   torch_compile: false
-  micro_batch_size: 8
+  micro_batch_size: 6
   grad_accum_steps: 1
 
 checkpoint:

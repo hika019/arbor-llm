@@ -98,6 +98,11 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
     name = cfg.get("scheduler", "cosine_warmup")
     warmup = cfg.get("warmup_steps", 0)
     total = cfg["total_steps"]
+    # 最終 step での lr 下限 (ピーク lr に対する比率)。0 で従来どおり 0 まで減衰。
+    # 下限を残しておくと total_steps を増やした resume での追加学習が素直に効く。
+    min_ratio = float(cfg.get("min_lr_ratio", 0.0))
+    if not 0.0 <= min_ratio < 1.0:
+        raise ValueError(f"min_lr_ratio は [0, 1) で指定: {min_ratio}")
     if name != "cosine_warmup":
         raise ValueError(f"unknown scheduler: {name}")
 
@@ -105,6 +110,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
         if step < warmup:
             return step / max(1, warmup)
         progress = (step - warmup) / max(1, total - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return min_ratio + (1.0 - min_ratio) * cos
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

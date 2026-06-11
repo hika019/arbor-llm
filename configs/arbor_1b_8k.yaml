@@ -72,6 +72,7 @@ optim:
   weight_decay: 0.1
   grad_clip: 1.0
   scheduler: cosine_warmup
+  min_lr_ratio: 0.1            # 最終 step の lr = ピークの 10% (0 で従来の完全減衰)
   warmup_steps: 1000
   total_steps: 200000
 
