@@ -14,12 +14,12 @@ model:
   entropy_threshold: 2.0    # 次バイト予測エントロピー (nats) がこれを超えたら区切る
   entropy_model:            # ByteLM の構成 (entropy_lm.yaml の model 節と一致させる)
     vocab_size: 260
-    max_bytes: 512
-    hidden_size: 256
+    max_bytes: 32768
+    hidden_size: 512
     num_heads: 8
     num_kv_heads: 4
-    intermediate_size: 768
-    num_hidden_layers: 4
+    intermediate_size: 1536
+    num_hidden_layers: 6
     rope_theta: 10000.0
     bitnet: false
   entropy_model_ckpt: ./checkpoints/entropy_lm/latest   # 初回構築時に重みを読む

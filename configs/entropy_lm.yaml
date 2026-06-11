@@ -18,11 +18,11 @@ model:
   arch: byte_lm             # 小型 causal バイト LM (Arbor 本体ではない)
   vocab_size: 260
   max_bytes: 32768          # 本体 (8k 本走 / 32k 拡張) の max_bytes 以上にする
-  hidden_size: 256
+  hidden_size: 512
   num_heads: 8
   num_kv_heads: 4
-  intermediate_size: 768
-  num_hidden_layers: 4
+  intermediate_size: 1536
+  num_hidden_layers: 6
   rope_theta: 10000.0
   bitnet: false             # 境界判定用なので FP の通常 Transformer
   gradient_checkpointing: false
