@@ -1,27 +1,18 @@
-# PyTorch (install separately with CUDA index-url):
+# PyTorch は CUDA 版を別途インストールする (README 参照):
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
-# torch>=2.3 is assumed but intentionally not pinned here.
+# 検証済み: torch 2.5.1+cu121 / Python 3.12 (RTX 4090, WSL2)
 
-# core
-transformers>=4.44
-accelerate>=0.33
-datasets>=2.20
-safetensors>=0.4.3
-bitsandbytes>=0.43
-sentencepiece>=0.2.0
+# ---- 学習コア ----
+pyyaml>=6.0          # config 読み込み
+numpy>=1.26          # RNG state 保存ほか
+safetensors>=0.4.3   # checkpoint の重み保存
+datasets>=2.18       # HF streaming (state_dict resume には >=2.18 必須)
+bitsandbytes>=0.43   # optim.optimizer: bnb_adamw_8bit 用 (lion/adamw_fused なら不要)
 
-# flash-attn requires `pip install packaging ninja` first, and matching CUDA toolkit
-packaging
-ninja
-# flash-attn>=2.6  # uncomment after toolchain is verified
+# ---- HF エクスポート / transformers からの推論 ----
+transformers>=4.45
+accelerate>=0.33     # transformers のモデルロード補助 (推奨)
 
-# logging / utils
-wandb>=0.17
-pyyaml>=6.0
-tqdm>=4.66
-numpy>=1.26
-rich>=13.7
-
-# dev
+# ---- dev ----
 pytest>=8.2
 ruff>=0.6
