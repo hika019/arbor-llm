@@ -85,11 +85,13 @@ def load_inference_model(
     """checkpoint からモデルを構築してロードし、eval モードで返す."""
     from safetensors.torch import load_file as safe_load
 
-    from src.model.arbor import build_arbor
-
     model_cfg = dict(cfg["model"])
     model_cfg["gradient_checkpointing"] = False  # 推論では不要
-    model = build_arbor(model_cfg).to(device=device, dtype=dtype)
+    if model_cfg.get("arch", "arbor") == "byte_lm":
+        from src.model.arbor import build_byte_lm as build_model
+    else:
+        from src.model.arbor import build_arbor as build_model
+    model = build_model(model_cfg).to(device=device, dtype=dtype)
 
     state = _strip_compile_prefix(safe_load(str(ckpt_dir / "model.safetensors"), device="cpu"))
     model.load_state_dict(state, strict=True)

@@ -41,8 +41,11 @@ from src.infer.generate import (  # noqa: E402
 _HF_TEMPLATES = _ROOT / "src" / "hf"
 
 # config.json に書き出す model 設定のフィールド (modeling_arbor.py と一致させる)
+# entropy_model_ckpt は除外: 重みは model.safetensors に同梱される
 _ARBOR_FIELDS = (
     "vocab_size", "patch_size", "max_bytes",
+    "patching_mode", "min_patch_len", "max_patch_len",
+    "entropy_threshold", "entropy_model",
     "hidden_size", "num_heads", "num_kv_heads", "intermediate_size",
     "num_hidden_layers",
     "local_hidden_size", "local_num_heads", "local_num_kv_heads",

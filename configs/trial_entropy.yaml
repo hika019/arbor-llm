@@ -1,0 +1,87 @@
+# entropy patching の動作確認用 (小モデル・ローカルデータ・200 step)
+# 前提: 先に configs/entropy_lm.yaml で ByteLM を学習しておくこと。
+#   python -m src.train.train --config configs/entropy_lm.yaml
+#   python -m src.train.train --config configs/trial_entropy.yaml
+
+run_name: trial_entropy
+seed: 42
+
+model:
+  vocab_size: 260
+  patching_mode: entropy    # choices: static | space | entropy
+  min_patch_len: 2
+  max_patch_len: 16
+  entropy_threshold: 2.0    # 次バイト予測エントロピー (nats) がこれを超えたら区切る
+  entropy_model:            # ByteLM の構成 (entropy_lm.yaml の model 節と一致させる)
+    vocab_size: 260
+    max_bytes: 512
+    hidden_size: 256
+    num_heads: 8
+    num_kv_heads: 4
+    intermediate_size: 768
+    num_hidden_layers: 4
+    rope_theta: 10000.0
+    bitnet: false
+  entropy_model_ckpt: ./checkpoints/entropy_lm/latest   # 初回構築時に重みを読む
+  max_bytes: 512
+  hidden_size: 256
+  num_heads: 8
+  num_kv_heads: 4
+  intermediate_size: 768
+  num_hidden_layers: 4
+  local_hidden_size: 128
+  local_num_heads: 4
+  local_num_kv_heads: 4
+  local_intermediate_size: 384
+  num_local_encoder_layers: 1
+  num_local_decoder_layers: 2
+  rope_theta: 10000.0
+  bitnet: true
+  gradient_checkpointing: false
+
+data:
+  source: "file:./bitnet_blt_project_spec.md"
+  streaming: true
+  shuffle_buffer: 0
+  context_length: 512
+  num_workers: 0
+  pin_memory: true
+  micro_batch_size: 8
+
+optim:
+  optimizer: adamw_fused
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  warmup_steps: 20
+  total_steps: 200
+
+speed:
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: false
+  torch_compile: false
+  micro_batch_size: 8
+  grad_accum_steps: 1
+
+checkpoint:
+  dir: ./checkpoints/trial_entropy
+  save_every_steps: 100
+  keep_last_k: 2
+  keep_every_n_steps: null
+  async_save: false
+
+sampling:
+  enabled: true
+  prompts: ["The model "]
+  max_new_bytes: 32
+  temperature: 0.8
+  top_p: 0.95
+  seed: 42
+
+logging:
+  log_every_steps: 20
+  throughput_window: 20

@@ -1,10 +1,16 @@
-"""Arbor v2 モデルの形状・因果性・勾配のテスト (CPU)."""
+"""Arbor v2 モデルの形状・因果性・勾配のテスト (CPU, 3 patching モード)."""
 from __future__ import annotations
 
 import pytest
 import torch
 
-from src.model.arbor import ArborConfig, ArborModel, build_arbor
+from src.model.arbor import (
+    ArborConfig,
+    ArborModel,
+    ByteLM,
+    build_arbor,
+    compute_patch_starts,
+)
 
 TINY = dict(
     vocab_size=260, patch_size=4, max_bytes=64,
@@ -15,6 +21,15 @@ TINY = dict(
     num_local_encoder_layers=1, num_local_decoder_layers=1,
     rope_theta=10000.0,
 )
+TINY_ENTROPY_LM = dict(hidden_size=32, num_heads=2, num_kv_heads=2,
+                       intermediate_size=64, num_hidden_layers=1)
+
+
+def tiny_cfg(mode: str) -> dict:
+    cfg = dict(TINY, patching_mode=mode)
+    if mode == "entropy":
+        cfg["entropy_model"] = TINY_ENTROPY_LM
+    return cfg
 
 
 @pytest.fixture(scope="module")
@@ -36,21 +51,77 @@ def test_forward_handles_partial_patch(model):
     assert out.logits.shape == (1, 10, 260)
 
 
+@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
-def test_causality(model, pos):
-    """位置 pos のバイトを変えても、位置 < pos の logits は変わらないこと."""
+def test_causality(mode, pos):
+    """位置 pos のバイトを変えても、位置 < pos の logits は変わらないこと.
+
+    動的モードでは境界判定自体もバイトに依存するため、その経路の因果性も
+    まとめて検証される (空白バイトを混ぜて境界が動く入力にする)。
+    """
     torch.manual_seed(1)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode))).eval()
     a = torch.randint(4, 260, (1, 32))
+    a[0, ::5] = 0x20 + 4  # 空白を混ぜて space 境界を発生させる
     b = a.clone()
     b[0, pos] = (a[0, pos] - 4 + 1) % 256 + 4  # 必ず違うバイトに
     with torch.inference_mode():
-        la = model(a).logits
-        lb = model(b).logits
+        la = m(a).logits
+        lb = m(b).logits
     assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5), (
-        f"position {pos} の変更が過去 (<{pos}) の logits に漏れている"
+        f"mode={mode}: position {pos} の変更が過去 (<{pos}) の logits に漏れている"
     )
     # 当該位置以降には影響していること (degenerate でないことの確認)
     assert not torch.allclose(la[:, pos:], lb[:, pos:], atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["space", "entropy"])
+def test_dynamic_forward_shape_and_grads(mode):
+    torch.manual_seed(0)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode)))
+    x = torch.randint(4, 260, (2, 30))  # patch_size の倍数でなくてもよい
+    out = m(x)
+    assert out.logits.shape == (2, 30, 260)
+    loss = torch.nn.functional.cross_entropy(
+        out.logits.flatten(0, 1), torch.randint(4, 260, (60,))
+    )
+    loss.backward()
+    trainable = [(n, p) for n, p in m.named_parameters() if p.requires_grad]
+    missing = [n for n, p in trainable if p.grad is None]
+    assert not missing, f"勾配が届いていない: {missing[:5]}"
+    bad = [n for n, p in trainable if p.grad is not None and not torch.isfinite(p.grad).all()]
+    assert not bad, f"非有限の勾配: {bad[:5]}"
+    if mode == "entropy":
+        # 凍結 ByteLM は学習されない
+        assert all(not p.requires_grad for p in m.entropy_model.parameters())
+
+
+def test_space_boundaries():
+    # "ab cd" -> 空白の直後 (c の位置) で新 patch
+    ids = torch.tensor([[ord("a"), ord("b"), 0x20, ord("c"), ord("d")]]) + 4
+    starts = compute_patch_starts(ids, "space", min_len=1, max_len=16)
+    assert starts.tolist() == [[True, False, False, True, False]]
+
+
+def test_boundary_min_max_enforcement():
+    # 毎バイト空白 (= 毎位置が境界候補) でも min_len 未満では切らない
+    ids = torch.full((1, 12), 0x20 + 4)
+    starts = compute_patch_starts(ids, "space", min_len=3, max_len=16)
+    assert starts.long().sum() == 4  # 12 / 3
+    # 境界候補ゼロでも max_len で強制的に切る
+    ids = torch.full((1, 12), ord("a") + 4)
+    starts = compute_patch_starts(ids, "space", min_len=2, max_len=4)
+    assert starts[0].nonzero().flatten().tolist() == [0, 4, 8]
+
+
+def test_byte_lm_forward_and_entropy():
+    torch.manual_seed(0)
+    lm = ByteLM(dict(TINY_ENTROPY_LM, max_bytes=64))
+    x = torch.randint(4, 260, (2, 16))
+    assert lm(x).logits.shape == (2, 16, 260)
+    ent = lm.next_byte_entropy(x)
+    assert ent.shape == (2, 16)
+    assert torch.isfinite(ent).all() and (ent >= 0).all()
 
 
 def test_partial_patch_padding_does_not_leak(model):

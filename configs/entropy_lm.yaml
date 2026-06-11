@@ -1,0 +1,65 @@
+# entropy patching 用の小型バイト LM (ByteLM) の学習設定
+# 使い方:
+#   python -m src.train.train --config configs/entropy_lm.yaml
+#   -> checkpoints/entropy_lm/latest を arbor 側の model.entropy_model_ckpt に指定
+#
+# 注意: 本番で使うなら本体と同じデータ (HF 混合) で数千 step 以上学習すること。
+# この設定はローカルデータ 200 step の動作確認用。
+
+run_name: entropy_lm
+seed: 42
+
+model:
+  arch: byte_lm             # 小型 causal バイト LM (Arbor 本体ではない)
+  vocab_size: 260
+  max_bytes: 512
+  hidden_size: 256
+  num_heads: 8
+  num_kv_heads: 4
+  intermediate_size: 768
+  num_hidden_layers: 4
+  rope_theta: 10000.0
+  bitnet: false             # 境界判定用なので FP の通常 Transformer
+  gradient_checkpointing: false
+
+data:
+  source: "file:./bitnet_blt_project_spec.md"
+  streaming: true
+  shuffle_buffer: 0
+  context_length: 512
+  num_workers: 0
+  pin_memory: true
+  micro_batch_size: 8
+
+optim:
+  optimizer: adamw_fused
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  warmup_steps: 20
+  total_steps: 200
+
+speed:
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: false
+  torch_compile: false
+  micro_batch_size: 8
+  grad_accum_steps: 1
+
+checkpoint:
+  dir: ./checkpoints/entropy_lm
+  save_every_steps: 100
+  keep_last_k: 2
+  keep_every_n_steps: null
+  async_save: false
+
+sampling:
+  enabled: false            # 境界判定用 LM なので生成品質は見ない
+
+logging:
+  log_every_steps: 20
+  throughput_window: 20

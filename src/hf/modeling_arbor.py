@@ -22,6 +22,8 @@ from transformers.modeling_outputs import CausalLMOutput
 
 _ARBOR_FIELDS = (
     "vocab_size", "patch_size", "max_bytes",
+    "patching_mode", "min_patch_len", "max_patch_len",
+    "entropy_threshold", "entropy_model",
     "hidden_size", "num_heads", "num_kv_heads", "intermediate_size",
     "num_hidden_layers",
     "local_hidden_size", "local_num_heads", "local_num_kv_heads",
@@ -31,6 +33,8 @@ _ARBOR_FIELDS = (
 
 _ARBOR_DEFAULTS = dict(
     vocab_size=260, patch_size=4, max_bytes=2048,
+    patching_mode="static", min_patch_len=2, max_patch_len=16,
+    entropy_threshold=1.5, entropy_model=None,
     hidden_size=2048, num_heads=16, num_kv_heads=4, intermediate_size=5632,
     num_hidden_layers=20,
     local_hidden_size=768, local_num_heads=12, local_num_kv_heads=12,
@@ -53,6 +57,9 @@ class ArborConfig(PretrainedConfig):
     def to_arbor_dict(self) -> dict:
         d = {name: getattr(self, name) for name in _ARBOR_FIELDS}
         d["gradient_checkpointing"] = False
+        # entropy_model の重みは model.safetensors に同梱されているので
+        # 外部 checkpoint パスからは読まない
+        d["entropy_model_ckpt"] = None
         return d
 
 

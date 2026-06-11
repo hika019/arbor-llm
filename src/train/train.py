@@ -158,10 +158,17 @@ def main() -> int:
         print(f"[train] cuda_mem_free={free / 2**30:.2f}GiB total={total / 2**30:.2f}GiB")
 
     # ---- モデル組み立て (Arbor v2: 自己完結 BitNet 階層 Transformer) ----
-    from src.model.arbor import build_arbor
+    # model.arch: arbor (既定) | byte_lm (entropy patching 用の小型バイト LM)
+    arch = cfg["model"].get("arch", "arbor")
+    if arch == "byte_lm":
+        from src.model.arbor import build_byte_lm as build_model
+    elif arch == "arbor":
+        from src.model.arbor import build_arbor as build_model
+    else:
+        raise ValueError(f"unknown model.arch: {arch}")
     compute_dtype, use_autocast = resolve_precision(cfg.get("speed", {}).get("precision", "bf16"))
-    print(f"[train] precision={compute_dtype} autocast={use_autocast}")
-    model = build_arbor(cfg["model"]).to(device=device, dtype=compute_dtype)
+    print(f"[train] arch={arch} precision={compute_dtype} autocast={use_autocast}")
+    model = build_model(cfg["model"]).to(device=device, dtype=compute_dtype)
     # checkpoint 保存とサンプル生成は compile 前のモデルで行う
     # (compile wrapper を保存すると state dict が _orig_mod. 付きになる)
     base_model = model

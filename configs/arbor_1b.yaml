@@ -10,6 +10,9 @@ seed: 42
 
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
+  # patching_mode: static       # 既定 static。space | entropy も選べる (READMEと
+  #                             # trial_*.yaml 参照)。進行中 run の config 照合を
+  #                             # 壊さないため、この run ではキー自体を書かない
   patch_size: 4                 # 1 patch = 4 bytes (静的)
   max_bytes: 2048               # 学習 context (bytes) = 512 patches
   # ---- global (patch 階層, BitLinear) ----
