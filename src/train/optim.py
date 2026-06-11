@@ -103,13 +103,19 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
     min_ratio = float(cfg.get("min_lr_ratio", 0.0))
     if not 0.0 <= min_ratio < 1.0:
         raise ValueError(f"min_lr_ratio は [0, 1) で指定: {min_ratio}")
+    # cosine 減衰を total_steps のどの時点で終えるか (比率)。0.8 なら総 step の
+    # 80% で min_lr に到達し、残り 20% は min_lr で一定 (終盤の lr を低く保つ)。
+    decay_end_ratio = float(cfg.get("decay_end_ratio", 1.0))
+    if not 0.0 < decay_end_ratio <= 1.0:
+        raise ValueError(f"decay_end_ratio は (0, 1] で指定: {decay_end_ratio}")
+    decay_end = max(warmup + 1, round(total * decay_end_ratio))
     if name != "cosine_warmup":
         raise ValueError(f"unknown scheduler: {name}")
 
     def lr_lambda(step: int) -> float:
         if step < warmup:
             return step / max(1, warmup)
-        progress = (step - warmup) / max(1, total - warmup)
+        progress = (step - warmup) / max(1, decay_end - warmup)
         cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
         return min_ratio + (1.0 - min_ratio) * cos
 

@@ -54,6 +54,24 @@ def test_scheduler_min_lr_ratio_default_zero():
     assert _lr_at(cfg, 100) == pytest.approx(0.0)       # 既定は従来どおり 0 まで減衰
 
 
+def test_scheduler_decay_end_ratio():
+    cfg = {"total_steps": 100, "warmup_steps": 10,
+           "min_lr_ratio": 0.1, "decay_end_ratio": 0.8}
+    assert _lr_at(cfg, 10) == pytest.approx(1.0)        # warmup 終了 = ピーク
+    assert _lr_at(cfg, 45) == pytest.approx(0.55)       # 減衰区間の中間 = (1+0.1)/2
+    assert _lr_at(cfg, 80) == pytest.approx(0.1)        # 80% 時点で下限到達
+    assert _lr_at(cfg, 90) == pytest.approx(0.1)        # 残り 20% は下限で一定
+    assert _lr_at(cfg, 100) == pytest.approx(0.1)
+
+
+def test_scheduler_decay_end_ratio_validation():
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
+    with pytest.raises(ValueError):
+        build_scheduler(opt, {"total_steps": 100, "decay_end_ratio": 0.0})
+    with pytest.raises(ValueError):
+        build_scheduler(opt, {"total_steps": 100, "decay_end_ratio": 1.5})
+
+
 def test_scheduler_min_lr_ratio_validation():
     opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
     with pytest.raises(ValueError):
