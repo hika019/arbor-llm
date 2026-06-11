@@ -7,8 +7,8 @@
 
 本体の entropy patching と同じ compute_patch_starts (min/max patch 長込み) で
 境界を計算するので、学習で実際に使われる区切りと一致する。
-`|` が patch 境界。日本語で UTF-8 文字の途中 (置換文字 � が出る位置) で
-切れている間は ByteLM の学習不足。
+表示は文字を壊さない: `|` = 文字の頭に揃った境界、`¦` = その文字の途中
+(UTF-8 マルチバイトの中) に落ちた境界。`¦` が多い間は ByteLM の学習不足。
 """
 from __future__ import annotations
 
@@ -63,11 +63,22 @@ def main() -> int:
                 min_len=args.min_patch_len, max_len=args.max_patch_len,
                 entropy_model=model, threshold=args.threshold,
             )[0]
-        idx = [i for i in range(len(bs)) if starts[i]]
-        patches = [bs[a:b] for a, b in zip(idx, idx[1:] + [len(bs)])]
-        print(f"mean_H={ent.mean():.2f} nats | patches={len(patches)} "
-              f"avg_len={len(bs) / len(patches):.1f}B")
-        print("  " + "|".join(p.decode("utf-8", "replace") for p in patches))
+        idx = {i for i in range(1, len(bs)) if starts[i]}
+        # 文字単位で表示を組み立てる: 境界が文字の先頭バイトなら手前に `|`、
+        # マルチバイト文字の途中に落ちたらその文字の後ろに `¦` (個数分)
+        out, pos, mid_total = [], 0, 0
+        for ch in text:
+            n = len(ch.encode("utf-8"))
+            if pos in idx:
+                out.append("|")
+            mid = sum(1 for j in range(pos + 1, pos + n) if j in idx)
+            mid_total += mid
+            out.append(ch + "¦" * mid)
+            pos += n
+        n_patches = len(idx) + 1
+        print(f"mean_H={ent.mean():.2f} nats | patches={n_patches} "
+              f"avg_len={len(bs) / n_patches:.1f}B | 文字内境界={mid_total}")
+        print("  " + "".join(out))
     return 0
 
 
