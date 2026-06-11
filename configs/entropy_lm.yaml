@@ -3,7 +3,7 @@
 #   python -m src.train.train --config configs/entropy_lm.yaml
 #   -> checkpoints/entropy_lm/latest を arbor 側の model.entropy_model_ckpt に指定
 #
-# データ混合は本走 (arbor_1b_8k.yaml) と同じ HF 混合。
+# データ混合は本走 (arbor_1b_8k.yaml) ベース + 日英の文体多様化 (下記)。
 # max_bytes は本体の max_bytes 以上にすること (next_byte_entropy は本体の
 # 入力列を一発で通すため、RoPE バッファが本体の context をカバーする必要がある)。
 # 32768 にしてあるので 32k 拡張 run でもそのまま使える。ただし学習 context は
@@ -12,7 +12,7 @@
 # 32768 で再学習するのが確実)。
 
 run_name: entropy_lm
-seed: 42
+seed: 2
 
 model:
   arch: byte_lm             # 小型 causal バイト LM (Arbor 本体ではない)
@@ -27,24 +27,40 @@ model:
   bitnet: false             # 境界判定用なので FP の通常 Transformer
   gradient_checkpointing: false
 
-# 本走 (arbor_1b_8k.yaml) と同じ混合
+# 本走 (arbor_1b_8k.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
+# 本体学習開始後は差し替え不可なので、文体カバレッジは広めに取る
+# (日本語: 現代web/口語/書籍・古典/百科事典、英語: edu/古典書籍/news)。
+# 混合を変えたら resume せず新規学習すること (dataloader 状態が合わなくなる)。
 data:
   sources:
-    - path: "HuggingFaceFW/fineweb-2"   # 日本語 web
+    # ---- 日本語 0.50 ----
+    - path: "HuggingFaceFW/fineweb-2"   # 現代 web
       name: "jpn_Jpan"
-      weight: 0.45
-    - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
-      weight: 0.20
-    - path: "vblagoje/cc_news"          # 英語 news
+      weight: 0.30
+    - path: "range3/cc100-ja"           # web 口語 (ブログ調)
+      weight: 0.07
+    - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
+      weight: 0.08
+    - path: "wikimedia/wikipedia"       # 百科事典文体
+      name: "20231101.ja"
       weight: 0.05
+    # ---- 英語 0.27 ----
+    - path: "HuggingFaceFW/fineweb-edu" # edu (高品質土台)
+      weight: 0.15
+    - path: "manu/project_gutenberg"    # 古典書籍
+      split: "en"
+      weight: 0.07
+    - path: "vblagoje/cc_news"          # news
+      weight: 0.05
+    # ---- code / math 0.23 ----
     - path: "HuggingFaceTB/finemath"    # 数学
       name: "finemath-4plus"
-      weight: 0.10
+      weight: 0.08
     - path: "codeparrot/codeparrot-clean"  # Python 実コード
       text_column: "content"
-      weight: 0.12
+      weight: 0.10
     - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.08
+      weight: 0.05
   streaming: true
   shuffle_buffer: 2000
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)
@@ -68,12 +84,12 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: false
   torch_compile: false
-  micro_batch_size: 4
+  micro_batch_size: 8
   grad_accum_steps: 1
 
 checkpoint:
   dir: ./checkpoints/entropy_lm
-  save_every_steps: 500
+  save_every_steps: 1500
   keep_last_k: 2
   keep_every_n_steps: null
   async_save: false
