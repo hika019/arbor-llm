@@ -124,7 +124,10 @@ python -m src.infer.generate --ckpt 5000                  # 特定 step
 ```
 
 モデル構成は checkpoint 内の `config.yaml` から自動復元される。
-KV cache は未実装 (1 バイトごとに全再フォワード。動作確認・品質評価用)。
+生成は 2 階層 KV cache (global は patch 確定ごとに追記、local は patch 内のみ
+再計算) + BitLinear 推論凍結 (packed ternary / dequant キャッシュ) を使う。
+1B 実測 27 B/s (4090/WSL2。フルフォワード方式 `--no-cache` 比 ~4 倍)。
+それ以上はカーネル起動レイテンシ律速 (issues.md 参照)。
 
 ## HuggingFace 形式エクスポート
 

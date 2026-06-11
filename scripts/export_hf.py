@@ -174,10 +174,16 @@ print(tok.decode(out[0]))
 - **ollama / LM Studio では動かない**: これらは llama.cpp (GGUF) の既知
   アーキテクチャのみ対応で、バイトレベル階層構造 + BitLinear には変換器が
   存在しない。transformers (Python) から利用すること。
-- KV cache 未実装のため generate() は 1 バイトごとに全系列を再フォワードする。
+- transformers の `generate()` は 1 バイトごとに全系列を再フォワードする (遅い)。
+  高速版は同梱の 2 階層 KV cache 生成器を直接使う:
+  ```python
+  from arbor_model.arbor import ArborByteGenerator
+  from arbor_model.bitlinear import freeze_bitlinear_for_inference
+  freeze_bitlinear_for_inference(model.model)
+  gen = ArborByteGenerator(model.model)
+  logits = gen.prefill(tok("日本の").input_ids)  # 以後 gen.push(next_id)
+  ```
 - tokenizer はバイト直 (token = byte + 4)。chat template は無い (base model)。
-- 重みは BF16 シャドウ重み。forward 時に on-the-fly で ternary 量子化される
-  (packed ternary 推論カーネルは未実装)。
 """, encoding="utf-8")
 
 

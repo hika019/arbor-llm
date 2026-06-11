@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from src.model.arbor import (
+    ArborByteGenerator,
     ArborConfig,
     ArborModel,
     ByteLM,
@@ -112,6 +113,36 @@ def test_boundary_min_max_enforcement():
     ids = torch.full((1, 12), ord("a") + 4)
     starts = compute_patch_starts(ids, "space", min_len=2, max_len=4)
     assert starts[0].nonzero().flatten().tolist() == [0, 4, 8]
+
+
+@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
+def test_generator_matches_full_forward(mode):
+    """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
+    torch.manual_seed(3)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode))).eval()
+    ids = torch.randint(4, 260, (26,))
+    ids[::5] = 0x20 + 4  # 空白を混ぜて動的境界を発生させる
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i in range(len(ids)):
+            inc = gen.push(int(ids[i]))
+            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
+            assert torch.allclose(inc, full, atol=1e-4), (
+                f"mode={mode}: 位置 {i} で逐次生成とフルフォワードの logits が不一致 "
+                f"(max diff={float((inc - full).abs().max()):.2e})"
+            )
+
+
+def test_generator_context_rebuild():
+    """max_bytes 到達時に内部で window を作り直しても落ちないこと."""
+    torch.manual_seed(4)
+    m = ArborModel(ArborConfig.from_dict(dict(TINY, max_bytes=16))).eval()
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i in range(40):  # max_bytes=16 を 2 回以上超える
+            logits = gen.push(4 + (i * 7) % 256)
+    assert torch.isfinite(logits).all()
+    assert len(gen.byte_ids) <= 16
 
 
 def test_byte_lm_forward_and_entropy():

@@ -96,6 +96,13 @@ def load_inference_model(
     state = _strip_compile_prefix(safe_load(str(ckpt_dir / "model.safetensors"), device="cpu"))
     model.load_state_dict(state, strict=True)
     model.eval()
+
+    # 推論では重みが固定なので BitLinear を packed ternary に凍結して高速化
+    from src.model.bitlinear import freeze_bitlinear_for_inference
+
+    n_frozen = freeze_bitlinear_for_inference(model)
+    if n_frozen:
+        print(f"[generate] bitlinear_frozen={n_frozen} layers (packed ternary inference)")
     return model
 
 
@@ -139,8 +146,15 @@ def generate_stream(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.bfloat16,
     seed: int | None = None,
+    use_cache: bool = True,
 ) -> Iterator[str]:
-    """1 バイトずつ生成し、UTF-8 として確定した文字列片を逐次 yield する."""
+    """1 バイトずつ生成し、UTF-8 として確定した文字列片を逐次 yield する.
+
+    ArborModel なら既定で 2 階層 KV cache (ArborByteGenerator) を使う。
+    use_cache=False でフルフォワード方式 (検証用・遅い) に切り替え。
+    """
+    from src.model.arbor import ArborByteGenerator, ArborModel
+
     if device is None:
         device = next(model.parameters()).device
     raw = prompt.encode("utf-8") if isinstance(prompt, str) else bytes(prompt)
@@ -155,21 +169,31 @@ def generate_stream(
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     use_autocast = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
 
+    gen: ArborByteGenerator | None = None
+    if use_cache and isinstance(model, ArborModel):
+        gen = ArborByteGenerator(model)
+        last_logits = gen.prefill(ids)
+
     for _ in range(max_new_bytes):
-        window = ids[-(max_context - 1):]
-        x = torch.tensor([window], dtype=torch.long, device=device)
-        ctx = (
-            torch.autocast(device_type=device.type, dtype=dtype)
-            if use_autocast
-            else torch.no_grad()
-        )
-        with ctx:
-            logits = model(x).logits[0, -1].float()
+        if gen is not None:
+            logits = last_logits.float()
+        else:
+            window = ids[-(max_context - 1):]
+            x = torch.tensor([window], dtype=torch.long, device=device)
+            ctx = (
+                torch.autocast(device_type=device.type, dtype=dtype)
+                if use_autocast
+                else torch.no_grad()
+            )
+            with ctx:
+                logits = model(x).logits[0, -1].float()
         logits[:BYTE_OFFSET] = float("-inf")  # 特殊 ID は出さない
         logits = logits[:VOCAB_SIZE]
         # multinomial を CPU generator で引くため logits を CPU に移す
         next_id = _sample_next(logits.cpu(), temperature, top_k, top_p, generator)
         ids.append(next_id)
+        if gen is not None:
+            last_logits = gen.push(next_id)
         piece = decoder.decode(bytes([next_id - BYTE_OFFSET]))
         if piece:
             yield piece
@@ -223,6 +247,8 @@ def main() -> int:
     p.add_argument("--top-k", default=0, type=int)
     p.add_argument("--top-p", default=0.95, type=float)
     p.add_argument("--seed", default=None, type=int)
+    p.add_argument("--no-cache", action="store_true",
+                   help="KV cache を使わずフルフォワードで生成 (検証用・遅い)")
     args = p.parse_args()
 
     if not args.interactive and args.prompt is None:
@@ -249,6 +275,7 @@ def main() -> int:
             max_new_bytes=args.max_new_bytes, temperature=args.temperature,
             top_k=args.top_k, top_p=args.top_p,
             max_context=max_context, seed=args.seed,
+            use_cache=not args.no_cache,
         ):
             sys.stdout.write(piece)
             sys.stdout.flush()

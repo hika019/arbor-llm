@@ -101,10 +101,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dtype)
+        # F.rms_norm は内部 fp32 計算の fused カーネル (手書き 6 カーネル比 ~8 倍速)
+        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
 
 
 class RotaryEmbedding(nn.Module):
@@ -132,11 +130,13 @@ class RotaryEmbedding(nn.Module):
         self.cos = cos.to(self.cos.device, self.cos.dtype)
         self.sin = sin.to(self.sin.device, self.sin.dtype)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """q, k: (B, n_heads, T, head_dim)"""
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, pos_offset: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """q, k: (B, n_heads, T, head_dim)。pos_offset は逐次生成時の絶対位置."""
         t = q.size(-2)
-        cos = self.cos[:t].to(q.dtype)
-        sin = self.sin[:t].to(q.dtype)
+        cos = self.cos[pos_offset:pos_offset + t].to(q.dtype)
+        sin = self.sin[pos_offset:pos_offset + t].to(q.dtype)
         return _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
 
 
@@ -176,12 +176,24 @@ class Attention(nn.Module):
         # SubLN: 出力射影の前に正規化 (BitNet 2B4T の attn_sub_norm)
         self.attn_sub_norm = RMSNorm(n_heads * self.head_dim, norm_eps)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        kv_cache: "_LayerKVCache | None" = None,
+        pos_offset: int = 0,
+    ) -> torch.Tensor:
         b, t, _ = x.shape
         q = self.wq(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.wv(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        q, k = self.rope(q, k)
+        q, k = self.rope(q, k, pos_offset)
+        is_incremental = False
+        if kv_cache is not None:
+            # cache には複製前の KV を入れる (メモリ節約)。cache 済み分は全て過去
+            # なので、新規トークンが 1 個ならマスク無しで全 attend が causal と等価
+            is_incremental = kv_cache.size() > 0
+            k, v = kv_cache.append(k, v)
         # GQA は KV head を明示的に複製してから SDPA に渡す。
         # torch 2.5 の enable_gqa=True は flash backward が壊れることがある
         if self.n_kv_heads != self.n_heads:
@@ -191,6 +203,10 @@ class Attention(nn.Module):
         if attn_mask is not None:
             # 動的 patching 用: causal 制約はマスク側に織り込み済み
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        elif is_incremental:
+            if t != 1:
+                raise ValueError("KV cache への追記は 1 トークンずつ行うこと")
+            out = F.scaled_dot_product_attention(q, k, v)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         out = out.transpose(1, 2).reshape(b, t, -1)
@@ -223,8 +239,14 @@ class Block(nn.Module):
         self.ffn_norm = RMSNorm(dim, norm_eps)
         self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), attn_mask)
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        kv_cache: "_LayerKVCache | None" = None,
+        pos_offset: int = 0,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), attn_mask, kv_cache, pos_offset)
         return x + self.ffn(self.ffn_norm(x))
 
 
@@ -346,6 +368,26 @@ def compute_patch_starts(
         starts[:, i] = s
         run = torch.where(s, torch.ones_like(run), run + 1)
     return starts.to(input_ids.device)
+
+
+# ------------------------------------------------------------------ KV cache
+class _LayerKVCache:
+    """1 層分の KV cache (複製前の n_kv_heads で保持)."""
+
+    def __init__(self) -> None:
+        self.k: torch.Tensor | None = None
+        self.v: torch.Tensor | None = None
+
+    def size(self) -> int:
+        return 0 if self.k is None else self.k.size(2)
+
+    def append(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.k is None:
+            self.k, self.v = k, v
+        else:
+            self.k = torch.cat((self.k, k), dim=2)
+            self.v = torch.cat((self.v, v), dim=2)
+        return self.k, self.v
 
 
 # -------------------------------------------------------------------- model
@@ -531,6 +573,137 @@ class ArborModel(nn.Module):
             + count(self.patch_proj) + count(self.global_to_local),
             "entropy_model": count(self.entropy_model),
         }
+
+
+class ArborByteGenerator:
+    """2 階層 KV cache 付きの逐次バイト生成器 (batch=1).
+
+    フルフォワード方式 (1 バイトごとに全系列再計算) と論理的に同一の logits を、
+    増分計算だけで返す:
+      - global: patch が確定するたびに 1 トークンだけ KV cache に追記
+      - local decoder: 現在 patch のプレフィックス (<= max_patch_len トークン) を
+        毎バイト再計算 (極小なのでキャッシュ不要)
+      - entropy モードは境界判定用 ByteLM にも KV cache を持つ
+
+    使い方:
+        gen = ArborByteGenerator(model)
+        logits = gen.prefill(prompt_ids)   # 最終位置の next-byte logits (vocab,)
+        logits = gen.push(next_id)         # 1 バイト進める
+
+    context が max_bytes に達したら後半半分を残して内部で自動的に作り直す。
+    """
+
+    def __init__(self, model: ArborModel):
+        if not isinstance(model, ArborModel):
+            raise TypeError("ArborByteGenerator は ArborModel 専用")
+        self.m = model.eval()
+        self.cfg = model.cfg
+        p = next(model.parameters())
+        self.device, self.dtype = p.device, p.dtype
+        self.reset()
+
+    def reset(self) -> None:
+        self.byte_ids: list[int] = []
+        self.cur_patch: list[int] = []
+        self.cur_patch_start = 0
+        self.n_global = 0
+        self.g_caches = [_LayerKVCache() for _ in self.m.global_layers]
+        self.h_cur: torch.Tensor | None = None
+        if self.cfg.patching_mode == "entropy":
+            self.lm_caches = [_LayerKVCache() for _ in self.m.entropy_model.layers]
+            self.prev_entropy = 0.0
+        self._push_global(self.m.global_bos.view(1, 1, -1))
+
+    @torch.inference_mode()
+    def prefill(self, ids: list[int] | torch.Tensor) -> torch.Tensor:
+        if isinstance(ids, torch.Tensor):
+            ids = ids.flatten().tolist()
+        logits = None
+        for byte_id in ids:
+            logits = self.push(int(byte_id))
+        if logits is None:
+            raise ValueError("prefill には 1 バイト以上必要")
+        return logits
+
+    @torch.inference_mode()
+    def push(self, byte_id: int) -> torch.Tensor:
+        if len(self.byte_ids) >= self.cfg.max_bytes:
+            self._rebuild(keep=self.cfg.max_bytes // 2)
+        if self._starts_new_patch():
+            self._commit_patch()
+        self.cur_patch.append(byte_id)
+        self.byte_ids.append(byte_id)
+        if self.cfg.patching_mode == "entropy":
+            self._advance_entropy_lm(byte_id)
+        return self._decode_current()
+
+    # ----------------------------------------------------------- internal
+    def _starts_new_patch(self) -> bool:
+        """次に push されるバイトが新しい patch を始めるか (compute_patch_starts と同条件)."""
+        run = len(self.cur_patch)
+        if run == 0:
+            return False
+        cfg = self.cfg
+        if cfg.patching_mode == "static":
+            return run >= cfg.patch_size
+        if run >= cfg.max_patch_len:
+            return True
+        if run < cfg.min_patch_len:
+            return False
+        if cfg.patching_mode == "space":
+            return (self.byte_ids[-1] - BYTE_OFFSET) in _SPACE_BYTES
+        return self.prev_entropy > cfg.entropy_threshold
+
+    def _push_global(self, g_in: torch.Tensor) -> None:
+        g = g_in.to(self.dtype)
+        for layer, cache in zip(self.m.global_layers, self.g_caches):
+            g = layer(g, kv_cache=cache, pos_offset=self.n_global)
+        self.n_global += 1
+        self.h_cur = self.m.global_to_local(self.m.global_norm(g))  # (1, 1, dl)
+
+    def _commit_patch(self) -> None:
+        ids = torch.tensor([self.cur_patch], dtype=torch.long, device=self.device)
+        x = self.m.byte_emb(ids)
+        pos = 0 if not self.m.dynamic else self.cur_patch_start
+        for layer in self.m.encoder_layers:
+            x = layer(x, pos_offset=pos)
+        if self.m.dynamic:
+            patch_emb = self.m.patch_proj(x.amax(dim=1))     # max-pool (1, dg)
+        else:
+            patch_emb = self.m.patch_proj(x.reshape(1, -1))  # concat (1, dg)
+        self._push_global(patch_emb.view(1, 1, -1))
+        self.cur_patch_start += len(self.cur_patch)
+        self.cur_patch = []
+
+    def _decode_current(self) -> torch.Tensor:
+        ids = torch.tensor([self.cur_patch], dtype=torch.long, device=self.device)
+        d = self.m.byte_emb(ids) + self.h_cur
+        pos = 0 if not self.m.dynamic else self.cur_patch_start
+        for layer in self.m.decoder_layers:
+            d = layer(d, pos_offset=pos)  # causal (<= max_patch_len トークン)
+        return self.m.head(self.m.head_norm(d[:, -1]))[0]  # (vocab,)
+
+    def _advance_entropy_lm(self, byte_id: int) -> None:
+        lm = self.m.entropy_model
+        pos = len(self.byte_ids) - 1
+        x = lm.embed(torch.tensor([[byte_id]], dtype=torch.long, device=self.device))
+        x = x.to(self.dtype)
+        for layer, cache in zip(lm.layers, self.lm_caches):
+            x = layer(x, kv_cache=cache, pos_offset=pos)
+        logp = F.log_softmax(lm.head(lm.norm(x)).float()[0, -1], dim=-1)
+        self.prev_entropy = float(-(logp.exp() * logp).sum())
+
+    def _rebuild(self, keep: int) -> None:
+        tail = self.byte_ids[-keep:]
+        self.reset()
+        for byte_id in tail:
+            if self._starts_new_patch():
+                self._commit_patch()
+            self.cur_patch.append(byte_id)
+            self.byte_ids.append(byte_id)
+            if self.cfg.patching_mode == "entropy":
+                self._advance_entropy_lm(byte_id)
+        # 次の push/_decode_current から通常運転
 
 
 def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:

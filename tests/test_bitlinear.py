@@ -57,3 +57,42 @@ def test_ste_gradients_flow_through_quantization():
 def test_bias_is_rejected():
     with pytest.raises(ValueError, match="bias"):
         BitLinear(8, 8, bias=True)
+
+
+def test_pack_unpack_roundtrip():
+    from src.model.bitlinear import pack_ternary_weight, unpack_ternary_weight
+
+    torch.manual_seed(0)
+    w = torch.randint(-1, 2, (7, 13), dtype=torch.int8)  # 4 で割れない K
+    packed = pack_ternary_weight(w)
+    assert packed.dtype == torch.uint8 and packed.shape == (7, 4)
+    assert torch.equal(unpack_ternary_weight(packed, 13), w)
+
+
+def test_frozen_inference_matches_eval_forward():
+    """推論凍結後の forward が通常 eval forward と (数値誤差内で) 一致すること."""
+    torch.manual_seed(0)
+    lin = BitLinear(64, 32).eval()
+    x = torch.randn(5, 64)
+    ref = lin(x)
+    lin.freeze_for_inference()
+    assert lin.frozen
+    out = lin(x)
+    assert torch.allclose(out, ref, atol=1e-4), float((out - ref).abs().max())
+    # train モードに戻すと学習パスに切り替わる (凍結値は使われない)
+    lin.train()
+    assert torch.allclose(lin(x), ref, atol=1e-4)
+    lin.unfreeze()
+    assert not lin.frozen
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_frozen_packed_kernel_matches_reference_cuda():
+    torch.manual_seed(0)
+    lin = BitLinear(128, 96).to(device="cuda", dtype=torch.bfloat16).eval()
+    x = torch.randn(9, 128, device="cuda", dtype=torch.bfloat16)
+    ref = lin(x).float()
+    lin.freeze_for_inference()
+    out = lin(x).float()
+    assert lin._w_packed is not None or lin._w_dq is not None
+    assert torch.allclose(out, ref, atol=3e-2, rtol=1e-2), float((out - ref).abs().max())

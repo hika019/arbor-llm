@@ -2,18 +2,22 @@
 
 対応済みの項目は削除済み。(2026-06-11 v2 移行時に全面整理)
 
-## 推論用 KV cache が無い
+## 生成がまだカーネル起動レイテンシ律速 (27 B/s)
 
 ### 状況
 
-`src/infer/generate.py` と HF エクスポートの `generate()` は 1 バイトごとに
-全系列を再フォワードする。動作確認には十分だが、長文生成は遅い。
+2 階層 KV cache (ArborByteGenerator) + BitLinear 推論凍結 + fused RMSNorm で
+7.0 → 27.2 B/s (4090/WSL2, 1B)。プロファイル上、計算自体は軽く、残りは
+「1 step あたり数百個の小さい CUDA カーネル起動 (WSL2 では 1 個 ~15-100us)
++ PyTorch の Python ディスパッチ」が支配的。RoPE (~430us/層) も手書きの
+複数カーネル。
 
 ### 対応案
 
-静的 patching なので 2 階層 cache が素直に書ける:
-- global: 確定した patch (4 bytes 揃った時点) ごとに KV を 1 entry 追加
-- local decoder: 現在 patch 内の KV のみ保持 (最大 4 tokens)
+torch.compile / CUDA Graph で step 関数を融合する (初回コンパイル数分の
+トレードオフ)。KV cache の cat を固定長バッファ + 書き込み位置方式に変えて
+形状を固定すれば reduce-overhead (CUDA Graph) まで効かせられる。
+Windows ネイティブや素の Linux なら起動レイテンシ自体も下がる。
 
 ## validation loss が無い (best = train loss EMA)
 
