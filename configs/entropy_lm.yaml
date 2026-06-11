@@ -29,38 +29,42 @@ model:
 
 # 本走 (arbor_1b_8k.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
 # 本体学習開始後は差し替え不可なので、文体カバレッジは広めに取る
-# (日本語: 現代web/口語/書籍・古典/百科事典、英語: edu/古典書籍/news)。
+# (日本語: 現代web/口語/書籍・古典/百科事典/法令、英語: edu/古典書籍/news、
+#  code は多言語 GitHub)。
 # 混合を変えたら resume せず新規学習すること (dataloader 状態が合わなくなる)。
 data:
   sources:
-    # ---- 日本語 0.50 ----
+    # ---- 日本語 0.60 ----
     - path: "HuggingFaceFW/fineweb-2"   # 現代 web
       name: "jpn_Jpan"
-      weight: 0.30
+      weight: 0.36
     - path: "range3/cc100-ja"           # web 口語 (ブログ調)
       weight: 0.07
     - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
-      weight: 0.08
+      weight: 0.07
     - path: "wikimedia/wikipedia"       # 百科事典文体
       name: "20231101.ja"
       weight: 0.05
-    # ---- 英語 0.27 ----
+    - path: "y2lan/japan-law"           # 法令 (条文体。8.75k 件と小さいが all_exhausted で循環)
+      text_column: "body"
+      weight: 0.05
+    # ---- 英語 0.22 ----
     - path: "HuggingFaceFW/fineweb-edu" # edu (高品質土台)
-      weight: 0.15
+      weight: 0.12
     - path: "manu/project_gutenberg"    # 古典書籍
       split: "en"
-      weight: 0.07
+      weight: 0.06
     - path: "vblagoje/cc_news"          # news
-      weight: 0.05
-    # ---- code / math 0.23 ----
+      weight: 0.04
+    # ---- code / math 0.18 ----
     - path: "HuggingFaceTB/finemath"    # 数学
       name: "finemath-4plus"
+      weight: 0.06
+    - path: "loubnabnl/github-code-more-filtering"  # 多言語 GitHub コード (32 言語, parquet 非 gated)
+      text_column: "code"
       weight: 0.08
-    - path: "codeparrot/codeparrot-clean"  # Python 実コード
-      text_column: "content"
-      weight: 0.10
     - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.05
+      weight: 0.04
   streaming: true
   shuffle_buffer: 2000
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)
@@ -76,16 +80,17 @@ optim:
   weight_decay: 0.0
   grad_clip: 1.0
   scheduler: cosine_warmup
-  min_lr_ratio: 0.1            # 最終 step の lr = ピークの 10% (0 で従来の完全減衰)
+  min_lr_ratio: 0.15            # lr 下限 = ピークの 15%
+  decay_end_ratio: 0.8          # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 100
-  total_steps: 5000
+  total_steps: 40000
 
 speed:
   precision: bf16
   tf32_matmul: true
   cudnn_benchmark: false
-  torch_compile: false
-  micro_batch_size: 6
+  torch_compile: true
+  micro_batch_size: 8
   grad_accum_steps: 1
 
 checkpoint:

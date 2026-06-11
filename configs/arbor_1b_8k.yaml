@@ -5,15 +5,15 @@
 # 終了後: configs/arbor_1b_32k.yaml で 32k bytes へ拡張 (--init-from)
 #
 # 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (4 bytes/patch)
-# なので global は 2048 patches。実効バッチは arbor_1b.yaml と同じ 131k bytes/update
-# (micro_batch 8→2, grad_accum 8→32 で相殺)。
+# なので global は 2048 patches。実効バッチは 64 seq = 524k bytes/update
+# (micro_batch 8→2, grad_accum 8→32 で seq 数は arbor_1b と同じだが、seq 長 4 倍ぶん増)。
 
 run_name: arbor2_1b_8k
 seed: 42
 
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
-  patching_mode: static
+  patching_mode: static         # choices: static | space | entropy
   patch_size: 4                 # 1 patch = 4 bytes (静的)
   max_bytes: 8192               # 学習 context (bytes) = 2048 patches
   # ---- global (patch 階層, BitLinear) ----
@@ -36,26 +36,32 @@ model:
   gradient_checkpointing: false # OOM 時のみ true
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
-# 日本語主軸 + 英語 + code/math (能力の土台はベースで仕込む)。
-# 注: gated の bigcode/the-stack-dedup (多言語 code) を使う場合は HF login +
-#     規約同意の上で codeparrot-clean と差し替え (text_column: content)。
+# 日本語 0.60 主軸 + 英語 0.17 + code/math 0.23 (能力の土台はベースで仕込む)。
+# code は多言語 GitHub (32 言語, parquet 非 gated)。さらに大規模・高品質が欲しい
+# 場合は gated の bigcode/the-stack-dedup (HF login + 規約同意) と差し替え可。
 data:
   sources:
+    # ---- 日本語 0.60 ----
     - path: "HuggingFaceFW/fineweb-2"   # 日本語 web
       name: "jpn_Jpan"
-      weight: 0.45
+      weight: 0.57
+    - path: "y2lan/japan-law"           # 法令 (条文体。小規模だが all_exhausted で循環)
+      text_column: "body"
+      weight: 0.03
+    # ---- 英語 0.17 ----
     - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
-      weight: 0.20
+      weight: 0.13
     - path: "vblagoje/cc_news"          # 英語 news
-      weight: 0.05
+      weight: 0.04
+    # ---- code / math 0.23 ----
     - path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
       name: "finemath-4plus"
-      weight: 0.10
-    - path: "codeparrot/codeparrot-clean"  # Python 実コード (非 gated)
-      text_column: "content"
-      weight: 0.12
-    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
       weight: 0.08
+    - path: "loubnabnl/github-code-more-filtering"  # 多言語 GitHub コード (32 言語)
+      text_column: "code"
+      weight: 0.10
+    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
+      weight: 0.05
   streaming: true
   shuffle_buffer: 2000
   context_length: 8192          # bytes。patch_size の倍数にする
@@ -72,7 +78,8 @@ optim:
   weight_decay: 0.1
   grad_clip: 1.0
   scheduler: cosine_warmup
-  min_lr_ratio: 0.1            # 最終 step の lr = ピークの 10% (0 で従来の完全減衰)
+  min_lr_ratio: 0.1            # lr 下限 = ピークの 10% (0 で従来の完全減衰)
+  decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
   total_steps: 200000
 
@@ -84,7 +91,7 @@ speed:
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   micro_batch_size: 2           # T=8192 なので 2 (bytes/micro は arbor_1b と同じ 16k)
-  grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 131k bytes/update)
+  grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)
 
 checkpoint:
   dir: ./checkpoints/arbor2_1b_8k

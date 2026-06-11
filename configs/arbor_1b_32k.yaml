@@ -42,22 +42,29 @@ model:
   bitnet: true
   gradient_checkpointing: false # T=32768 で OOM するなら true
 
-# ---- データ: 長文書 (code / edu / math) を 8k 本走より厚めに。短い news は外す ----
+# ---- データ: 長文書 (法令 / code / edu / math) を 8k 本走より厚めに。短い news は外す ----
+# 日本語 0.60 は本走 (arbor_1b_8k.yaml) と同じ方針。法令は 1 文書が長く 32k 向き。
 data:
   sources:
+    # ---- 日本語 0.60 ----
     - path: "HuggingFaceFW/fineweb-2"
       name: "jpn_Jpan"
-      weight: 0.30
+      weight: 0.52
+    - path: "y2lan/japan-law"               # 法令: 長文書 (小規模だが all_exhausted で循環)
+      text_column: "body"
+      weight: 0.08
+    # ---- 英語 0.12 ----
     - path: "HuggingFaceFW/fineweb-edu"
-      weight: 0.20
+      weight: 0.12
+    # ---- code / math 0.28 ----
     - path: "HuggingFaceTB/finemath"
       name: "finemath-4plus"
-      weight: 0.15
-    - path: "codeparrot/codeparrot-clean"   # コードはファイル単位で長い
-      text_column: "content"
-      weight: 0.25
-    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"
       weight: 0.10
+    - path: "loubnabnl/github-code-more-filtering"  # 多言語 GitHub コード (ファイル単位で長い)
+      text_column: "code"
+      weight: 0.13
+    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      weight: 0.05
   streaming: true
   shuffle_buffer: 2000
   context_length: 32768
@@ -74,7 +81,8 @@ optim:
   weight_decay: 0.1
   grad_clip: 1.0
   scheduler: cosine_warmup
-  min_lr_ratio: 0.1            # 最終 step の lr = ピークの 10% (0 で従来の完全減衰)
+  min_lr_ratio: 0.1            # lr 下限 = ピークの 10% (0 で従来の完全減衰)
+  decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 200
   total_steps: 20000
 
