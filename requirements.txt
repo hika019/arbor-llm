@@ -12,6 +12,7 @@ bitsandbytes>=0.43   # optim.optimizer: bnb_adamw_8bit 用 (lion/adamw_fused な
 # ---- HF エクスポート / transformers からの推論 ----
 transformers>=4.45
 accelerate>=0.33     # transformers のモデルロード補助 (推奨)
+huggingface_hub>=0.23  # エクスポートした modeling が Hub repo id 解決に使用
 
 # ---- dev ----
 pytest>=8.2

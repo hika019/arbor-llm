@@ -88,6 +88,27 @@ python -m src.train.train --config configs/arbor_1b.yaml --resume latest
   モデルで行うので `_orig_mod.` prefix 問題も起きない。
 - `best` は **train loss の EMA** が最良だった checkpoint (validation best ではない)。
 
+### entropy patching を使う手順 (区切り用 LM の学習)
+
+entropy モードは「次バイトの予測しにくさ」を測る小型バイト LM (ByteLM) を
+**事前に別途学習**して凍結利用する (本体と同時には学習しない。境界判定は
+離散なので勾配が流れず、判定基準が動くと本体の学習も不安定になるため)。
+
+```bash
+# 1. 区切り用 ByteLM を学習 (データ混合は本走と同じにすること)
+python -m src.train.train --config configs/entropy_lm.yaml
+
+# 2. 本体 config で entropy モードを指定して学習
+#    model.patching_mode: entropy
+#    model.entropy_model: (ByteLM の構成: entropy_lm.yaml の model 節と一致させる)
+#    model.entropy_model_ckpt: ./checkpoints/entropy_lm/latest
+python -m src.train.train --config configs/trial_entropy.yaml   # 小規模な実例
+```
+
+学習後の ByteLM は本体の checkpoint / HF エクスポートに同梱されるので、
+推論側で別途用意する必要は無い。`model.entropy_threshold` (nats) で
+区切りの細かさを調整する (小さいほど細かく切れる)。
+
 ### checkpoint 時の自動サンプル生成
 
 `sampling.enabled: true` で、checkpoint 保存のたびに固定プロンプト・固定 seed で
@@ -122,7 +143,15 @@ print(tok.decode(model.generate(ids, max_new_tokens=100)[0]))
 ```
 
 モデル定義 (`arbor_model/`, torch のみ依存) とバイト tokenizer を同梱した
-`trust_remote_code` 形式。
+`trust_remote_code` 形式。3 つの patching モードすべてエクスポート可能で、
+entropy モードでは凍結 ByteLM も safetensors に同梱される。
+
+HF Hub への公開も可能:
+
+```bash
+huggingface-cli upload <user>/<repo> export/arbor2_1b-step10000 .
+# 利用側: AutoModelForCausalLM.from_pretrained("<user>/<repo>", trust_remote_code=True)
+```
 
 ### ollama / LM Studio について
 

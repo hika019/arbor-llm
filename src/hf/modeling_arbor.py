@@ -67,7 +67,18 @@ def _resolve_code_root(config: ArborConfig) -> Path:
     candidates: list[Path] = []
     name_or_path = getattr(config, "_name_or_path", None)
     if name_or_path:
-        candidates.append(Path(name_or_path))
+        p = Path(name_or_path)
+        if p.is_dir():
+            candidates.append(p)
+        else:
+            # HF Hub の repo id とみなして snapshot を取得
+            # (from_pretrained 済みならキャッシュから即時に返る)
+            try:
+                from huggingface_hub import snapshot_download
+
+                candidates.append(Path(snapshot_download(name_or_path)))
+            except Exception:
+                pass
     if config.code_root:
         candidates.append(Path(config.code_root))
     candidates.append(Path(__file__).resolve().parent)
