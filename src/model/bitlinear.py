@@ -1,413 +1,63 @@
-"""BitLinear (BitNet b1.58, W1.58 / A8) with STE.
+"""BitLinear — BitNet b1.58 (W1.58 / A8) 公式レシピ準拠.
 
-BF16 shadow weights are kept as the master parameter. On the forward pass the
-weights are quantized to ternary {-1, 0, +1} in int8 storage via absmean
-rounding, and the activations are quantized per-token to int8 via absmax. The
-backward pass uses a straight-through estimator (STE).
+"The Era of 1-bit LLMs: Training Tips, Code and FAQ" (Microsoft) の実装に従う:
 
-On CUDA, the forward path uses an optional Triton kernel that stores ternary
-weights packed 4 values per byte and multiplies them with int8 activations. On
-CPU or when Triton is unavailable, it falls back to the PyTorch reference path.
-Backward is still an STE reference implementation.
+- 重み: per-tensor absmean scale で ternary {-1, 0, +1} に丸める (1.58 bit)。
+- 活性: per-token absmax scale で int8 [-128, 127] に丸める。
+- STE は detach トリックで実装する:
+      x_q = x + (Q(x) - x).detach()
+  これにより forward は量子化値を使い、backward は量子化を恒等写像とみなした
+  勾配が「量子化後の重み・活性」で計算される (生の重み/活性で勾配を取るのは
+  公式レシピと異なる)。
+- bias は持たない (BitNet b1.58 2B4T 仕様)。
+- 量子化前の正規化 (SubLN) は層構造側 (arbor.py) が担う。BitNet 2B4T と同じく、
+  すべての BitLinear の入力は直前に RMSNorm を通る:
+      q/k/v <- input_layernorm,  o <- attn_sub_norm,
+      gate/up <- post_attention_layernorm,  down <- ffn_sub_norm
+
+カスタム autograd や Triton カーネルは使わない。純 PyTorch なので torch.compile が
+全体を融合でき、CPU でもそのまま動く。学習は BF16 シャドウ重みが master。
+推論専用の packed ternary カーネルは将来の最適化として分離する。
 """
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    import triton
-    import triton.language as tl
-except Exception:  # pragma: no cover - depends on optional CUDA stack
-    triton = None
-    tl = None
+
+def activation_quant(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """per-token absmax int8 量子化 (値は dequantize して返す)."""
+    scale = 127.0 / x.abs().amax(dim=-1, keepdim=True).clamp_min(eps)
+    return (x * scale).round().clamp(-128, 127) / scale
 
 
-def _round_clip(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
-    return torch.clamp(torch.round(x), lo, hi)
-
-
-def quantize_weight_ternary(w: torch.Tensor, eps: float = 1e-5) -> tuple[torch.Tensor, torch.Tensor]:
-    """absmean ternary quantization. Returns (int8 w_q in {-1,0,1}, scale)."""
+def weight_quant(w: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """per-tensor absmean ternary 量子化 (値は dequantize して返す)."""
     scale = w.abs().mean().clamp_min(eps)
-    w_q = _round_clip(w / scale, -1.0, 1.0).to(torch.int8)
-    return w_q, scale
-
-
-def quantize_activation_int8(x: torch.Tensor, eps: float = 1e-5) -> tuple[torch.Tensor, torch.Tensor]:
-    """absmax per-token int8 quantization. Returns (int8 x_q in [-127,127], scale).
-    Scale shape: (..., 1) so it broadcasts on the last (feature) dim.
-    """
-    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / 127.0
-    x_q = _round_clip(x / scale, -127.0, 127.0).to(torch.int8)
-    return x_q, scale
-
-
-def pack_ternary_weight(w_q: torch.Tensor) -> torch.Tensor:
-    """Pack int8 ternary weights {-1,0,1} into uint8, 4 weights per byte."""
-    if w_q.dtype != torch.int8:
-        raise TypeError(f"w_q must be torch.int8, got {w_q.dtype}")
-    if w_q.dim() != 2:
-        raise ValueError(f"w_q must be 2D, got shape={tuple(w_q.shape)}")
-    n, k = w_q.shape
-    k_packed = math.ceil(k / 4)
-    padded = w_q.new_zeros((n, k_packed * 4), dtype=torch.int8)
-    padded[:, :k] = w_q
-    codes = (padded + 1).to(torch.uint8).view(n, k_packed, 4)
-    return (
-        codes[:, :, 0]
-        | (codes[:, :, 1] << 2)
-        | (codes[:, :, 2] << 4)
-        | (codes[:, :, 3] << 6)
-    ).contiguous()
-
-
-def unpack_ternary_weight(w_packed: torch.Tensor, k: int) -> torch.Tensor:
-    """Unpack uint8 ternary weights back to int8 {-1,0,1}."""
-    if w_packed.dtype != torch.uint8:
-        raise TypeError(f"w_packed must be torch.uint8, got {w_packed.dtype}")
-    codes = torch.stack(
-        (
-            w_packed & 0x03,
-            (w_packed >> 2) & 0x03,
-            (w_packed >> 4) & 0x03,
-            (w_packed >> 6) & 0x03,
-        ),
-        dim=-1,
-    )
-    return (codes.reshape(w_packed.size(0), -1)[:, :k].to(torch.int8) - 1).contiguous()
-
-
-if triton is not None:
-
-    @triton.jit
-    def _packed_bitlinear_kernel(
-        x_ptr, w_ptr, sx_ptr, sw_ptr, y_ptr,
-        m: tl.constexpr, n: tl.constexpr, k: tl.constexpr, k_packed: tl.constexpr,
-        stride_xm: tl.constexpr, stride_ym: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    ):
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-
-        for k0 in range(0, k, BLOCK_K):
-            k_idxs = k0 + offs_k
-            x = tl.load(
-                x_ptr + offs_m[:, None] * stride_xm + k_idxs[None, :],
-                mask=(offs_m[:, None] < m) & (k_idxs[None, :] < k),
-                other=0,
-            )
-
-            pack_idxs = k_idxs // 4
-            shifts = (k_idxs % 4) * 2
-            packed = tl.load(
-                w_ptr + offs_n[None, :] * k_packed + pack_idxs[:, None],
-                mask=(offs_n[None, :] < n) & (k_idxs[:, None] < k),
-                other=1,
-            )
-            codes = ((packed >> shifts[:, None]) & 3).to(tl.int32)
-            w = (codes - 1).to(tl.int8)
-            acc += tl.dot(x, w, out_dtype=tl.float32)
-
-        sx = tl.load(sx_ptr + offs_m, mask=offs_m < m, other=0.0).to(tl.float32)
-        sw = tl.load(sw_ptr).to(tl.float32)
-        y = acc * sx[:, None] * sw
-        tl.store(
-            y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :],
-            y,
-            mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
-        )
-
-
-def _packed_bitlinear_forward_from_packed(
-    x_q: torch.Tensor,
-    sx: torch.Tensor,
-    w_packed: torch.Tensor,
-    k: int,
-    n: int,
-    sw: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor | None:
-    if triton is None or not x_q.is_cuda:
-        return None
-    if x_q.dim() != 2 or w_packed.dim() != 2:
-        return None
-    m, x_k = x_q.shape
-    if x_k != k:
-        raise ValueError(f"x/w shape mismatch: x_k={x_k} k={k}")
-    y = torch.empty((m, n), device=x_q.device, dtype=out_dtype)
-    block_m, block_n, block_k = 16, 32, 64
-    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
-    _packed_bitlinear_kernel[grid](
-        x_q.contiguous(), w_packed, sx.reshape(m).contiguous(), sw.contiguous(), y,
-        m, n, k, w_packed.size(1),
-        x_q.stride(0), y.stride(0),
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-        num_warps=4,
-    )
-    return y
-
-
-def _packed_bitlinear_forward(
-    x_q: torch.Tensor,
-    sx: torch.Tensor,
-    w_q: torch.Tensor,
-    sw: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor | None:
-    if triton is None or not x_q.is_cuda:
-        return None
-    if x_q.dim() != 2 or w_q.dim() != 2:
-        return None
-    w_packed = pack_ternary_weight(w_q).contiguous()
-    return _packed_bitlinear_forward_from_packed(
-        x_q=x_q,
-        sx=sx,
-        w_packed=w_packed,
-        k=w_q.size(1),
-        n=w_q.size(0),
-        sw=sw,
-        out_dtype=out_dtype,
-    )
-
-
-def _quantized_grad_x(
-    grad_out: torch.Tensor,
-    w_q: torch.Tensor,
-    sw: torch.Tensor,
-    out_dtype: torch.dtype,
-    w_t_packed: torch.Tensor | None = None,
-) -> torch.Tensor:
-    orig_shape = grad_out.shape[:-1]
-    g_q, sg = quantize_activation_int8(grad_out)
-    g_q_2d = g_q.reshape(-1, g_q.size(-1))
-    sg_2d = sg.reshape(-1, 1)
-    if w_t_packed is not None:
-        y = _packed_bitlinear_forward_from_packed(
-            x_q=g_q_2d,
-            sx=sg_2d,
-            w_packed=w_t_packed,
-            k=w_q.size(0),
-            n=w_q.size(1),
-            sw=sw,
-            out_dtype=out_dtype,
-        )
-    else:
-        y = _packed_bitlinear_forward(
-            x_q=g_q_2d,
-            sx=sg_2d,
-            w_q=w_q.t().contiguous(),
-            sw=sw,
-            out_dtype=out_dtype,
-        )
-    if y is None:
-        y = F.linear(g_q.to(out_dtype), w_q.t().to(out_dtype)) * sg.to(out_dtype) * sw.to(out_dtype)
-    else:
-        y = y.reshape(*orig_shape, w_q.size(1))
-    return y.to(out_dtype)
-
-
-class _BitLinearSTE(torch.autograd.Function):
-    """STE wrapper: forward uses quantized w & x, backward passes grads through."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        w: torch.Tensor,
-        w_q_cached: torch.Tensor | None = None,
-        sw_cached: torch.Tensor | None = None,
-        w_packed_cached: torch.Tensor | None = None,
-        w_t_packed_cached: torch.Tensor | None = None,
-        backward_mode: str = "ste",
-    ):
-        orig_shape = x.shape[:-1]
-        x_q, sx = quantize_activation_int8(x)
-        if w_q_cached is None or sw_cached is None:
-            w_q, sw = quantize_weight_ternary(w)
-        else:
-            w_q, sw = w_q_cached, sw_cached
-        x_q_2d = x_q.reshape(-1, x_q.size(-1))
-        sx_2d = sx.reshape(-1, 1)
-        if w_packed_cached is not None:
-            y = _packed_bitlinear_forward_from_packed(
-                x_q=x_q_2d,
-                sx=sx_2d,
-                w_packed=w_packed_cached,
-                k=w.size(1),
-                n=w.size(0),
-                sw=sw,
-                out_dtype=x.dtype,
-            )
-        else:
-            y = _packed_bitlinear_forward(x_q_2d, sx_2d, w_q, sw, x.dtype)
-        if y is None:
-            y = F.linear(x_q.to(x.dtype), w_q.to(x.dtype)) * sx * sw
-        else:
-            y = y.reshape(*orig_shape, w.size(0))
-        ctx.save_for_backward(x, w, w_q, sw)
-        ctx.w_t_packed = w_t_packed_cached
-        ctx.backward_mode = backward_mode
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, w, w_q, sw = ctx.saved_tensors
-        # STE: 量子化を恒等視して勾配を素通し. autocast 由来の dtype 混在を吸収する.
-        g = grad_out.to(w.dtype)
-        if ctx.backward_mode == "quantized_grad_x":
-            grad_x = _quantized_grad_x(
-                grad_out=g,
-                w_q=w_q,
-                sw=sw,
-                out_dtype=x.dtype,
-                w_t_packed=ctx.w_t_packed,
-            )
-        elif ctx.backward_mode == "ste":
-            grad_x = (g @ w).to(x.dtype)
-        else:
-            raise ValueError(f"unknown BitLinear backward_mode: {ctx.backward_mode}")
-        flat_g = g.reshape(-1, g.size(-1))
-        flat_x = x.reshape(-1, x.size(-1)).to(w.dtype)
-        grad_w = flat_g.t() @ flat_x
-        return grad_x, grad_w, None, None, None, None, None
+    return (w / scale).round().clamp(-1, 1) * scale
 
 
 class BitLinear(nn.Module):
-    """Drop-in replacement for nn.Linear with W1.58 / A8 + STE.
+    """nn.Linear (bias 無し) の drop-in 置換. W1.58 / A8 + STE."""
 
-    bias is intentionally not supported (matches MS BitNet b1.58 2B4T design:
-    Linear layers carry no bias).
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        cache_packed_weight: bool = False,
-        backward_mode: str = "ste",
-    ):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__()
         if bias:
-            raise ValueError("BitLinear is bias-free (matches BitNet b1.58 spec).")
+            raise ValueError("BitLinear is bias-free (BitNet b1.58 spec).")
         self.in_features = in_features
         self.out_features = out_features
-        self.cache_packed_weight = cache_packed_weight
-        self.backward_mode = backward_mode
-        self._cache_weight_version: int | None = None
-        self._cache_device: torch.device | None = None
-        self._cache_dtype: torch.dtype | None = None
-        self._cache_w_q: torch.Tensor | None = None
-        self._cache_sw: torch.Tensor | None = None
-        self._cache_w_packed: torch.Tensor | None = None
-        self._cache_w_t_packed: torch.Tensor | None = None
-        # BF16 シャドウ重みを master とする (学習対象).
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16))
-        # 一部の nn 標準モジュール (MultiheadAttention 等) が .bias を直接参照するため
-        # nn.Linear と同じ属性を None で公開する.
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        # 出力側 (wo / down) は builder 側で 1/sqrt(2*n_layers) に再スケールする
+        nn.init.trunc_normal_(self.weight, std=0.02, a=-0.06, b=0.06)
         self.register_parameter("bias", None)
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
-
-    def clear_weight_cache(self) -> None:
-        self._cache_weight_version = None
-        self._cache_device = None
-        self._cache_dtype = None
-        self._cache_w_q = None
-        self._cache_sw = None
-        self._cache_w_packed = None
-        self._cache_w_t_packed = None
-
-    def set_weight_cache_enabled(self, enabled: bool) -> None:
-        self.cache_packed_weight = enabled
-        if not enabled:
-            self.clear_weight_cache()
-
-    def set_backward_mode(self, mode: str) -> None:
-        if mode not in ("ste", "quantized_grad_x"):
-            raise ValueError(f"unknown BitLinear backward_mode: {mode}")
-        self.backward_mode = mode
-
-    def _cached_quantized_weight(
-        self,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        if not self.cache_packed_weight or triton is None or not self.weight.is_cuda:
-            return None, None, None, None
-        version = self.weight._version
-        if (
-            self._cache_weight_version == version
-            and self._cache_device == self.weight.device
-            and self._cache_dtype == self.weight.dtype
-            and self._cache_w_q is not None
-            and self._cache_sw is not None
-            and self._cache_w_packed is not None
-            and self._cache_w_t_packed is not None
-        ):
-            return self._cache_w_q, self._cache_sw, self._cache_w_packed, self._cache_w_t_packed
-
-        with torch.no_grad():
-            w_q, sw = quantize_weight_ternary(self.weight)
-            w_packed = pack_ternary_weight(w_q).contiguous()
-            w_t_packed = pack_ternary_weight(w_q.t().contiguous()).contiguous()
-        self._cache_weight_version = version
-        self._cache_device = self.weight.device
-        self._cache_dtype = self.weight.dtype
-        self._cache_w_q = w_q
-        self._cache_sw = sw
-        self._cache_w_packed = w_packed
-        self._cache_w_t_packed = w_t_packed
-        return w_q, sw, w_packed, w_t_packed
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_q, sw, w_packed, w_t_packed = self._cached_quantized_weight()
-        return _BitLinearSTE.apply(
-            x,
-            self.weight,
-            w_q,
-            sw,
-            w_packed,
-            w_t_packed,
-            self.backward_mode,
-        )
+        w = self.weight
+        # detach トリック STE: forward は量子化値、backward は恒等
+        x_q = x + (activation_quant(x) - x).detach()
+        w_q = w + (weight_quant(w) - w).detach()
+        return F.linear(x_q, w_q)
 
     def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias=False, w_dtype={self.weight.dtype}, "
-            f"cache_packed_weight={self.cache_packed_weight}, "
-            f"backward_mode={self.backward_mode}"
-        )
-
-
-def set_bitlinear_weight_cache(module: nn.Module, enabled: bool) -> int:
-    count = 0
-    for child in module.modules():
-        if isinstance(child, BitLinear):
-            child.set_weight_cache_enabled(enabled)
-            count += 1
-    return count
-
-
-def clear_bitlinear_weight_cache(module: nn.Module) -> int:
-    count = 0
-    for child in module.modules():
-        if isinstance(child, BitLinear):
-            child.clear_weight_cache()
-            count += 1
-    return count
-
-
-def set_bitlinear_backward_mode(module: nn.Module, mode: str) -> int:
-    count = 0
-    for child in module.modules():
-        if isinstance(child, BitLinear):
-            child.set_backward_mode(mode)
-            count += 1
-    return count
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias=False"

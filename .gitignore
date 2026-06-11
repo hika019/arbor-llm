@@ -13,6 +13,7 @@ __pycache__/
 
 # checkpoints / data (src/data/ は除外しない: パターンを /data/ に限定)
 /checkpoints/
+/export/
 /wandb/
 /data/
 *.safetensors

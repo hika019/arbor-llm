@@ -1,30 +1,36 @@
-# スモークテスト用設定: 小モデル + ローカルファイル + 数ステップ
-# 目的: 学習ループ・チェックポイント・再開・eval が一通り動くことの確認.
+# スモークテスト用設定: 小モデル + ローカルファイル + 50 step
+# 目的: 学習ループ・チェックポイント・再開・サンプル生成が一通り動くことの確認.
+# CPU でも動く (bitnet 含め純 PyTorch 実装のため)。
 
 run_name: smoke
 seed: 42
 
 model:
   vocab_size: 260
+  patch_size: 4
+  max_bytes: 128
   hidden_size: 128
+  num_heads: 4
+  num_kv_heads: 2
   intermediate_size: 256
   num_hidden_layers: 2
-  num_attention_heads: 4
-  num_key_value_heads: 4
-  max_position_embeddings: 256
+  local_hidden_size: 64
+  local_num_heads: 2
+  local_num_kv_heads: 2
+  local_intermediate_size: 128
+  num_local_encoder_layers: 1
+  num_local_decoder_layers: 1
   rope_theta: 10000.0
-  use_flash_attention: false
+  bitnet: true
   gradient_checkpointing: false
-  bitlinear_in_global: false
-  fp_in_local: true
 
 data:
-  # ローカル mmap (HF download 不要). 巨大データ前提と同じストリーミング契約を踏襲.
+  # ローカル mmap (HF download 不要)。巨大データ前提と同じストリーミング契約を踏襲.
   source: "file:./bitnet_blt_project_spec.md"
   streaming: true
   shuffle_buffer: 0
   context_length: 128
-  num_workers: 0          # smoke は単一プロセスで.
+  num_workers: 0
   prefetch_factor: 2
   pin_memory: true
   micro_batch_size: 4
@@ -46,19 +52,23 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: false    # smoke では compile しない (起動を速く)
-  compile_mode: default
   micro_batch_size: 4
   grad_accum_steps: 1
-  flash_attention: false
-  fused_rmsnorm: false
-  fused_swiglu: false
 
 checkpoint:
   dir: ./checkpoints/smoke
   save_every_steps: 10
   keep_last_k: 2
   keep_every_n_steps: null
-  async_save: false       # smoke 検証は同期保存で確実に.
+  async_save: false
+
+sampling:
+  enabled: true
+  prompts: ["The "]
+  max_new_bytes: 24
+  temperature: 0.8
+  top_p: 0.95
+  seed: 42
 
 logging:
   wandb_project: arbor-llm

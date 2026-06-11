@@ -17,7 +17,7 @@ if str(_ROOT) not in sys.path:
 
 from src.data.byte_dataset import build_byte_dataloader  # noqa: E402
 from src.eval.perplexity import byte_perplexity  # noqa: E402
-from src.model.arbor_blt import build_arbor_blt  # noqa: E402
+from src.model.arbor import build_arbor  # noqa: E402
 from src.train.checkpoint import CheckpointManager  # noqa: E402
 from src.train.train import apply_speed_settings, load_config  # noqa: E402
 
@@ -34,7 +34,7 @@ def main() -> int:
     apply_speed_settings(cfg.get("speed", {}))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_arbor_blt(cfg["model"]).to(device=device, dtype=torch.bfloat16)
+    model = build_arbor(cfg["model"]).to(device=device, dtype=torch.bfloat16)
 
     ckpt = CheckpointManager(cfg["checkpoint"]["dir"], async_save=False)
     meta, _ = ckpt.load(args.ckpt, model, map_location=device)

@@ -1,114 +1,96 @@
-# Arbor-LLM 1B (BLT + BitNet b1.58) 学習設定
+# Arbor v2 1B (バイトレベル階層 Transformer × BitNet b1.58) 学習設定
+#
+# 新規:   python -m src.train.train --config configs/arbor_1b.yaml
+# 再開:   python -m src.train.train --config configs/arbor_1b.yaml --resume latest
+#
+# 約 0.95B params。静的 patching (4 bytes/patch) で形状固定 → torch.compile 常時 ON。
 
-run_name: arbor_1b_v0
+run_name: arbor2_1b
 seed: 42
 
-# ---- 文字列で指定する主な選択肢 ----
-# model.patching_mode:
-#   space              空白優先の動的patching。現状の推奨
-#   static             固定長patching
-#   byte               1 byte = 1 patch
-#   entropy/bpe/...    upstream BLT用。追加モデル/前処理が必要な場合があるため未推奨
-# optim.optimizer:
-#   lion               軽量。現状の推奨
-#   bnb_adamw_8bit     bitsandbytes AdamW8bit。安定寄り
-#   adamw_fused        torch AdamW fallback/smoke用
-# speed.precision:
-#   bf16               推奨
-#   fp16               試験用
-#   fp32               smoke/debug用。遅い
-# speed.compile_scope:
-#   global             global_transformerだけcompile対象にする設定値
-#   model              model全体
-#   off                compile_scopeだけで無効化
-# speed.compile_mode:
-#   default            推奨
-#   reduce-overhead    torch.compile標準mode
-#   max-autotune       autotuneが重い。現状非推奨
-# speed.bitlinear_backward:
-#   ste                推奨。通常のSTE backward
-#   quantized_grad_x   実験用。grad_xだけ量子化近似。現状benchでは遅い
-
-# ---- モデル (Global Latent Transformer; BLT 全体は別途構築) ----
 model:
-  vocab_size: 260           # 256 バイト + 特殊トークン少数
+  vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
+  patch_size: 4                 # 1 patch = 4 bytes (静的)
+  max_bytes: 2048               # 学習 context (bytes) = 512 patches
+  # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
-  intermediate_size: 6528   # FFN: squared ReLU. local縮小後も約1.00B paramsに合わせる
-  num_hidden_layers: 22     # BitNet 2B4T=24 を 1B 用に縮小
-  num_attention_heads: 16
-  num_key_value_heads: 4    # GQA
-  local_hidden_size: 1024   # FP Local Encoder/Decoder を縮小して速度・VRAMを改善
-  local_num_attention_heads: 8
-  local_num_key_value_heads: 4
-  max_position_embeddings: 2048
+  num_heads: 16
+  num_kv_heads: 4               # GQA
+  intermediate_size: 5632       # ReLU² gated FFN
+  num_hidden_layers: 20
+  # ---- local (byte 階層, BitLinear) ----
+  local_hidden_size: 768
+  local_num_heads: 12
+  local_num_kv_heads: 12
+  local_intermediate_size: 2048
+  num_local_encoder_layers: 2
+  num_local_decoder_layers: 4
+  # ---- 共通 ----
   rope_theta: 500000.0
-  use_flash_attention: true
-  gradient_checkpointing: true
-  bitlinear_in_global: true   # Global Latent のみ BitLinear 化
-  fp_in_local: true           # Local Encoder/Decoder は FP 維持
-  patching_mode: space        # choices: space | static | byte | entropy | bpe | bpe_patcher
-  patch_size: 4
+  norm_eps: 1.0e-5
+  bitnet: true                  # false で全 Linear を nn.Linear に (比較実験用)
+  gradient_checkpointing: false # 活性が小さいので不要。OOM 時のみ true
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
-# 日本語主軸の混合 (2026-06-03): 日本語 60% + 英語 40%(うち news 15%).
-# weight は確率に正規化し interleave_datasets で行レベルに混合 (byte_dataset.py).
-# 全ソース smoke test 済み (認証不要 streaming OK). バイト直なので vocab 変更不要.
+# 日本語主軸の混合: 日本語 60% + 英語 40% (うち news 15%)
 data:
   sources:
-    - path: "HuggingFaceFW/fineweb-2"   # 日本語 web (NHK 等 news 含む). 高品質
+    - path: "HuggingFaceFW/fineweb-2"   # 日本語 web (NHK 等 news 含む)
       name: "jpn_Jpan"
       weight: 0.60
     - path: "vblagoje/cc_news"          # 英語 news (CommonCrawl News)
       weight: 0.15
     - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
       weight: 0.25
-  streaming: true             # メモリに全部載せない
-  shuffle_buffer: 2000        # 複数ソース分のバッファを持つため 1ソースより縮小 (RAM 17GB)
-  context_length: 2048        # bytes
-  num_workers: 0              # RAM 制約: num_workers>0 は persistent_workers でバッファ複製→枯渇
-  prefetch_factor: 4          # num_workers>0 時のみ有効 (現状 num_workers=0 で無視)
+  streaming: true
+  shuffle_buffer: 2000
+  context_length: 2048          # bytes。patch_size の倍数にする
+  num_workers: 0                # 正確 resume は単一プロセス前提
+  prefetch_factor: 4
   pin_memory: true
 
-# ---- 最適化 ----
+# ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
 optim:
-  optimizer: lion              # choices: lion | bnb_adamw_8bit | adamw_fused
-  lr: 3.0e-4
-  betas: [0.9, 0.99]
+  optimizer: bnb_adamw_8bit     # choices: lion | bnb_adamw_8bit | adamw_fused
+  lr: 8.0e-4
+  betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
-  scheduler: cosine_warmup     # choices: cosine_warmup
-  warmup_steps: 2000
+  scheduler: cosine_warmup
+  warmup_steps: 1000
   total_steps: 200000
 
-# ---- スループット最適化 ----
+# ---- スループット ----
 speed:
-  precision: bf16             # choices: bf16 | fp16 | fp32
+  precision: bf16               # choices: bf16 | fp16 | fp32
   tf32_matmul: true
   cudnn_benchmark: true
-  torch_compile: false        # 実測: global/model compile とも patch 数変動で総学習時間が悪化
-  compile_scope: global       # choices: global | model | off
-  compile_mode: default       # choices: default | reduce-overhead | max-autotune
-  compile_dynamic: true       # 1B本走実測: static は patch_lengths 形状(~200種)で recompile地獄→cache64溢れ→step20未到達. 形状非依存の dynamic に確定 (2026-06-03)
-  dynamo_cache_size_limit: 64
-  bitlinear_weight_cache: true # grad accumulation 中は packed ternary weight を再利用
-  bitlinear_backward: ste # choices: ste | quantized_grad_x
-  micro_batch_size: 4         # 4090/WSL実測の安全最速。VRAMを抑えてPCIe退避を避ける
-  grad_accum_steps: 16        # 実効バッチ = 64 を維持
-  flash_attention: true
-  fused_rmsnorm: true
-  fused_swiglu: false         # FFN は squared ReLU なので未使用
+  torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
+  compile_mode: default         # choices: default | reduce-overhead | max-autotune
+  micro_batch_size: 8           # 4090 実測: B=8 で VRAM ~16GiB / 51k tok/s (synthetic)
+  grad_accum_steps: 8           # 実効バッチ 64 (= 131k bytes/update)
 
-# ---- チェックポイント (外部保存、中断/再開可) ----
 checkpoint:
   dir: ./checkpoints
   save_every_steps: 1000
   keep_last_k: 3
-  keep_every_n_steps: 10000   # 長期保存は 1万 step 毎
-  async_save: false           # 安全優先: 保存と prune は同期実行
+  keep_every_n_steps: 10000
+  async_save: false
 
-# ---- ログ ----
+# ---- checkpoint 時のサンプル生成 (checkpoint dir に samples.txt を保存) ----
+sampling:
+  enabled: true
+  prompts:
+    - "日本の四季は"
+    - "The most important thing in life is"
+  max_new_bytes: 100
+  temperature: 0.8
+  top_p: 0.95
+  seed: 42                      # 固定すると step 間で同条件の品質比較ができる
+
 logging:
   wandb_project: arbor-llm
-  log_every_steps: 1
-  throughput_window: 50       # tokens/sec を直近 N step で平均
+  log_every_steps: 5
+  throughput_window: 50
+  best_ema_decay: 0.98          # best 判定に使う train loss EMA (validation best ではない)

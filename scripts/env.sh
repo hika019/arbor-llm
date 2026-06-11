@@ -22,14 +22,13 @@ if [[ -f "${PROJECT_DIR}/.venv/bin/activate" ]]; then
   source "${PROJECT_DIR}/.venv/bin/activate"
 fi
 
-export BLT_SUPPRESS_ATTN_ERROR=1
 # CUDA caching allocator を expandable segments 化し VRAM 断片化を抑止.
 # 可変 batch/seq・大きな activation で OOM 余地を減らす (torch>=2.1, 単一GPUなら無害).
 # CUDA 初期化前 = torch import 前に効かせる必要があるので shell 側で設定.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# 1B BLT の dynamic compile は compile worker を増やしすぎると WSL RAM を食い潰す。
+# compile worker を増やしすぎると WSL RAM を食い潰す。
 # FX graph cache は2回目以降の起動待ちを短縮する。
 export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-12}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
-export PYTHONPATH="${PROJECT_DIR}:${PROJECT_DIR}/third_party/blt:${PYTHONPATH:-}"
+export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 echo "[env] venv + micromamba gcc 有効化済み. gcc=$(gcc --version | head -1)"

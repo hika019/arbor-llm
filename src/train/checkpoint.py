@@ -170,11 +170,12 @@ class CheckpointManager:
         if ckpt_dir is None or not ckpt_dir.exists():
             raise FileNotFoundError(f"checkpoint not found: {which}")
 
-        # weights
+        # weights。strict=True: 形状/キー不一致を黙って通すと部分ロード事故になる.
+        # torch.compile 済みモデルで保存された旧 checkpoint の "_orig_mod." prefix は剥がす.
         weights = safe_load(str(ckpt_dir / "model.safetensors"), device=str(map_location))
-        missing, unexpected = model.load_state_dict(weights, strict=False)
-        if missing or unexpected:
-            print(f"[checkpoint] missing={len(missing)} unexpected={len(unexpected)}")
+        if any(k.startswith("_orig_mod.") for k in weights):
+            weights = {k.removeprefix("_orig_mod."): v for k, v in weights.items()}
+        model.load_state_dict(weights, strict=True)
 
         # weights_only=False: RNG/dataloader/optimizer は pickle 由来の Python オブジェクトを含む
         if optimizer is not None and (ckpt_dir / "optimizer.pt").exists():

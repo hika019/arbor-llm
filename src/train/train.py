@@ -21,6 +21,7 @@ import platform
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # torch import / CUDA 初期化より前に効かせる必要がある env (env.sh と二重で保険).
@@ -47,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", required=True, type=Path)
     p.add_argument("--resume", default=None, help="'latest' | 'best' | step | path")
     p.add_argument("--dry-run", action="store_true", help="1 step だけ走らせて即終了")
+    p.add_argument(
+        "--allow-config-mismatch", action="store_true",
+        help="resume 時に checkpoint の model 設定と現在の config が違っても続行する",
+    )
     return p.parse_args()
 
 
@@ -129,42 +134,13 @@ def resolve_precision(name: str) -> tuple[torch.dtype, bool]:
 
 def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Module:
     """Apply torch.compile according to speed config and return the trainable model."""
-    if not speed.get("torch_compile", False):
+    # Arbor v2 は静的 patching で形状固定なので compile が素直に効く (既定 ON)
+    if not speed.get("torch_compile", True):
         print("[train] torch_compile=OFF")
         return model
-
     mode = speed.get("compile_mode", "default")
-    # BLT の動的パッチングで seq 長が毎 step 変動し dynamo が recompile を繰り返す
-    # (cache_size_limit 既定 8 に到達→eager fallback) のを抑える:
-    #   dynamo_cache_size_limit: cache 上限 (recompile を許容する形状数)
-    #   compile_dynamic: None=auto / True=seq 次元を symbolic に1グラフ / False=静的
-    csl = speed.get("dynamo_cache_size_limit")
-    if csl:
-        torch._dynamo.config.cache_size_limit = int(csl)
-    dynamic = speed.get("compile_dynamic", None)
-    scope = speed.get("compile_scope", "model")
-
-    if scope == "off":
-        print("[train] torch_compile=OFF scope=off")
-        return model
-    if scope == "model":
-        print(
-            "[train] torch_compile=ON "
-            f"scope=model mode={mode} dynamic={dynamic} cache_size_limit={csl}"
-        )
-        return torch.compile(model, mode=mode, dynamic=dynamic)
-    if scope == "global":
-        blt = getattr(model, "blt", None)
-        global_transformer = getattr(blt, "global_transformer", None)
-        if global_transformer is None:
-            raise ValueError("compile_scope=global requires a BLT wrapper with blt.global_transformer")
-        print(
-            "[train] torch_compile=ON "
-            f"scope=global_transformer mode={mode} dynamic={dynamic} cache_size_limit={csl}"
-        )
-        blt.global_transformer = torch.compile(global_transformer, mode=mode, dynamic=dynamic)
-        return model
-    raise ValueError(f"unknown compile_scope: {scope}")
+    print(f"[train] torch_compile=ON mode={mode}")
+    return torch.compile(model, mode=mode)
 
 # ------------------------------------------------------------------- main
 def main() -> int:
@@ -181,27 +157,14 @@ def main() -> int:
         free, total = torch.cuda.mem_get_info()
         print(f"[train] cuda_mem_free={free / 2**30:.2f}GiB total={total / 2**30:.2f}GiB")
 
-    # ---- モデル組み立て (BLT + BitLinear) は src.model.arbor_blt に集約 ----
-    from src.model.arbor_blt import build_arbor_blt  # 遅延 import (BLT 取り込み後に有効化)
+    # ---- モデル組み立て (Arbor v2: 自己完結 BitNet 階層 Transformer) ----
+    from src.model.arbor import build_arbor
     compute_dtype, use_autocast = resolve_precision(cfg.get("speed", {}).get("precision", "bf16"))
     print(f"[train] precision={compute_dtype} autocast={use_autocast}")
-    model = build_arbor_blt(cfg["model"]).to(device=device, dtype=compute_dtype)
-    bitlinear_weight_cache = bool(cfg.get("speed", {}).get("bitlinear_weight_cache", False))
-    bitlinear_backward = cfg.get("speed", {}).get("bitlinear_backward", "ste")
-    if bitlinear_backward != "ste":
-        from src.model.bitlinear import set_bitlinear_backward_mode
-
-        n_backward = set_bitlinear_backward_mode(model, bitlinear_backward)
-        print(f"[train] bitlinear_backward={bitlinear_backward} layers={n_backward}")
-    else:
-        print("[train] bitlinear_backward=ste")
-    if bitlinear_weight_cache:
-        from src.model.bitlinear import set_bitlinear_weight_cache
-
-        n_cached = set_bitlinear_weight_cache(model, True)
-        print(f"[train] bitlinear_weight_cache=ON layers={n_cached}")
-    else:
-        print("[train] bitlinear_weight_cache=OFF")
+    model = build_arbor(cfg["model"]).to(device=device, dtype=compute_dtype)
+    # checkpoint 保存とサンプル生成は compile 前のモデルで行う
+    # (compile wrapper を保存すると state dict が _orig_mod. 付きになる)
+    base_model = model
     model = apply_compile_settings(model, cfg["speed"])
 
     # ---- データ (streaming, メモリに全部載せない) ----
@@ -238,7 +201,26 @@ def main() -> int:
     global_step = 0
     best_loss = float("inf")
     if args.resume:
-        meta, dl_state = ckpt.load(args.resume, model, optimizer, scheduler, map_location=device)
+        # model 形状が違う checkpoint を strict=False で黙って部分ロードする事故を防ぐ.
+        # checkpoint には保存時の実効 config が入っているので model 節を突き合わせる.
+        resolved = ckpt.resolve(args.resume)
+        saved_cfg_file = resolved / "config.yaml" if resolved else None
+        if saved_cfg_file is not None and saved_cfg_file.exists():
+            saved_model_cfg = yaml.safe_load(saved_cfg_file.read_text()).get("model", {})
+            if saved_model_cfg and saved_model_cfg != cfg["model"]:
+                diff_keys = sorted(
+                    k for k in set(saved_model_cfg) | set(cfg["model"])
+                    if saved_model_cfg.get(k) != cfg["model"].get(k)
+                )
+                msg = (
+                    f"checkpoint の model 設定と現在の config が不一致: {diff_keys}. "
+                    f"再開するなら `--config {saved_cfg_file}` を使うか、"
+                    "意図的なら --allow-config-mismatch を付ける。"
+                )
+                if not args.allow_config_mismatch:
+                    raise SystemExit(f"[train] ERROR: {msg}")
+                print(f"[train] WARNING: {msg}")
+        meta, dl_state = ckpt.load(args.resume, base_model, optimizer, scheduler, map_location=device)
         global_step = meta.global_step
         best_loss = meta.best_loss
         if dl_state is not None:
@@ -281,10 +263,52 @@ def main() -> int:
         )
     print("[train] note=early tok/s includes compile/warmup; use logs after the rolling window fills for steady throughput")
 
+    # checkpoint 保存時のサンプル生成 (任意)。学習を止めないよう失敗は警告に留める.
+    sampling_cfg = cfg.get("sampling", {})
+    sampling_enabled = bool(sampling_cfg.get("enabled", False))
+    if sampling_enabled:
+        print(
+            "[train] sampling=ON prompts={} max_new_bytes={}".format(
+                len(sampling_cfg.get("prompts", [])),
+                sampling_cfg.get("max_new_bytes", 100),
+            )
+        )
+
+    def sample_at_checkpoint(step_dir: Path, step: int) -> None:
+        from src.infer.generate import generate_samples
+
+        prompts = sampling_cfg.get("prompts") or ["The ", "日本の"]
+        base_model.eval()
+        try:
+            t0 = time.perf_counter()
+            samples = generate_samples(
+                base_model,
+                prompts,
+                max_new_bytes=int(sampling_cfg.get("max_new_bytes", 100)),
+                temperature=float(sampling_cfg.get("temperature", 0.8)),
+                top_p=float(sampling_cfg.get("top_p", 0.95)),
+                max_context=int(context_length) if context_length else 2048,
+                seed=int(sampling_cfg.get("seed", 42)),
+            )
+            lines = [f"# step {step}"]
+            for prompt, text in samples:
+                print(f"[sample] step={step} prompt={prompt!r} -> {text!r}")
+                lines.append(f"\n## prompt: {prompt}\n{text}")
+            (step_dir / "samples.txt").write_text("\n".join(lines), encoding="utf-8")
+            print(f"[sample] wrote {step_dir / 'samples.txt'} in {time.perf_counter() - t0:.1f}s")
+        except Exception as e:  # noqa: BLE001 - サンプル生成失敗で学習は止めない
+            print(f"[sample] generation failed (continuing training): {type(e).__name__}: {e}")
+        finally:
+            base_model.train()
+
     model.train()
     optimizer.zero_grad(set_to_none=True)
     accum_loss_tensor: torch.Tensor | None = None
     best_loss_tensor = torch.tensor(best_loss, device=device, dtype=torch.float32)
+    # best 判定は単発 step ではなく EMA 損失で行う (train loss のノイズで
+    # "best" が偶然の低い step に張り付くのを防ぐ。validation best ではない点に注意)
+    ema_loss_tensor: torch.Tensor | None = None
+    ema_decay = float(cfg["logging"].get("best_ema_decay", 0.98))
 
     data_iter = iter(train_loader)
     while global_step < total_steps:
@@ -319,10 +343,6 @@ def main() -> int:
                 )
             optimizer.step()
             scheduler.step()
-            if bitlinear_weight_cache:
-                from src.model.bitlinear import clear_bitlinear_weight_cache
-
-                clear_bitlinear_weight_cache(model)
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
@@ -335,8 +355,13 @@ def main() -> int:
                 if accum_loss_tensor is not None
                 else torch.tensor(0.0, device=device)
             )
-            is_best_tensor = loss_for_step < best_loss_tensor
-            best_loss_tensor = torch.minimum(best_loss_tensor, loss_for_step)
+            ema_loss_tensor = (
+                loss_for_step
+                if ema_loss_tensor is None
+                else ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_for_step
+            )
+            is_best_tensor = ema_loss_tensor < best_loss_tensor
+            best_loss_tensor = torch.minimum(best_loss_tensor, ema_loss_tensor)
 
             should_save = (
                 global_step % save_every == 0
@@ -374,12 +399,14 @@ def main() -> int:
                     },
                 )
                 dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None
-                ckpt.save(
-                    model, optimizer, scheduler, dl_state, meta, config=effective_cfg,
+                saved_dir = ckpt.save(
+                    base_model, optimizer, scheduler, dl_state, meta, config=effective_cfg,
                     is_best=is_best,
                     is_final=global_step >= total_steps,
                 )
                 print(f"[train] saved checkpoint @ step={global_step}{' (best)' if is_best else ''}")
+                if sampling_enabled:
+                    sample_at_checkpoint(saved_dir, global_step)
 
             if stop.requested:
                 print("[train] stop requested, exiting cleanly.")

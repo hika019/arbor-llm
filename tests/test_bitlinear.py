@@ -1,101 +1,59 @@
+"""BitLinear (BitNet b1.58 公式レシピ) のテスト (CPU)."""
 from __future__ import annotations
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from src.model.bitlinear import (
-    BitLinear,
-    _packed_bitlinear_forward,
-    clear_bitlinear_weight_cache,
-    pack_ternary_weight,
-    quantize_activation_int8,
-    quantize_weight_ternary,
-    set_bitlinear_backward_mode,
-    set_bitlinear_weight_cache,
-    unpack_ternary_weight,
-)
+from src.model.bitlinear import BitLinear, activation_quant, weight_quant
 
 
-def test_pack_ternary_weight_round_trip_with_padding():
-    w_q = torch.tensor(
-        [
-            [-1, 0, 1, 1, 0],
-            [1, -1, 0, -1, 1],
-        ],
-        dtype=torch.int8,
-    )
-
-    packed = pack_ternary_weight(w_q)
-    unpacked = unpack_ternary_weight(packed, k=w_q.size(1))
-
-    assert packed.dtype == torch.uint8
-    assert packed.shape == (2, 2)
-    assert torch.equal(unpacked, w_q)
+def test_weight_quant_is_ternary():
+    w = torch.randn(64, 32)
+    w_q = weight_quant(w)
+    scale = w.abs().mean()
+    levels = torch.unique((w_q / scale).round())
+    assert set(levels.tolist()) <= {-1.0, 0.0, 1.0}
 
 
-def test_bitlinear_forward_backward_cpu_fallback():
-    layer = BitLinear(7, 5)
-    x = torch.randn(3, 4, 7, dtype=torch.bfloat16, requires_grad=True)
-
-    y = layer(x)
-    y.float().sum().backward()
-
-    assert y.shape == (3, 4, 5)
-    assert x.grad is not None
-    assert layer.weight.grad is not None
-
-
-def test_bitlinear_weight_cache_helpers_toggle_modules():
-    model = torch.nn.Sequential(BitLinear(7, 5), torch.nn.ReLU(), BitLinear(5, 3))
-
-    assert set_bitlinear_weight_cache(model, True) == 2
-    assert all(m.cache_packed_weight for m in model.modules() if isinstance(m, BitLinear))
-
-    x = torch.randn(2, 7, dtype=torch.bfloat16, requires_grad=True)
-    y = model(x)
-    y.float().sum().backward()
-
-    assert clear_bitlinear_weight_cache(model) == 2
-    assert set_bitlinear_weight_cache(model, False) == 2
-    assert not any(m.cache_packed_weight for m in model.modules() if isinstance(m, BitLinear))
+def test_activation_quant_per_token_grid():
+    x = torch.randn(8, 32)
+    x_q = activation_quant(x)
+    # per-token absmax: 各行が int8 グリッドに乗る
+    scale = 127.0 / x.abs().amax(dim=-1, keepdim=True)
+    grid = (x_q * scale).round()
+    assert torch.allclose(x_q * scale, grid, atol=1e-4)
+    assert grid.abs().max() <= 128
+    # 量子化誤差は 1 ステップ未満
+    assert (x_q - x).abs().max() <= (1.0 / scale).max()
 
 
-def test_bitlinear_quantized_grad_x_backward_mode_cpu_fallback():
-    layer = BitLinear(7, 5)
-    layer.set_backward_mode("quantized_grad_x")
-    x = torch.randn(3, 4, 7, dtype=torch.bfloat16, requires_grad=True)
-
-    y = layer(x)
-    y.float().sum().backward()
-
-    assert y.shape == (3, 4, 5)
-    assert x.grad is not None
-    assert layer.weight.grad is not None
+def test_forward_matches_quantized_linear():
+    torch.manual_seed(0)
+    lin = BitLinear(32, 16)
+    x = torch.randn(4, 32)
+    y = lin(x)
+    expected = F.linear(activation_quant(x), weight_quant(lin.weight))
+    assert torch.allclose(y, expected, atol=1e-5)
 
 
-def test_bitlinear_backward_mode_helper_validates_mode():
-    model = torch.nn.Sequential(BitLinear(7, 5), BitLinear(5, 3))
+def test_ste_gradients_flow_through_quantization():
+    torch.manual_seed(0)
+    lin = BitLinear(32, 16)
+    x = torch.randn(4, 32, requires_grad=True)
+    y = lin(x)
+    y.sum().backward()
+    assert lin.weight.grad is not None and torch.isfinite(lin.weight.grad).all()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    # STE: 勾配は「量子化後の値」で計算される (公式レシピ準拠)
+    w_q = weight_quant(lin.weight.detach())
+    expected_grad_x = torch.ones(4, 16) @ w_q
+    assert torch.allclose(x.grad, expected_grad_x, atol=1e-5)
+    x_q = activation_quant(x.detach())
+    expected_grad_w = torch.ones(4, 16).t() @ x_q
+    assert torch.allclose(lin.weight.grad, expected_grad_w, atol=1e-5)
 
-    assert set_bitlinear_backward_mode(model, "quantized_grad_x") == 2
-    assert all(
-        m.backward_mode == "quantized_grad_x"
-        for m in model.modules()
-        if isinstance(m, BitLinear)
-    )
-    with pytest.raises(ValueError, match="backward_mode"):
-        set_bitlinear_backward_mode(model, "unknown")
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton kernel")
-def test_packed_triton_forward_matches_reference_cuda():
-    x = torch.randn(9, 13, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(11, 13, device="cuda", dtype=torch.bfloat16)
-    x_q, sx = quantize_activation_int8(x)
-    w_q, sw = quantize_weight_ternary(w)
-
-    actual = _packed_bitlinear_forward(x_q, sx, w_q, sw, x.dtype)
-    expected = (F.linear(x_q.float(), w_q.float()) * sx.float() * sw.float()).to(x.dtype)
-
-    assert actual is not None
-    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-2)
+def test_bias_is_rejected():
+    with pytest.raises(ValueError, match="bias"):
+        BitLinear(8, 8, bias=True)

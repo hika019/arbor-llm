@@ -51,6 +51,44 @@ def test_multi_worker_iterable_requires_explicit_opt_in(tmp_path):
         )
 
 
+class _FakeStatefulStream:
+    """datasets の IterableDataset (state_dict/load_state_dict 持ち) を模す."""
+
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
+        self.idx = 0
+
+    def __iter__(self):
+        while self.idx < len(self.rows):
+            row = self.rows[self.idx]
+            self.idx += 1
+            yield row
+
+    def state_dict(self):
+        return {"idx": self.idx}
+
+    def load_state_dict(self, state):
+        self.idx = state["idx"]
+
+
+def test_hf_stream_exact_resume_via_state_dict(monkeypatch):
+    rows = [{"text": "abcdefgh"}, {"text": "ijklmnop"}]
+    ds = ByteStreamDataset(source="dummy", context_length=3, byte_offset=0)
+    monkeypatch.setattr(ds, "_build_hf_stream", lambda: _FakeStatefulStream(rows))
+    it = ds._iter_hf_stream()
+    first = next(it)
+    state = ds.state_dict()
+
+    ds2 = ByteStreamDataset(source="dummy", context_length=3, byte_offset=0)
+    monkeypatch.setattr(ds2, "_build_hf_stream", lambda: _FakeStatefulStream(rows))
+    ds2.load_state_dict(state)
+    second = next(ds2._iter_hf_stream())
+
+    # 1 サンプル目 "abcd" の続き ("efgh") が、再走査スキップなしで出ること
+    assert first["input_ids"].tolist() == [ord("a"), ord("b"), ord("c")]
+    assert second["input_ids"].tolist() == [ord("e"), ord("f"), ord("g")]
+
+
 def test_local_file_resume_uses_byte_offset_without_double_skip(tmp_path):
     data_file = tmp_path / "bytes.txt"
     data_file.write_text("abcdefghijklmnopqrstuvwxyz")
@@ -64,5 +102,6 @@ def test_local_file_resume_uses_byte_offset_without_double_skip(tmp_path):
     restored.load_state_dict(state)
     second = next(iter(restored))
 
+    # block 単位 stride (重複なし): 1 サンプル目 "abcd" の次は "efgh"
     assert first["input_ids"].tolist() == [ord("a"), ord("b"), ord("c")]
-    assert second["input_ids"].tolist() == [ord("b"), ord("c"), ord("d")]
+    assert second["input_ids"].tolist() == [ord("e"), ord("f"), ord("g")]

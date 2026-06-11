@@ -127,10 +127,20 @@ class ByteStreamDataset(IterableDataset):
         except ImportError as e:
             raise RuntimeError("`datasets` が必要 (pip install datasets)") from e
 
-        ring = bytearray()
         block = self.context_length + 1
-        skip = self._state.samples_emitted
         off = self.byte_offset
+
+        # 正確 resume: datasets の state_dict API でストリーム位置を復元する
+        # (旧来の「最初から流し直して skip」はデータ量に比例して遅い)。
+        # 注意: shuffle バッファの中身は復元されない (datasets の仕様)。
+        hf_state = self._state.extra.get("hf_state")
+        ring = bytearray(self._state.extra.get("ring", b""))
+        skip = 0
+        if hf_state is not None and hasattr(ds, "load_state_dict"):
+            ds.load_state_dict(hf_state)
+        else:
+            ring.clear()
+            skip = self._state.samples_emitted  # 旧 checkpoint 向け fallback
 
         for row in ds:
             text = row.get("text")
@@ -138,6 +148,7 @@ class ByteStreamDataset(IterableDataset):
                 continue
             ring.extend(text.encode("utf-8", errors="ignore"))
             ring.extend(b"\n")
+            row_state = ds.state_dict() if hasattr(ds, "state_dict") else None
             while len(ring) >= block:
                 chunk = bytes(ring[:block])
                 del ring[:block]
@@ -148,6 +159,9 @@ class ByteStreamDataset(IterableDataset):
                 ids = buf[:-1]
                 tgt = buf[1:]
                 self._state.samples_emitted += 1
+                if row_state is not None:
+                    self._state.extra["hf_state"] = row_state
+                    self._state.extra["ring"] = bytes(ring)
                 yield {"input_ids": ids, "labels": tgt}
 
     def _iter_local_file(self, path_str: str) -> Iterator[dict[str, torch.Tensor]]:
@@ -175,7 +189,8 @@ class ByteStreamDataset(IterableDataset):
                 if cursor + block > size:
                     cursor = 0  # 循環
                 chunk = mm[cursor:cursor + block]
-                cursor += 1
+                # block 単位で進める (1 byte stride だと隣接サンプルが 2047 byte 重複する)
+                cursor += block
                 self._state.byte_offset = cursor
                 if skip > 0:
                     skip -= 1
