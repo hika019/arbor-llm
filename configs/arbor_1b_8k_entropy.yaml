@@ -1,21 +1,44 @@
-# Arbor v2 1B / 8192 bytes ベース学習 (arbor_1b.yaml の長コンテキスト + code/math 入り版)
+# Arbor v2 1B / 8192 bytes 本走の entropy patching 版 (BLT 本命方式)
 #
-# 新規:   python -m src.train.train --config configs/arbor_1b_8k.yaml
-# 再開:   python -m src.train.train --config configs/arbor_1b_8k.yaml --resume latest
-# 終了後: configs/arbor_1b_32k.yaml で 32k bytes へ拡張 (--init-from)
+# 前提: configs/entropy_lm.yaml の ByteLM 学習が完了していること
+#       (checkpoints/entropy_lm/final = step 50000, train EMA ~1.1 nats/byte)。
+# 新規:   python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml
+# 再開:   python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml --resume latest
 #
-# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (4 bytes/patch)
-# なので global は 2048 patches。実効バッチは 64 seq = 524k bytes/update
-# (micro_batch 8→2, grad_accum 8→32 で seq 数は arbor_1b と同じだが、seq 長 4 倍ぶん増)。
+# static 版 (arbor_1b_8k.yaml) との違いは patching のみ。threshold 2.0 で
+# 平均 patch 長は混合加重 ~4.3 bytes (実測) と static の 4 bytes とほぼ等価だが、
+# 動的モードは patch 数を max_bytes / min_patch_len = 4096 に固定 pad するため
+# global 層の系列長は static (2048) の 2 倍になる (pad patch は decoder から
+# gather されず勾配も流れないが、計算自体は走る)。速度が厳しければ
+# min_patch_len: 4 (= global 2048, ただし 4 bytes 未満で区切れなくなる) が次の手。
+#
+# 実測 (RTX 4090 / WSL2, 窓 attention + compile ON, micro 1):
+#   25.2k tok/s / peak VRAM 16.4GiB → 200k steps ≈ 48 日
+# 注: torch_compile と gradient_checkpointing の併用は torch 2.5 で backward が
+# NaN になるため train.py が起動時に弾く。OOM 時は compile を犠牲にして
+# gradient_checkpointing: true + torch_compile: false (7.8k tok/s) にする。
 
-run_name: arbor2_1b_8k
+run_name: arbor2_1b_8k_entropy
 seed: 42
 
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
-  patching_mode: static         # choices: static | space | entropy
-  patch_size: 4                 # 1 patch = 4 bytes (静的)
-  max_bytes: 8192               # 学習 context (bytes) = 2048 patches
+  patching_mode: entropy        # choices: static | space | entropy
+  min_patch_len: 2              # これ未満では区切らない (max_patches = 8192/2 = 4096)
+  max_patch_len: 16             # これに達したら強制区切り
+  entropy_threshold: 2.0        # 次バイト H (nats)。混合加重で平均 ~4.3 bytes/patch
+  entropy_model:                # ByteLM の構成 (entropy_lm.yaml の model 節と一致させる)
+    vocab_size: 260
+    max_bytes: 32768
+    hidden_size: 512
+    num_heads: 8
+    num_kv_heads: 4
+    intermediate_size: 1536
+    num_hidden_layers: 6
+    rope_theta: 10000.0
+    bitnet: false
+  entropy_model_ckpt: ./checkpoints/entropy_lm/final   # 初回構築時に重みを読む (凍結同梱)
+  max_bytes: 8192               # 学習 context (bytes)
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
   num_heads: 16
@@ -35,10 +58,7 @@ model:
   bitnet: true
   gradient_checkpointing: false # OOM 時のみ true
 
-# ---- データ (streaming 前提; 一括ロードは禁止) ----
-# 日本語 0.60 主軸 + 英語 0.17 + code/math 0.23 (能力の土台はベースで仕込む)。
-# code は多言語 GitHub (32 言語, parquet 非 gated)。さらに大規模・高品質が欲しい
-# 場合は gated の bigcode/the-stack-dedup (HF login + 規約同意) と差し替え可。
+# ---- データ: static 版と同一混合 (ByteLM はこの上位集合で学習済み) ----
 data:
   sources:
     # ---- 日本語 0.60 ----
@@ -64,7 +84,7 @@ data:
       weight: 0.05
   streaming: true
   shuffle_buffer: 2000
-  context_length: 8192          # bytes。patch_size の倍数にする
+  context_length: 8192          # bytes
   num_workers: 0                # 正確 resume は単一プロセス前提
   prefetch_factor: 4
   pin_memory: true
@@ -88,15 +108,13 @@ speed:
   precision: bf16               # choices: bf16 | fp16 | fp32
   tf32_matmul: true
   cudnn_benchmark: true
-  torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
+  torch_compile: true           # 固定 pad で形状固定なので ON 可 (compute_patch_starts は対象外)
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
-  micro_batch_size: 1           # 2 は VRAM 溢れ (compile OFF 実測 22.6GiB)。1 で peak 21.2GiB / 22.6k tok/s
-  grad_accum_steps: 64          # 実効バッチ 64 seq 相当 (= 524k bytes/update)。
-                                # それでも溢れる時は gradient_checkpointing: true + torch_compile: false
-                                # (compile×ckpt 併用は torch2.5 で NaN になるため train.py が弾く)
+  micro_batch_size: 1           # compile ON はこれが上限 (peak 16.4GiB 実測。2 は溢れる)
+  grad_accum_steps: 64          # 実効バッチ 64 seq 相当 (= 524k bytes/update, static 版と同じ)
 
 checkpoint:
-  dir: ./checkpoints/arbor2_1b_8k
+  dir: ./checkpoints/arbor2_1b_8k_entropy
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000
