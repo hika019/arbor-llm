@@ -16,6 +16,7 @@ import argparse
 import copy
 from contextlib import nullcontext
 import hashlib
+import json
 import os
 import platform
 import socket
@@ -228,6 +229,9 @@ def main() -> int:
         keep_every_n_steps=ckpt_cfg.get("keep_every_n_steps"),
         async_save=ckpt_cfg.get("async_save", True),
     )
+    # loss/ema/lr の時系列 (log_every_steps ごとに 1 行追記)。resume 時は追記継続
+    # なので、巻き戻した場合は同じ step が重複しうる (プロット時は後勝ちで dedup)。
+    metrics_path = ckpt_dir / "metrics.jsonl"
 
     # ---- 再開処理 ----
     global_step = 0
@@ -405,10 +409,22 @@ def main() -> int:
 
             if global_step % log_every == 0:
                 assert cur_loss is not None
+                cur_ema = float(ema_loss_tensor.cpu())
+                cur_lr = scheduler.get_last_lr()[0]
+                cur_tok_s = meter.tokens_per_sec()
                 print(
-                    f"step={global_step} loss={cur_loss:.4f} "
-                    f"tok/s={meter.tokens_per_sec():.0f} lr={scheduler.get_last_lr()[0]:.2e}"
+                    f"step={global_step} loss={cur_loss:.4f} ema={cur_ema:.4f} "
+                    f"tok/s={cur_tok_s:.0f} lr={cur_lr:.2e}"
                 )
+                with metrics_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "step": global_step,
+                        "loss": round(cur_loss, 6),
+                        "ema": round(cur_ema, 6),
+                        "lr": cur_lr,
+                        "tok_s": round(cur_tok_s),
+                        "time": time.time(),
+                    }) + "\n")
             accum_loss_tensor = None
 
             # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
