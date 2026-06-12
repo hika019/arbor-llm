@@ -145,6 +145,22 @@ def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Modu
         print("[train] torch_compile=OFF")
         return model
     mode = speed.get("compile_mode", "default")
+
+    # torch 2.5 では compile × gradient_checkpointing の併用で最初の backward
+    # から loss が NaN になる (1B/小モデル・窓/密マスク・モデル全体/層単位
+    # compile の全組合せで再現を確認済み)。黙って走らせると run 全体が無駄に
+    # なるので起動時に弾く。
+    cfg_obj = getattr(model, "cfg", None)
+    uses_ckpt = bool(
+        cfg_obj.get("gradient_checkpointing", False) if isinstance(cfg_obj, dict)
+        else getattr(cfg_obj, "gradient_checkpointing", False)
+    )
+    if uses_ckpt:
+        raise ValueError(
+            "speed.torch_compile と model.gradient_checkpointing の併用は不可 "
+            "(torch 2.5 で backward が NaN になる実測バグ)。compile を切るか "
+            "micro_batch_size を下げて gradient_checkpointing を外すこと"
+        )
     print(f"[train] torch_compile=ON mode={mode}")
     return torch.compile(model, mode=mode)
 
@@ -345,6 +361,9 @@ def main() -> int:
     # "best" が偶然の低い step に張り付くのを防ぐ。validation best ではない点に注意)
     ema_loss_tensor: torch.Tensor | None = None
     ema_decay = float(cfg["logging"].get("best_ema_decay", 0.98))
+    # 「前回保存以降に best (EMA 最小) が更新されたか」。保存 step 単発の判定だと
+    # 保存間に更新があっても symlink が動かない (best が古い step を指し続ける)
+    best_improved_tensor = torch.tensor(False, device=device)
 
     data_iter = iter(train_loader)
     while global_step < total_steps:
@@ -397,6 +416,7 @@ def main() -> int:
                 else ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_for_step
             )
             is_best_tensor = ema_loss_tensor < best_loss_tensor
+            best_improved_tensor = best_improved_tensor | is_best_tensor
             best_loss_tensor = torch.minimum(best_loss_tensor, ema_loss_tensor)
 
             should_save = (
@@ -431,7 +451,8 @@ def main() -> int:
             # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
             if should_save:
                 best_loss = float(best_loss_tensor.cpu())
-                is_best = bool(is_best_tensor.cpu())
+                is_best = bool(best_improved_tensor.cpu())
+                best_improved_tensor = torch.tensor(False, device=device)
                 meta = CheckpointMeta(
                     global_step=global_step,
                     best_loss=best_loss,
