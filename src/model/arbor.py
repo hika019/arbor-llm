@@ -24,6 +24,10 @@ patching_mode (3 択):
   patch 数を max_patches (= max_bytes / min_patch_len) に固定 pad し、
   encoder/decoder は flat (B,T) のまま「同一 patch 内のみ許す」block 対角
   attention mask で処理する。これにより動的モードでも tensor 形状は固定。
+  T が _WINDOW_CHUNK の倍数のときは T×T 密マスクの代わりに窓マスク
+  (WindowMask: 1 patch ≤ max_patch_len を利用し q の前後 w バイトだけ見る)
+  で計算する。密マスクは SDPA が math 経路に落ちて T² のスコアを実体化し、
+  T=8192 では局所層だけで VRAM ~20GB / 計算 ~50× を浪費するため。
   境界判定だけは逐次処理なので @torch.compiler.disable で compile 対象外。
   pad された patch 行は decoder から一切 gather されないため勾配が流れず、
   ゼロ行の RMSNorm backward 増幅問題 (next.md 参照) も起こさない。
@@ -49,6 +53,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 BYTE_OFFSET = 4  # 生バイト b は token id (b + 4)
+
+# 動的 patching の local attention を窓化する際の chunk 長 (T はこの倍数のとき窓経路)
+_WINDOW_CHUNK = 128
+
+
+@dataclass
+class WindowMask:
+    """patch 内 attention 用の窓マスク (chunk × (chunk+2w) のみ実体化).
+
+    1 patch の長さは max_patch_len (= w) 以下なので、同一 patch の kv は
+    q の前後 w バイト以内に必ず収まる。これを利用して T×T の密マスクの
+    代わりに chunk ごとの窓だけを見る (メモリ O(T·窓)、計算 ~T/窓 分の 1)。
+    """
+
+    mask: torch.Tensor  # (B, n_chunk, chunk, chunk + 2w) bool
+    chunk: int
+    w: int
+
+
+def _windowed_sdpa(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wm: WindowMask
+) -> torch.Tensor:
+    """q/k/v: (B, H, T, d), T = n * chunk。戻り値も (B, H, T, d)。"""
+    b, h, t, d = q.shape
+    c, w = wm.chunk, wm.w
+    n = t // c
+    win = c + 2 * w
+    qc = q.view(b, h, n, c, d).permute(0, 2, 1, 3, 4).reshape(b * n, h, c, d)
+    # kv は両側 w を pad してから chunk 幅 c でスライドして窓を切り出す
+    kw = F.pad(k, (0, 0, w, w)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
+    vw = F.pad(v, (0, 0, w, w)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
+    out = F.scaled_dot_product_attention(qc, kw, vw, attn_mask=wm.mask.reshape(b * n, 1, c, win))
+    return out.view(b, n, h, c, d).permute(0, 2, 1, 3, 4).reshape(b, h, t, d)
 
 
 @dataclass
@@ -179,7 +216,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
+        attn_mask: "torch.Tensor | WindowMask | None" = None,
         kv_cache: "_LayerKVCache | None" = None,
         pos_offset: int = 0,
     ) -> torch.Tensor:
@@ -200,8 +237,11 @@ class Attention(nn.Module):
             n_rep = self.n_heads // self.n_kv_heads
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
-        if attn_mask is not None:
-            # 動的 patching 用: causal 制約はマスク側に織り込み済み
+        if isinstance(attn_mask, WindowMask):
+            # 動的 patching 用 (窓経路): T×T を実体化しない
+            out = _windowed_sdpa(q, k, v, attn_mask)
+        elif attn_mask is not None:
+            # 動的 patching 用 (密マスク fallback): causal 制約はマスク側に織り込み済み
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         elif is_incremental:
             if t != 1:
@@ -242,7 +282,7 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
+        attn_mask: "torch.Tensor | WindowMask | None" = None,
         kv_cache: "_LayerKVCache | None" = None,
         pos_offset: int = 0,
     ) -> torch.Tensor:
@@ -522,11 +562,28 @@ class ArborModel(nn.Module):
         k = self.max_patches
 
         x = self.byte_emb(input_ids)                       # (B, T, dl)
-        same = patch_id.unsqueeze(2) == patch_id.unsqueeze(1)  # (B, T, T)
+
+        # patch 内 attention マスク: T が chunk の倍数なら窓経路 (T×T を実体化
+        # しない)、端数 (生成 prefill 等) は従来の密マスク fallback
+        c, w = _WINDOW_CHUNK, cfg.max_patch_len
+        if t % c == 0 and t >= c:
+            # kv 側は両側 w を pad。pad 位置は patch_id=-1 で不一致を保証
+            qpid = patch_id.view(b, t // c, c)
+            kpid = F.pad(patch_id, (w, w), value=-1).unfold(1, c + 2 * w, c)
+            same_win = qpid.unsqueeze(3) == kpid.unsqueeze(2)  # (B, n, c, c+2w)
+            # 絶対位置: q = i*c + qi, kv = i*c - w + ki なので causal ⇔ qi + w >= ki
+            ar_q = torch.arange(c, device=x.device).unsqueeze(1)
+            ar_k = torch.arange(c + 2 * w, device=x.device).unsqueeze(0)
+            enc_mask: torch.Tensor | WindowMask = WindowMask(same_win, c, w)
+            dec_mask: torch.Tensor | WindowMask = WindowMask(same_win & (ar_q + w >= ar_k), c, w)
+        else:
+            same = patch_id.unsqueeze(2) == patch_id.unsqueeze(1)  # (B, T, T)
+            causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device))
+            enc_mask = same.unsqueeze(1)
+            dec_mask = (same & causal).unsqueeze(1)
 
         # Local Encoder: patch 内 bidirectional (block 対角マスク)
         h = x
-        enc_mask = same.unsqueeze(1)
         for layer in self.encoder_layers:
             h = self._maybe_ckpt(layer, h, enc_mask)
 
@@ -545,8 +602,6 @@ class ArborModel(nn.Module):
 
         # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
         d = x + h_byte
-        causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device))
-        dec_mask = (same & causal).unsqueeze(1)
         for layer in self.decoder_layers:
             d = self._maybe_ckpt(layer, d, dec_mask)
         return ArborOutput(logits=self.head(self.head_norm(d)))
@@ -562,7 +617,8 @@ class ArborModel(nn.Module):
         return self.global_to_local(self.global_norm(g))
 
     def _maybe_ckpt(
-        self, layer: nn.Module, x: torch.Tensor, attn_mask: torch.Tensor | None = None
+        self, layer: nn.Module, x: torch.Tensor,
+        attn_mask: "torch.Tensor | WindowMask | None" = None,
     ) -> torch.Tensor:
         if self.cfg.gradient_checkpointing and self.training and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint

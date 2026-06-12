@@ -77,6 +77,30 @@ def test_causality(mode, pos):
 
 
 @pytest.mark.parametrize("mode", ["space", "entropy"])
+def test_window_path_matches_dense(mode, monkeypatch):
+    """T が chunk の倍数のときの窓 attention 経路が密マスク経路と一致すること.
+
+    既存テストは T < _WINDOW_CHUNK で密経路しか通らないため、T=256 で
+    窓経路を踏み、_WINDOW_CHUNK を巨大化して得た密経路の logits と比較する。
+    """
+    import src.model.arbor as arbor_mod
+
+    torch.manual_seed(2)
+    t = 2 * arbor_mod._WINDOW_CHUNK
+    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg(mode), max_bytes=t))).eval()
+    x = torch.randint(4, 260, (2, t))
+    x[0, ::5] = 0x20 + 4  # space 境界を発生させる
+    with torch.inference_mode():
+        win = m(x).logits
+        monkeypatch.setattr(arbor_mod, "_WINDOW_CHUNK", 10**9)  # t >= c を破り密経路へ
+        dense = m(x).logits
+    assert torch.allclose(win, dense, atol=1e-5), (
+        f"mode={mode}: 窓経路と密マスク経路の logits が不一致 "
+        f"(max diff={(win - dense).abs().max().item():.2e})"
+    )
+
+
+@pytest.mark.parametrize("mode", ["space", "entropy"])
 def test_dynamic_forward_shape_and_grads(mode):
     torch.manual_seed(0)
     m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode)))
