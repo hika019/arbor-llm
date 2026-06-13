@@ -81,9 +81,9 @@ optim:
   grad_clip: 1.0
   scheduler: cosine_warmup
   min_lr_ratio: 0.15            # lr 下限 = ピークの 15%
-  decay_end_ratio: 0.8          # 総 step の 80% で下限到達、残りは下限で一定
-  warmup_steps: 100
-  total_steps: 40000
+  decay_end_ratio: 0.6          # 総 step の 60% で下限到達、残りは下限で一定
+  warmup_steps: 1000
+  total_steps: 100000
 
 speed:
   precision: bf16
