@@ -374,6 +374,7 @@ def compute_patch_starts(
     max_len: int,
     entropy_model: ByteLM | None = None,
     threshold: float = 1.5,
+    entropy_values: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """patch 開始位置の bool tensor (B, T) を返す。判定は過去バイトのみに依存 (causal).
 
@@ -395,9 +396,12 @@ def compute_patch_starts(
         raw = torch.zeros(b, t, dtype=torch.bool, device=input_ids.device)
         raw[:, 1:] = is_space
     elif mode == "entropy":
-        if entropy_model is None:
-            raise ValueError("patching_mode=entropy には entropy_model が必要")
-        ent = entropy_model.next_byte_entropy(input_ids)  # (B, T)
+        if entropy_values is None:
+            if entropy_model is None:
+                raise ValueError("patching_mode=entropy には entropy_model が必要")
+            ent = entropy_model.next_byte_entropy(input_ids)  # (B, T)
+        else:
+            ent = entropy_values
         raw = torch.zeros(b, t, dtype=torch.bool, device=input_ids.device)
         raw[:, 1:] = ent[:, :-1] > threshold
     else:
@@ -554,9 +558,16 @@ class ArborModel(nn.Module):
     def _forward_dynamic(self, input_ids: torch.Tensor) -> ArborOutput:
         cfg = self.cfg
         b, t = input_ids.shape
+        entropy_values = None
+        if cfg.patching_mode == "entropy":
+            if self.entropy_model is None:
+                raise ValueError("patching_mode=entropy には entropy_model が必要")
+            # Keep only the data-dependent boundary walk out of torch.compile.
+            # The frozen ByteLM itself is dense tensor work and benefits from compile.
+            entropy_values = self.entropy_model.next_byte_entropy(input_ids)
         starts = compute_patch_starts(
             input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
-            self.entropy_model, cfg.entropy_threshold,
+            self.entropy_model, cfg.entropy_threshold, entropy_values,
         )
         patch_id = starts.long().cumsum(1) - 1             # (B, T) 各バイトの patch 番号
         k = self.max_patches
