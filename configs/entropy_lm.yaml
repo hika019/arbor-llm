@@ -39,7 +39,7 @@ data:
     # ---- 日本語 0.60 ----
     - path: "HuggingFaceFW/fineweb-2"   # 現代 web
       name: "jpn_Jpan"
-      weight: 0.30
+      weight: 0.31
     - path: "range3/cc100-ja"           # web 口語 (ブログ調)
       weight: 0.06
     - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
@@ -51,9 +51,9 @@ data:
       text_column: "body"
       weight: 0.04
     - path: "shidowake/chatbot-arena-ja_dedup_subset-5k"  # 日本語チャット/崩れた入力
-      weight: 0.04
+      weight: 0.05
     - path: "sirgecko/dataset_japanesechatbot2"  # 日本語チャット文
-      weight: 0.03
+      weight: 0.04
     - path: "sirgecko/dataset_japanesechatbot_sentence"  # 日本語短文チャット
       weight: 0.03
     # ---- 英語 0.12 ----
@@ -86,15 +86,7 @@ data:
     - path: "HuggingFaceFW/fineweb-2"   # アラビア語
       name: "arb_Arab"
       weight: 0.012
-    - path: "HuggingFaceFW/fineweb-2"   # ヒンディー語
-      name: "hin_Deva"
-      weight: 0.01
-    - path: "HuggingFaceFW/fineweb-2"   # タイ語
-      name: "tha_Thai"
-      weight: 0.01
-    - path: "HuggingFaceFW/fineweb-2"   # ベトナム語
-      name: "vie_Latn"
-      weight: 0.01
+
     # ---- 会話 / typo / 絵文字 0.06 ----
     - path: "OpenAssistant/oasst1"      # 多言語チャット。崩れた文・顔文字・絵文字も含む
       weight: 0.06
@@ -146,5 +138,5 @@ sampling:
   enabled: false            # 境界判定用 LM なので生成品質は見ない
 
 logging:
-  log_every_steps: 20
-  throughput_window: 20
+  log_every_steps: 50
+  throughput_window: 50

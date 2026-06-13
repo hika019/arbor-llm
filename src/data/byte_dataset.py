@@ -96,12 +96,13 @@ class ByteStreamDataset(IterableDataset):
             if col != "text":
                 ds = ds.rename_column(col, "text")
             ds = ds.select_columns(["text"])  # スキーマ衝突回避 (混合時)
-            if self.shuffle_buffer > 0:
-                ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=42)
             return ds
 
         if not self.sources:
-            return _one(self.source, None, self.text_column, self.split)
+            ds = _one(self.source, None, self.text_column, self.split)
+            if self.shuffle_buffer > 0:
+                ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=42)
+            return ds
 
         from datasets import interleave_datasets
 
@@ -116,10 +117,15 @@ class ByteStreamDataset(IterableDataset):
         total = sum(weights) or 1.0
         probs = [w / total for w in weights]
         # all_exhausted: 巨大コーパスでは実質無限。比率を保ちつつ枯渇分は再サンプル.
-        return interleave_datasets(
+        ds = interleave_datasets(
             streams, probabilities=probs, seed=42,
             stopping_strategy="all_exhausted",
         )
+        if self.shuffle_buffer > 0:
+            # source ごとに shuffle すると buffer_size * source数 の行を保持し、
+            # WSL の小さめの RAM 上限では OOM になりやすい。混合後に一度だけ shuffle する。
+            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=42)
+        return ds
 
     def _iter_hf_stream(self) -> Iterator[dict[str, torch.Tensor]]:
         try:

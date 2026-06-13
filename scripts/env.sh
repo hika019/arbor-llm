@@ -28,7 +28,7 @@ fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # compile worker を増やしすぎると WSL RAM を食い潰す。
 # FX graph cache は2回目以降の起動待ちを短縮する。
-export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-12}"
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-4}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 echo "[env] venv + micromamba gcc 有効化済み. gcc=$(gcc --version | head -1)"
