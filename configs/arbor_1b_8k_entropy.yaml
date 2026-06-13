@@ -5,18 +5,24 @@
 # 新規:   python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml
 # 再開:   python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml --resume latest
 #
-# static 版 (arbor_1b_8k.yaml) との違いは patching のみ。threshold 2.0 で
-# 平均 patch 長は混合加重 ~4.3 bytes (実測) と static の 4 bytes とほぼ等価だが、
-# 動的モードは patch 数を max_bytes / min_patch_len = 4096 に固定 pad するため
-# global 層の系列長は static (2048) の 2 倍になる (pad patch は decoder から
-# gather されず勾配も流れないが、計算自体は走る)。速度が厳しければ
-# min_patch_len: 4 (= global 2048, ただし 4 bytes 未満で区切れなくなる) が次の手。
+# static 版 (arbor_1b_8k.yaml) との違いは patching のみ。動的モードは patch 数を
+# max_bytes / min_patch_len に固定 pad して global を回す。threshold 2.0 の実 patch
+# 数は ~1900 だが pad 上限はこの式で決まるため、min_patch_len が global 系列長
+# (=速度/VRAM) と patch 粒度 (=品質) の両方を決める主ノブになる。
 #
-# 実測 (RTX 4090 / WSL2, 窓 attention + compile ON, micro 1):
-#   25.2k tok/s / peak VRAM 16.4GiB → 200k steps ≈ 48 日
-# 注: torch_compile と gradient_checkpointing の併用は torch 2.5 で backward が
-# NaN になるため train.py が起動時に弾く。OOM 時は compile を犠牲にして
-# gradient_checkpointing: true + torch_compile: false (7.8k tok/s) にする。
+# 速度/品質バランスの実測 (RTX 4090 / WSL2, 窓 attention + compile ON, 定常値):
+#   min2/micro1: 24.3k tok/s, 17.5GiB, code patch 3.0B (最細)        → 200k ≈ 48 日
+#   min3/micro2: 43.3k tok/s, 20.5GiB, code patch 3.9B (法令は min2 と同一)→ 27 日  ★採用
+#   min4/micro2: 54.0k tok/s, 18.9GiB, code patch 5.2B (粗い)         → 22 日
+# min3 を採用 (速度ほぼ2倍で patch 粒度は最細に近い。性能>速度方針)。さらに速度が
+# 要るなら min_patch_len: 4 (+ micro2 維持) で 54k/22 日。
+#
+# 注1: micro2 は min2 だと VRAM 溢れ。min3 以上 (global 系列短縮) で初めて収まる。
+# 注2: compile_mode: max-autotune は逆効果 (10k tok/s まで低下、CUDA グラフ系の病的
+#      挙動。本構成では default が最速)。
+# 注3: torch_compile と gradient_checkpointing の併用は torch 2.5 で backward が NaN
+#      になるため train.py が起動時に弾く。OOM 時は compile を犠牲にして
+#      gradient_checkpointing: true + torch_compile: false にする。
 
 run_name: arbor2_1b_8k_entropy
 seed: 42
@@ -24,7 +30,7 @@ seed: 42
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
   patching_mode: entropy        # choices: static | space | entropy
-  min_patch_len: 2              # これ未満では区切らない (max_patches = 8192/2 = 4096)
+  min_patch_len: 3              # これ未満では区切らない (max_patches = ceil(8192/3) = 2731)
   max_patch_len: 16             # これに達したら強制区切り
   entropy_threshold: 2.0        # 次バイト H (nats)。混合加重で平均 ~4.3 bytes/patch
   entropy_model:                # ByteLM の構成 (entropy_lm.yaml の model 節と一致させる)
@@ -109,9 +115,9 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: true           # 固定 pad で形状固定なので ON 可 (compute_patch_starts は対象外)
-  compile_mode: default         # choices: default | reduce-overhead | max-autotune
-  micro_batch_size: 1           # compile ON はこれが上限 (peak 16.4GiB 実測。2 は溢れる)
-  grad_accum_steps: 64          # 実効バッチ 64 seq 相当 (= 524k bytes/update, static 版と同じ)
+  compile_mode: default         # max-autotune は逆効果 (上部コメント参照)。default が最速
+  micro_batch_size: 2           # min3 で global 系列が縮み micro2 が収まる (peak 20.5GiB 実測)
+  grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update, static 版と同じ)
 
 checkpoint:
   dir: ./checkpoints/arbor2_1b_8k_entropy
