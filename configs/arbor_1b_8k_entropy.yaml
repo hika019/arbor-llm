@@ -18,8 +18,10 @@
 # 要るなら min_patch_len: 4 (+ micro2 維持) で 54k/22 日。
 #
 # 注1: micro2 は min2 だと VRAM 溢れ。min3 以上 (global 系列短縮) で初めて収まる。
-# 注2: compile_mode: max-autotune は逆効果 (10k tok/s まで低下、CUDA グラフ系の病的
-#      挙動。本構成では default が最速)。
+# 注2: compile_mode: max-autotune は逆効果 (step 330-355 実測 24k tok/s、
+#      rolling 表示も 14k tok/s 前後まで落ち、default の定常 ~46k tok/s を下回る)。
+#      autotune 候補探索中にエラー風ログが出ること自体はありうるが、本構成では
+#      速度面の採用理由が無い。
 # 注3: torch_compile と gradient_checkpointing の併用は torch 2.5 で backward が NaN
 #      になるため train.py が起動時に弾く。OOM 時は compile を犠牲にして
 #      gradient_checkpointing: true + torch_compile: false にする。
