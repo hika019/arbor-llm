@@ -28,43 +28,85 @@ model:
   gradient_checkpointing: false
 
 # 本走 (arbor_1b_8k.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
-# 本体学習開始後は差し替え不可なので、文体カバレッジは広めに取る
-# (日本語: 現代web/口語/書籍・古典/百科事典/法令、英語: edu/古典書籍/news、
-#  code は多言語 GitHub)。
+# 本体学習開始後は差し替え不可なので、文体カバレッジは広めに取る。
+# 日本語は最低 60% を維持し、その中に日本語チャット/崩れ文も入れる。
+# 残りで英語・多言語 UTF-8・会話/typo/絵文字・
+# code/markdown/math を混ぜる。HF の text 列に残っている改行・タブ・空白・
+# 絵文字・顔文字は UTF-8 bytes としてそのまま学習され、row 末尾にも LF を足す。
 # 混合を変えたら resume せず新規学習すること (dataloader 状態が合わなくなる)。
 data:
   sources:
     # ---- 日本語 0.60 ----
     - path: "HuggingFaceFW/fineweb-2"   # 現代 web
       name: "jpn_Jpan"
-      weight: 0.36
+      weight: 0.30
     - path: "range3/cc100-ja"           # web 口語 (ブログ調)
-      weight: 0.07
+      weight: 0.06
     - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
-      weight: 0.07
+      weight: 0.06
     - path: "wikimedia/wikipedia"       # 百科事典文体
       name: "20231101.ja"
-      weight: 0.05
+      weight: 0.04
     - path: "y2lan/japan-law"           # 法令 (条文体。8.75k 件と小さいが all_exhausted で循環)
       text_column: "body"
-      weight: 0.05
-    # ---- 英語 0.22 ----
+      weight: 0.04
+    - path: "shidowake/chatbot-arena-ja_dedup_subset-5k"  # 日本語チャット/崩れた入力
+      weight: 0.04
+    - path: "sirgecko/dataset_japanesechatbot2"  # 日本語チャット文
+      weight: 0.03
+    - path: "sirgecko/dataset_japanesechatbot_sentence"  # 日本語短文チャット
+      weight: 0.03
+    # ---- 英語 0.12 ----
     - path: "HuggingFaceFW/fineweb-edu" # edu (高品質土台)
-      weight: 0.12
+      weight: 0.07
     - path: "manu/project_gutenberg"    # 古典書籍
       split: "en"
-      weight: 0.06
+      weight: 0.03
     - path: "vblagoje/cc_news"          # news
-      weight: 0.04
-    # ---- code / math 0.18 ----
+      weight: 0.02
+    # ---- 多言語 UTF-8 web 0.12 ----
+    - path: "HuggingFaceFW/fineweb-2"   # 韓国語
+      name: "kor_Hang"
+      weight: 0.015
+    - path: "HuggingFaceFW/fineweb-2"   # ドイツ語
+      name: "deu_Latn"
+      weight: 0.015
+    - path: "HuggingFaceFW/fineweb-2"   # フランス語
+      name: "fra_Latn"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"   # スペイン語
+      name: "spa_Latn"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"   # 中国語
+      name: "cmn_Hani"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"   # ロシア語
+      name: "rus_Cyrl"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"   # アラビア語
+      name: "arb_Arab"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"   # ヒンディー語
+      name: "hin_Deva"
+      weight: 0.01
+    - path: "HuggingFaceFW/fineweb-2"   # タイ語
+      name: "tha_Thai"
+      weight: 0.01
+    - path: "HuggingFaceFW/fineweb-2"   # ベトナム語
+      name: "vie_Latn"
+      weight: 0.01
+    # ---- 会話 / typo / 絵文字 0.06 ----
+    - path: "OpenAssistant/oasst1"      # 多言語チャット。崩れた文・顔文字・絵文字も含む
+      weight: 0.06
+    # ---- code / markdown / math 0.10 ----
     - path: "HuggingFaceTB/finemath"    # 数学
       name: "finemath-4plus"
-      weight: 0.06
+      weight: 0.03
     - path: "loubnabnl/github-code-more-filtering"  # 多言語 GitHub コード (32 言語, parquet 非 gated)
       text_column: "code"
-      weight: 0.08
+      weight: 0.05
     - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.04
+      weight: 0.02
   streaming: true
   shuffle_buffer: 2000
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)
@@ -80,10 +122,10 @@ optim:
   weight_decay: 0.0
   grad_clip: 1.0
   scheduler: cosine_warmup
-  min_lr_ratio: 0.15            # lr 下限 = ピークの 15%
+  min_lr_ratio: 0.05            # lr 下限 = ピークの 5%
   decay_end_ratio: 0.6          # 総 step の 60% で下限到達、残りは下限で一定
   warmup_steps: 1000
-  total_steps: 100000
+  total_steps: 500000
 
 speed:
   precision: bf16
