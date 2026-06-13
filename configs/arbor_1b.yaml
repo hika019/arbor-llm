@@ -3,18 +3,17 @@
 # 新規:   python -m src.train.train --config configs/arbor_1b.yaml
 # 再開:   python -m src.train.train --config configs/arbor_1b.yaml --resume latest
 #
-# 約 0.95B params。静的 patching (4 bytes/patch) で形状固定 → torch.compile 常時 ON。
+# 約 0.95B params。静的 patching (9 bytes/patch) で形状固定 → torch.compile 常時 ON。
+# 8190 bytes ≈ 8k context。日本語ではおおむね 3 文字/patch、global は 910 patches。
 
 run_name: arbor2_1b
 seed: 42
 
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
-  # patching_mode: static       # 既定 static。space | entropy も選べる (READMEと
-  #                             # trial_*.yaml 参照)。進行中 run の config 照合を
-  #                             # 壊さないため、この run ではキー自体を書かない
-  patch_size: 4                 # 1 patch = 4 bytes (静的)
-  max_bytes: 2048               # 学習 context (bytes) = 512 patches
+  patching_mode: static         # choices: static | space | entropy
+  patch_size: 9                 # 1 patch = 9 bytes (静的)
+  max_bytes: 8190               # 学習 context (bytes) = 910 patches
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
   num_heads: 16
@@ -47,7 +46,7 @@ data:
       weight: 0.25
   streaming: true
   shuffle_buffer: 2000
-  context_length: 2048          # bytes。patch_size の倍数にする
+  context_length: 8190          # bytes。patch_size の倍数にする
   num_workers: 0                # 正確 resume は単一プロセス前提
   prefetch_factor: 4
   pin_memory: true
@@ -61,6 +60,8 @@ optim:
   weight_decay: 0.1
   grad_clip: 1.0
   scheduler: cosine_warmup
+  min_lr_ratio: 0.1            # lr 下限 = ピークの 10%
+  decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
   total_steps: 200000
 
@@ -71,11 +72,11 @@ speed:
   cudnn_benchmark: true
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
-  micro_batch_size: 8           # 4090 実測: B=8 で VRAM ~16GiB / 51k tok/s (synthetic)
-  grad_accum_steps: 8           # 実効バッチ 64 (= 131k bytes/update)
+  micro_batch_size: 2           # p9 で global 系列 910。OOM 時は 1 に下げて accum を 64 へ
+  grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)
 
 checkpoint:
-  dir: ./checkpoints
+  dir: ./checkpoints/arbor2_1b
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000
