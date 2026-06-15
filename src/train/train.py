@@ -110,6 +110,11 @@ def run_metadata(args: argparse.Namespace, device: torch.device) -> dict[str, ob
     }
 
 
+def should_restore_dataloader_state(saved_data_cfg: dict | None, current_data_cfg: dict) -> bool:
+    """Return whether checkpoint dataloader state is compatible with current data config."""
+    return saved_data_cfg is None or saved_data_cfg == current_data_cfg
+
+
 # ---------------------------------------------------------- グローバル最適化
 def apply_speed_settings(speed: dict) -> None:
     """学習開始前に効かせるスループット系の設定をまとめて適用."""
@@ -257,8 +262,11 @@ def main() -> int:
         # checkpoint には保存時の実効 config が入っているので model 節を突き合わせる.
         resolved = ckpt.resolve(args.resume)
         saved_cfg_file = resolved / "config.yaml" if resolved else None
+        saved_data_cfg = None
         if saved_cfg_file is not None and saved_cfg_file.exists():
-            saved_model_cfg = yaml.safe_load(saved_cfg_file.read_text()).get("model", {})
+            saved_cfg = yaml.safe_load(saved_cfg_file.read_text()) or {}
+            saved_model_cfg = saved_cfg.get("model", {})
+            saved_data_cfg = saved_cfg.get("data")
             if saved_model_cfg and saved_model_cfg != cfg["model"]:
                 diff_keys = sorted(
                     k for k in set(saved_model_cfg) | set(cfg["model"])
@@ -276,7 +284,14 @@ def main() -> int:
         global_step = meta.global_step
         best_loss = meta.best_loss
         if dl_state is not None:
-            train_loader.load_state_dict(dl_state)
+            if not should_restore_dataloader_state(saved_data_cfg, data_cfg):
+                print(
+                    "[train] WARNING: checkpoint の data 設定が現在の config と不一致のため "
+                    "dataloader state は復元しない。model/optimizer/scheduler は resume し、"
+                    "新しいデータ混合は先頭から開始する。"
+                )
+            else:
+                train_loader.load_state_dict(dl_state)
         print(f"[train] resumed from step={global_step}, best_loss={best_loss:.4f}")
 
     # ---- 学習ループ ----

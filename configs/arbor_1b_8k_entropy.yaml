@@ -72,10 +72,15 @@ data:
     # ---- 日本語 0.60 ----
     - path: "HuggingFaceFW/fineweb-2"   # 日本語 web
       name: "jpn_Jpan"
-      weight: 0.57
+      weight: 0.41
     - path: "y2lan/japan-law"           # 法令 (条文体。小規模だが all_exhausted で循環)
       text_column: "body"
-      weight: 0.03
+      weight: 0.01
+    - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
+      weight: 0.02
+    - path: "wikimedia/wikipedia"       # 百科事典文体
+      name: "20231101.ja"
+      weight: 0.16
     # ---- 英語 0.17 ----
     - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
       weight: 0.13
@@ -109,7 +114,7 @@ optim:
   min_lr_ratio: 0.1            # lr 下限 = ピークの 10% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
-  total_steps: 200000
+  total_steps: 100000
 
 # ---- スループット ----
 speed:
