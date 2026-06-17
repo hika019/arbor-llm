@@ -43,6 +43,26 @@ from src.train.signals import StopFlag  # noqa: E402
 from src.train.throughput import ThroughputMeter  # noqa: E402
 
 
+_TIMING_ENABLED = os.environ.get("ARBOR_TIMING", "0") == "1"
+_TIMING_T0 = time.perf_counter()
+_TIMING_LAST = _TIMING_T0
+
+
+def timing_mark(label: str, device: torch.device | None = None) -> None:
+    """Print coarse wall-clock timing when ARBOR_TIMING=1."""
+    global _TIMING_LAST
+    if not _TIMING_ENABLED:
+        return
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+    now = time.perf_counter()
+    print(
+        f"[timing] {label}: +{now - _TIMING_LAST:.3f}s total={now - _TIMING_T0:.3f}s",
+        flush=True,
+    )
+    _TIMING_LAST = now
+
+
 # --------------------------------------------------------------- 引数 / 設定
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -126,9 +146,13 @@ class CudaBatchPrefetcher:
         self.stream = torch.cuda.Stream(device=device)
         self.next_batch: dict[str, torch.Tensor] | None = None
         if initial_batch is None:
+            timing_mark("cuda_prefetcher_preload_start")
             self._preload()
+            timing_mark("cuda_prefetcher_preload_done", device)
         else:
+            timing_mark("cuda_prefetcher_stage_resume_batch_start")
             self._stage(initial_batch)
+            timing_mark("cuda_prefetcher_stage_resume_batch_done", device)
 
     def __iter__(self):
         return self
@@ -225,12 +249,17 @@ def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Modu
 
 # ------------------------------------------------------------------- main
 def main() -> int:
+    timing_mark("process_start")
     args = parse_args()
+    timing_mark("parse_args")
     cfg = load_config(args.config)
+    timing_mark("load_config")
     git_info = git_metadata(_ROOT)
+    timing_mark("git_metadata")
 
     torch.manual_seed(cfg.get("seed", 42))
     apply_speed_settings(cfg.get("speed", {}))
+    timing_mark("seed_and_speed_settings")
 
     device = pick_device()
     print(f"[train] device={device} torch={torch.__version__}")
@@ -249,7 +278,12 @@ def main() -> int:
         raise ValueError(f"unknown model.arch: {arch}")
     compute_dtype, use_autocast = resolve_precision(cfg.get("speed", {}).get("precision", "bf16"))
     print(f"[train] arch={arch} precision={compute_dtype} autocast={use_autocast}")
+    print("[train] building model...")
+    timing_mark("before_model_build", device)
+    t0 = time.perf_counter()
     model = build_model(cfg["model"]).to(device=device, dtype=compute_dtype)
+    print(f"[train] model built and moved to {device} in {time.perf_counter() - t0:.1f}s")
+    timing_mark("model_build_to_device", device)
     # checkpoint 保存とサンプル生成は compile 前のモデルで行う
     # (compile wrapper を保存すると state dict が _orig_mod. 付きになる)
     base_model = model
@@ -267,13 +301,19 @@ def main() -> int:
             init_path = init_path / "model.safetensors"
         if not init_path.exists():
             raise SystemExit(f"[train] ERROR: --init-from に model.safetensors が無い: {init_path}")
+        t0 = time.perf_counter()
+        print(f"[train] loading init weights from {init_path}...")
         weights = safe_load(str(init_path), device=str(device))
         if any(k.startswith("_orig_mod.") for k in weights):
             weights = {k.removeprefix("_orig_mod."): v for k, v in weights.items()}
         base_model.load_state_dict(weights, strict=True)
-        print(f"[train] init_from={init_path} (weights only; optimizer/scheduler/step は新規)")
+        print(
+            f"[train] init_from={init_path} loaded in {time.perf_counter() - t0:.1f}s "
+            "(weights only; optimizer/scheduler/step は新規)"
+        )
 
     model = apply_compile_settings(model, cfg["speed"])
+    timing_mark("compile_wrapper_created", device)
 
     # ---- データ (streaming, メモリに全部載せない) ----
     from src.data.byte_dataset import build_byte_dataloader
@@ -290,10 +330,13 @@ def main() -> int:
     else:
         data_cfg.setdefault("micro_batch_size", 4)
     train_loader = build_byte_dataloader(data_cfg, split="train")
+    timing_mark("dataloader_object_created", device)
 
     # ---- optimizer / scheduler ----
     optimizer = build_optimizer(model.parameters(), cfg["optim"])
+    timing_mark("optimizer_created", device)
     scheduler = build_scheduler(optimizer, cfg["optim"])
+    timing_mark("scheduler_created", device)
 
     # ---- チェックポイント ----
     ckpt_cfg = cfg["checkpoint"]
@@ -334,7 +377,12 @@ def main() -> int:
                 if not args.allow_config_mismatch:
                     raise SystemExit(f"[train] ERROR: {msg}")
                 print(f"[train] WARNING: {msg}")
+        timing_mark("before_checkpoint_load", device)
+        t0 = time.perf_counter()
+        print(f"[train] loading checkpoint resume={args.resume}...")
         meta, dl_state = ckpt.load(args.resume, base_model, optimizer, scheduler, map_location=device)
+        print(f"[train] checkpoint loaded in {time.perf_counter() - t0:.1f}s")
+        timing_mark("checkpoint_loaded", device)
         global_step = meta.global_step
         best_loss = meta.best_loss
         pending_prefetch_batch = None
@@ -444,12 +492,16 @@ def main() -> int:
 
     def make_data_iter():
         nonlocal pending_prefetch_batch
+        timing_mark("make_data_iter_start", device)
         source_iter = iter(train_loader)
+        timing_mark("train_loader_iter_created", device)
         if not cuda_prefetch:
             return source_iter
         initial_batch = pending_prefetch_batch
         pending_prefetch_batch = None
-        return CudaBatchPrefetcher(source_iter, device, initial_batch=initial_batch)
+        data_iter = CudaBatchPrefetcher(source_iter, device, initial_batch=initial_batch)
+        timing_mark("make_data_iter_done", device)
+        return data_iter
 
     if cuda_prefetch:
         print("[train] cuda_prefetch=ON")
@@ -461,13 +513,19 @@ def main() -> int:
         try:
             tokens_this_step = 0
             for micro in range(grad_accum):
+                if global_step == 0:
+                    timing_mark(f"step0_micro{micro}_before_next_batch", device)
                 batch = next(data_iter)
+                if global_step == 0:
+                    timing_mark(f"step0_micro{micro}_batch_ready", device)
                 if cuda_prefetch:
                     inputs = batch["input_ids"]
                     labels = batch["labels"]
                 else:
                     inputs = batch["input_ids"].to(device, non_blocking=True)
                     labels = batch["labels"].to(device, non_blocking=True)
+                if global_step == 0:
+                    timing_mark(f"step0_micro{micro}_batch_on_device", device)
                 tokens_this_step += inputs.numel()
                 amp_context = (
                     torch.autocast(device_type=device.type, dtype=compute_dtype)
@@ -475,11 +533,19 @@ def main() -> int:
                     else nullcontext()
                 )
                 with amp_context:
+                    if global_step == 0:
+                        timing_mark(f"step0_micro{micro}_before_forward", device)
                     out = model(inputs)
+                    if global_step == 0:
+                        timing_mark(f"step0_micro{micro}_forward_done", device)
                     loss = torch.nn.functional.cross_entropy(
                         out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
                     ) / grad_accum
+                if global_step == 0:
+                    timing_mark(f"step0_micro{micro}_before_backward", device)
                 loss.backward()
+                if global_step == 0:
+                    timing_mark(f"step0_micro{micro}_backward_done", device)
                 detached_loss = loss.detach()
                 accum_loss_tensor = (
                     detached_loss

@@ -26,9 +26,8 @@ fi
 # 可変 batch/seq・大きな activation で OOM 余地を減らす (torch>=2.1, 単一GPUなら無害).
 # CUDA 初期化前 = torch import 前に効かせる必要があるので shell 側で設定.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# compile worker を増やしすぎると WSL RAM を食い潰す。
-# FX graph cache は2回目以降の起動待ちを短縮する。
-export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-4}"
+# TORCHINDUCTOR_COMPILE_THREADS は未指定なら PyTorch が CPU 数から決める。
+# メモリ不足になる環境だけ、source 前に 4 などへ明示的に下げる。
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 echo "[env] venv + micromamba gcc 有効化済み. gcc=$(gcc --version | head -1)"

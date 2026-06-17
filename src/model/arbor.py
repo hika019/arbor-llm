@@ -45,6 +45,7 @@ SubLN / ReLU² gated FFN / bias 無し。Embedding・射影・head・Norm は FP
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -807,10 +808,16 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
         ckpt = Path(cfg.entropy_model_ckpt)
         weights_file = ckpt / "model.safetensors"
         if weights_file.exists():
+            size_mb = weights_file.stat().st_size / 2**20
+            t0 = time.perf_counter()
+            print(f"[arbor] loading entropy_model weights from {weights_file} ({size_mb:.1f}MiB)...")
             state = safe_load(str(weights_file), device="cpu")
             state = {key.removeprefix("_orig_mod."): v for key, v in state.items()}
             model.entropy_model.load_state_dict(state, strict=True)
-            print(f"[arbor] entropy_model weights loaded from {ckpt}")
+            print(
+                f"[arbor] entropy_model weights loaded from {ckpt} "
+                f"in {time.perf_counter() - t0:.1f}s"
+            )
         else:
             print(
                 f"[arbor] WARNING: entropy_model_ckpt={ckpt} に model.safetensors が無い。"
