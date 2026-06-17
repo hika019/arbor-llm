@@ -115,6 +115,60 @@ def should_restore_dataloader_state(saved_data_cfg: dict | None, current_data_cf
     return saved_data_cfg is None or saved_data_cfg == current_data_cfg
 
 
+class CudaBatchPrefetcher:
+    """Move the next CPU batch to CUDA on a side stream while the current step runs."""
+
+    def __init__(self, source_iter, device: torch.device, initial_batch: dict | None = None):
+        if device.type != "cuda":
+            raise ValueError("CudaBatchPrefetcher requires a CUDA device")
+        self.source_iter = source_iter
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.next_batch: dict[str, torch.Tensor] | None = None
+        if initial_batch is None:
+            self._preload()
+        else:
+            self._stage(initial_batch)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> dict[str, torch.Tensor]:
+        if self.next_batch is None:
+            raise StopIteration
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        batch = self.next_batch
+        for value in batch.values():
+            if torch.is_tensor(value):
+                value.record_stream(torch.cuda.current_stream(self.device))
+        self._preload()
+        return batch
+
+    def _preload(self) -> None:
+        try:
+            batch = next(self.source_iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+        self._stage(batch)
+
+    def _stage(self, batch: dict) -> None:
+        with torch.cuda.stream(self.stream):
+            self.next_batch = {
+                key: value.to(self.device, non_blocking=True) if torch.is_tensor(value) else value
+                for key, value in batch.items()
+            }
+
+    def state_dict(self) -> dict | None:
+        if self.next_batch is None:
+            return None
+        self.stream.synchronize()
+        return {
+            key: value.detach().cpu() if torch.is_tensor(value) else value
+            for key, value in self.next_batch.items()
+        }
+
+
 # ---------------------------------------------------------- グローバル最適化
 def apply_speed_settings(speed: dict) -> None:
     """学習開始前に効かせるスループット系の設定をまとめて適用."""
@@ -283,16 +337,22 @@ def main() -> int:
         meta, dl_state = ckpt.load(args.resume, base_model, optimizer, scheduler, map_location=device)
         global_step = meta.global_step
         best_loss = meta.best_loss
+        pending_prefetch_batch = None
         if dl_state is not None:
+            if isinstance(dl_state, dict):
+                pending_prefetch_batch = dl_state.pop("_cuda_prefetch_next_batch", None)
             if not should_restore_dataloader_state(saved_data_cfg, data_cfg):
                 print(
                     "[train] WARNING: checkpoint の data 設定が現在の config と不一致のため "
                     "dataloader state は復元しない。model/optimizer/scheduler は resume し、"
                     "新しいデータ混合は先頭から開始する。"
                 )
+                pending_prefetch_batch = None
             else:
                 train_loader.load_state_dict(dl_state)
         print(f"[train] resumed from step={global_step}, best_loss={best_loss:.4f}")
+    else:
+        pending_prefetch_batch = None
 
     # ---- 学習ループ ----
     stop = StopFlag()
@@ -305,6 +365,8 @@ def main() -> int:
     run_info = run_metadata(args, device)
     save_every = ckpt_cfg["save_every_steps"]
     grad_accum = cfg["speed"].get("grad_accum_steps", 1)
+    sync_each_step = bool(cfg["speed"].get("sync_each_step", False))
+    cuda_prefetch = bool(cfg["speed"].get("cuda_prefetch", False)) and device.type == "cuda"
     log_every = cfg["logging"].get("log_every_steps", 20)
     total_steps = cfg["optim"]["total_steps"]
     micro_batch = data_cfg.get("micro_batch_size")
@@ -380,14 +442,32 @@ def main() -> int:
     # 保存間に更新があっても symlink が動かない (best が古い step を指し続ける)
     best_improved_tensor = torch.tensor(False, device=device)
 
-    data_iter = iter(train_loader)
+    def make_data_iter():
+        nonlocal pending_prefetch_batch
+        source_iter = iter(train_loader)
+        if not cuda_prefetch:
+            return source_iter
+        initial_batch = pending_prefetch_batch
+        pending_prefetch_batch = None
+        return CudaBatchPrefetcher(source_iter, device, initial_batch=initial_batch)
+
+    if cuda_prefetch:
+        print("[train] cuda_prefetch=ON")
+    if sync_each_step:
+        print("[train] sync_each_step=ON")
+
+    data_iter = make_data_iter()
     while global_step < total_steps:
         try:
             tokens_this_step = 0
             for micro in range(grad_accum):
                 batch = next(data_iter)
-                inputs = batch["input_ids"].to(device, non_blocking=True)
-                labels = batch["labels"].to(device, non_blocking=True)
+                if cuda_prefetch:
+                    inputs = batch["input_ids"]
+                    labels = batch["labels"]
+                else:
+                    inputs = batch["input_ids"].to(device, non_blocking=True)
+                    labels = batch["labels"].to(device, non_blocking=True)
                 tokens_this_step += inputs.numel()
                 amp_context = (
                     torch.autocast(device_type=device.type, dtype=compute_dtype)
@@ -416,7 +496,7 @@ def main() -> int:
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
-            if device.type == "cuda":
+            if device.type == "cuda" and sync_each_step:
                 torch.cuda.synchronize()
             meter.step(tokens_this_step)
 
@@ -483,12 +563,25 @@ def main() -> int:
                     },
                 )
                 dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None
+                if (
+                    dl_state is not None
+                    and cuda_prefetch
+                    and isinstance(data_iter, CudaBatchPrefetcher)
+                ):
+                    prefetched = data_iter.state_dict()
+                    if prefetched is not None:
+                        dl_state["_cuda_prefetch_next_batch"] = prefetched
+                t0 = time.perf_counter()
                 saved_dir = ckpt.save(
                     base_model, optimizer, scheduler, dl_state, meta, config=effective_cfg,
                     is_best=is_best,
                     is_final=global_step >= total_steps,
                 )
-                print(f"[train] saved checkpoint @ step={global_step}{' (best)' if is_best else ''}")
+                save_seconds = time.perf_counter() - t0
+                print(
+                    f"[train] saved checkpoint @ step={global_step}"
+                    f"{' (best)' if is_best else ''} in {save_seconds:.1f}s"
+                )
                 if sampling_enabled:
                     sample_at_checkpoint(saved_dir, global_step)
 
@@ -499,7 +592,7 @@ def main() -> int:
                 break
 
         except StopIteration:
-            data_iter = iter(train_loader)
+            data_iter = make_data_iter()
             continue
 
     # 最終 prune の daemon スレッドが途中終了して checkpoint を部分削除しないよう待つ

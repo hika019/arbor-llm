@@ -52,6 +52,8 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: false    # smoke では compile しない (起動を速く)
+  cuda_prefetch: true      # CUDA 実行時のみ有効。CPU smoke では無視される
+  sync_each_step: false
   micro_batch_size: 4
   grad_accum_steps: 1
 

@@ -50,6 +50,8 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: false
   torch_compile: false      # 動的モードの試験は eager で
+  cuda_prefetch: true
+  sync_each_step: false
   micro_batch_size: 8
   grad_accum_steps: 1
 

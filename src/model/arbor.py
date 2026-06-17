@@ -383,10 +383,14 @@ def compute_patch_starts(
     その後 min_len (それ未満では区切らない) / max_len (達したら強制区切り) を適用。
 
     min/max 制約は「境界 s の次の境界 = min(s+min_len 以降で最初の候補, s+max_len)」
-    というジャンプ過程なので、候補位置の事前計算 (ベクトル化) + patch 単位の整数
-    ジャンプで計算する (バイト毎の tensor 演算ループは T=8k で ~0.3s/batch かかり
-    entropy 学習のボトルネックになる)。データ依存の分岐を含むため compile 対象外。
+    というジャンプ過程なので、CUDA では raw -> starts の境界 walk を extension
+    に渡して GPU 上で完結させる。CPU ではテスト用の torch 実装を使う。
     """
+    if min_len <= 0:
+        raise ValueError("min_patch_len must be positive")
+    if max_len < min_len:
+        raise ValueError("max_patch_len must be >= min_patch_len")
+
     b, t = input_ids.shape
     if mode == "space":
         prev = input_ids[:, :-1] - BYTE_OFFSET
@@ -399,7 +403,7 @@ def compute_patch_starts(
         if entropy_values is None:
             if entropy_model is None:
                 raise ValueError("patching_mode=entropy には entropy_model が必要")
-            ent = entropy_model.next_byte_entropy(input_ids)  # (B, T)
+            ent = entropy_model.next_byte_entropy(input_ids)  # (B, T), no_grad in ByteLM
         else:
             ent = entropy_values
         raw = torch.zeros(b, t, dtype=torch.bool, device=input_ids.device)
@@ -407,22 +411,23 @@ def compute_patch_starts(
     else:
         raise ValueError(f"unknown dynamic patching mode: {mode}")
 
-    import numpy as np
+    if raw.is_cuda:
+        from src.model.patch_starts_cuda import patch_starts_cuda
 
-    raw_np = raw.cpu().numpy()
-    starts_np = np.zeros((b, t), dtype=bool)
-    pos = np.arange(t)
+        return patch_starts_cuda(raw, min_len, max_len)
+
+    starts = torch.zeros_like(raw)
     for r in range(b):
-        # nxt[p] = p 以降で最初の境界候補の位置 (無ければ t)。後ろからの累積 min
-        cand = np.where(raw_np[r], pos, t)
-        nxt = np.minimum.accumulate(cand[::-1])[::-1]
         i = 0
         while i < t:
-            starts_np[r, i] = True
+            starts[r, i] = True
             lo = i + min_len
-            j = int(nxt[lo]) if lo < t else t
-            i = min(j, i + max_len)
-    return torch.from_numpy(starts_np).to(input_ids.device)
+            if lo >= t:
+                break
+            hi = min(i + max_len, t)
+            candidates = raw[r, lo:hi].nonzero(as_tuple=False)
+            i = lo + int(candidates[0, 0]) if candidates.numel() else hi
+    return starts
 
 
 # ------------------------------------------------------------------ KV cache

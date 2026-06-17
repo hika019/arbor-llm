@@ -30,7 +30,7 @@ Thumbs.db
 *.log
 nohup.out
 
-# BLT は third_party/blt 配下に独立 git リポジトリとして clone 済み。
-# サブモジュール化していないので親リポジトリからは無視する。
+# 旧 BLT fork を置いていた環境でも親リポジトリには含めない。
 third_party/blt/
 .deps/*
+.torch_extensions/

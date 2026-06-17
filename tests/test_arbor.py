@@ -184,6 +184,38 @@ def test_patch_starts_edge_cases():
         assert torch.equal(got, want)
 
 
+def test_entropy_model_runs_without_grad_during_boundary_scoring(monkeypatch):
+    torch.manual_seed(0)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("entropy")))
+    grad_states = []
+    orig_forward = m.entropy_model.forward
+
+    def wrapped_forward(input_ids):
+        grad_states.append(torch.is_grad_enabled())
+        return orig_forward(input_ids)
+
+    monkeypatch.setattr(m.entropy_model, "forward", wrapped_forward)
+    x = torch.randint(4, 260, (2, 30))
+    out = m(x)
+    assert out.logits.requires_grad
+    assert grad_states and not any(grad_states)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_patch_starts_cuda_matches_cpu_reference():
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    if CUDA_HOME is None:
+        pytest.skip("CUDA toolkit is not available")
+
+    g = torch.Generator().manual_seed(0)
+    ids = torch.randint(4, 260, (2, 113), generator=g)
+    ids[torch.rand(ids.shape, generator=g) < 0.2] = 0x20 + 4
+    cpu = compute_patch_starts(ids, "space", min_len=3, max_len=16)
+    cuda = compute_patch_starts(ids.cuda(), "space", min_len=3, max_len=16).cpu()
+    assert torch.equal(cuda, cpu)
+
+
 @pytest.mark.parametrize("mode", ["static", "space", "entropy"])
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""

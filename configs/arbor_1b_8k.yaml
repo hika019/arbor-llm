@@ -90,6 +90,8 @@ speed:
   cudnn_benchmark: true
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
+  cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
+  sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
   micro_batch_size: 1           # 2 は VRAM 溢れ (compile OFF 実測 22.6GiB)。1 で peak 21.2GiB / 22.6k tok/s
   grad_accum_steps: 64          # 実効バッチ 64 seq 相当 (= 524k bytes/update)。
                                 # それでも溢れる時は gradient_checkpointing: true + torch_compile: false

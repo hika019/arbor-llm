@@ -123,6 +123,8 @@ speed:
   cudnn_benchmark: true
   torch_compile: true           # 固定 pad で形状固定なので ON 可 (compute_patch_starts は対象外)
   compile_mode: default         # max-autotune は逆効果 (上部コメント参照)。default が最速
+  cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
+  sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
   micro_batch_size: 2           # min3 で global 系列が縮み micro2 が収まる (peak 20.5GiB 実測)
   grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update, static 版と同じ)
 

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from src.train.train import resolve_precision
+from src.train.train import CudaBatchPrefetcher
 from src.train.train import should_restore_dataloader_state
 
 
@@ -44,3 +45,30 @@ def test_should_not_restore_dataloader_state_when_data_config_changed():
     }
 
     assert not should_restore_dataloader_state(saved_data_cfg, current_data_cfg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_batch_prefetcher_moves_tensor_batches_to_device():
+    batches = iter([
+        {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "labels": torch.zeros(2, 4, dtype=torch.long),
+        },
+        {
+            "input_ids": torch.full((2, 4), 2, dtype=torch.long),
+            "labels": torch.full((2, 4), 3, dtype=torch.long),
+        }
+    ])
+    prefetcher = CudaBatchPrefetcher(batches, torch.device("cuda"))
+
+    batch = next(prefetcher)
+    assert batch["input_ids"].device.type == "cuda"
+    assert batch["labels"].device.type == "cuda"
+    state = prefetcher.state_dict()
+    assert state["input_ids"].device.type == "cpu"
+    resumed = CudaBatchPrefetcher(iter([]), torch.device("cuda"), initial_batch=state)
+    resumed_batch = next(resumed)
+    assert resumed_batch["input_ids"].device.type == "cuda"
+    assert resumed_batch["input_ids"].cpu().tolist() == [[2, 2, 2, 2], [2, 2, 2, 2]]
+    with pytest.raises(StopIteration):
+        next(resumed)

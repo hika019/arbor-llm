@@ -92,6 +92,8 @@ speed:
   cudnn_benchmark: true
   torch_compile: true
   compile_mode: default
+  cuda_prefetch: true
+  sync_each_step: false
   micro_batch_size: 1           # 32k bytes/micro
   grad_accum_steps: 4           # 実効バッチ 131k bytes/update (8k 本走と同じ)
 
