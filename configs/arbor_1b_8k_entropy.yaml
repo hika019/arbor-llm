@@ -6,9 +6,9 @@
 # 再開:   python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml --resume latest
 #
 # static 版 (arbor_1b_8k.yaml) との違いは patching のみ。動的モードは global 側を
-# max_patches に固定 pad して回す。未指定なら max_bytes / min_patch_len の worst-case。
+# max_bytes / min_patch_len の worst-case に固定 pad して回す。
 # 実 patch 数はデータに依存するため、bytes/patch, patches/seq, max_patch/seq,
-# patch_headroom をログで見ながら max_patches を詰める。
+# patch_headroom をログで見ながら、新規 run では model.max_patches を詰められる。
 #
 # 速度/品質バランスの実測 (RTX 4090 / WSL2, 窓 attention + compile ON, 定常値):
 #   min2/micro1: 24.3k bytes/s, 17.5GiB, code patch 3.0B (最細)        → 200k ≈ 48 日
@@ -34,7 +34,6 @@ model:
   patching_mode: entropy        # choices: static | space | entropy
   min_patch_len: 3              # これ未満では区切らない (worst-case patches = ceil(8192/3) = 2731)
   max_patch_len: 16             # これに達したら強制区切り
-  max_patches: 2304             # 固定 pad 上限。超過時は明示エラー (worst-case 2731)
   entropy_threshold: 2.0        # 次バイト H (nats)。実効粒度は bytes/patch ログで確認する
   entropy_model:                # ByteLM の構成 (entropy_lm.yaml の model 節と一致させる)
     vocab_size: 260
