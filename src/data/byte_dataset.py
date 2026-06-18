@@ -232,6 +232,13 @@ class _ResumableLoader(DataLoader):
         if hasattr(ds, "load_state_dict"):
             ds.load_state_dict(state)
 
+    def shutdown_workers(self) -> None:
+        """Stop persistent DataLoader workers before process teardown."""
+        iterator = getattr(self, "_iterator", None)
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+        self._iterator = None
+
 
 def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
     ds = ByteStreamDataset(

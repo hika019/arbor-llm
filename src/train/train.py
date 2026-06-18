@@ -192,6 +192,11 @@ class CudaBatchPrefetcher:
             for key, value in self.next_batch.items()
         }
 
+    def close(self) -> None:
+        self.stream.synchronize()
+        self.next_batch = None
+        self.source_iter = None
+
 
 # ---------------------------------------------------------- グローバル最適化
 def apply_speed_settings(speed: dict) -> None:
@@ -369,14 +374,22 @@ def main() -> int:
                     k for k in set(saved_model_cfg) | set(cfg["model"])
                     if saved_model_cfg.get(k) != cfg["model"].get(k)
                 )
+                compatible_diff_keys = {"max_patches"}
+                blocking_diff_keys = [k for k in diff_keys if k not in compatible_diff_keys]
                 msg = (
                     f"checkpoint の model 設定と現在の config が不一致: {diff_keys}. "
                     f"再開するなら `--config {saved_cfg_file}` を使うか、"
                     "意図的なら --allow-config-mismatch を付ける。"
                 )
-                if not args.allow_config_mismatch:
+                if blocking_diff_keys and not args.allow_config_mismatch:
                     raise SystemExit(f"[train] ERROR: {msg}")
-                print(f"[train] WARNING: {msg}")
+                if blocking_diff_keys:
+                    print(f"[train] WARNING: {msg}")
+                else:
+                    print(
+                        "[train] compatible model config diff allowed on resume: "
+                        f"{diff_keys}"
+                    )
         timing_mark("before_checkpoint_load", device)
         t0 = time.perf_counter()
         print(f"[train] loading checkpoint resume={args.resume}...")
@@ -420,12 +433,12 @@ def main() -> int:
     micro_batch = data_cfg.get("micro_batch_size")
     context_length = data_cfg.get("context_length")
     if micro_batch and context_length:
-        tokens_per_update = int(micro_batch) * int(context_length) * int(grad_accum)
+        bytes_per_update = int(micro_batch) * int(context_length) * int(grad_accum)
         print(
             "[train] throughput_meter="
             f"optimizer_step rolling_window={meter.window} log_every={log_every} "
             f"micro_batch={micro_batch} grad_accum={grad_accum} "
-            f"context_length={context_length} tokens_per_update={tokens_per_update}"
+            f"context_length={context_length} bytes_per_update={bytes_per_update}"
         )
         if int(micro_batch) < 4:
             print(
@@ -438,7 +451,18 @@ def main() -> int:
             f"optimizer_step rolling_window={meter.window} log_every={log_every} "
             f"grad_accum={grad_accum}"
         )
-    print("[train] note=early tok/s includes compile/warmup; use logs after the rolling window fills for steady throughput")
+    steady_after_steps = int(cfg["logging"].get("steady_after_steps", meter.window))
+    profile_sections_every = int(cfg["logging"].get("profile_sections_every_steps", 0))
+    print(
+        "[train] note=early bytes/s includes compile/warmup; "
+        "use phase=steady logs for throughput decisions"
+    )
+    if profile_sections_every > 0:
+        print(
+            "[train] profile_sections=ON "
+            f"every={profile_sections_every} optimizer steps "
+            "(one no-grad patching probe; Arbor_ms is estimated from compiled forward time)"
+        )
 
     # checkpoint 保存時のサンプル生成 (任意)。学習を止めないよう失敗は警告に留める.
     sampling_cfg = cfg.get("sampling", {})
@@ -489,6 +513,58 @@ def main() -> int:
     # 「前回保存以降に best (EMA 最小) が更新されたか」。保存 step 単発の判定だと
     # 保存間に更新があっても symlink が動かない (best が古い step を指し続ける)
     best_improved_tensor = torch.tensor(False, device=device)
+    interval_t0 = time.perf_counter()
+    interval_bytes = 0
+    interval_patches_tensor: torch.Tensor | None = None
+    interval_max_patch_tensor: torch.Tensor | None = None
+    interval_cpu_ms = {
+        "batch_wait": 0.0,
+        "h2d": 0.0,
+        "step": 0.0,
+    }
+    cuda_records: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+        "forward": [],
+        "backward": [],
+        "optimizer": [],
+    }
+    cpu_records_ms = {
+        "forward": 0.0,
+        "backward": 0.0,
+        "optimizer": 0.0,
+    }
+    latest_section_profile: dict[str, float] | None = None
+    stop_notice_printed = False
+    interval_steps = 0
+    logs_emitted = 0
+
+    def start_gpu_section(name: str):
+        if device.type != "cuda":
+            return time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start
+
+    def end_gpu_section(name: str, start) -> None:
+        if device.type != "cuda":
+            cpu_records_ms[name] += (time.perf_counter() - start) * 1000.0
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        cuda_records[name].append((start, end))
+
+    def collect_section_ms() -> dict[str, float]:
+        if device.type != "cuda":
+            values = dict(cpu_records_ms)
+            for key in cpu_records_ms:
+                cpu_records_ms[key] = 0.0
+            return values
+        values = {
+            name: sum(start.elapsed_time(end) for start, end in records)
+            for name, records in cuda_records.items()
+        }
+        for records in cuda_records.values():
+            records.clear()
+        return values
 
     def make_data_iter():
         nonlocal pending_prefetch_batch
@@ -511,39 +587,72 @@ def main() -> int:
     data_iter = make_data_iter()
     while global_step < total_steps:
         try:
-            tokens_this_step = 0
+            step_t0 = time.perf_counter()
+            bytes_this_step = 0
             for micro in range(grad_accum):
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_next_batch", device)
+                t0 = time.perf_counter()
                 batch = next(data_iter)
+                interval_cpu_ms["batch_wait"] += (time.perf_counter() - t0) * 1000.0
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_batch_ready", device)
+                t0 = time.perf_counter()
                 if cuda_prefetch:
                     inputs = batch["input_ids"]
                     labels = batch["labels"]
                 else:
                     inputs = batch["input_ids"].to(device, non_blocking=True)
                     labels = batch["labels"].to(device, non_blocking=True)
+                interval_cpu_ms["h2d"] += (time.perf_counter() - t0) * 1000.0
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_batch_on_device", device)
-                tokens_this_step += inputs.numel()
+                bytes_this_step += inputs.numel()
+                interval_bytes += inputs.numel()
                 amp_context = (
                     torch.autocast(device_type=device.type, dtype=compute_dtype)
                     if use_autocast
                     else nullcontext()
                 )
+                do_section_profile = (
+                    profile_sections_every > 0
+                    and (logs_emitted == 0 or (global_step + 1) % profile_sections_every == 0)
+                    and micro == 0
+                    and hasattr(base_model, "profile_patching_sections")
+                )
                 with amp_context:
                     if global_step == 0:
                         timing_mark(f"step0_micro{micro}_before_forward", device)
+                    if do_section_profile:
+                        try:
+                            with torch.no_grad():
+                                latest_section_profile = base_model.profile_patching_sections(inputs)
+                        except RuntimeError as exc:
+                            latest_section_profile = {"profile_error": str(exc)[:200]}
+                            print(f"[train] WARNING: section profile failed: {exc}", flush=True)
+                    fwd_start = start_gpu_section("forward")
                     out = model(inputs)
+                    end_gpu_section("forward", fwd_start)
                     if global_step == 0:
                         timing_mark(f"step0_micro{micro}_forward_done", device)
                     loss = torch.nn.functional.cross_entropy(
                         out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
                     ) / grad_accum
+                if out.patch_count is not None:
+                    pc = out.patch_count.detach()
+                    interval_patches_tensor = pc if interval_patches_tensor is None else interval_patches_tensor + pc
+                if out.max_patch_count is not None:
+                    max_pc = out.max_patch_count.detach()
+                    interval_max_patch_tensor = (
+                        max_pc
+                        if interval_max_patch_tensor is None
+                        else torch.maximum(interval_max_patch_tensor, max_pc)
+                    )
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_backward", device)
+                bwd_start = start_gpu_section("backward")
                 loss.backward()
+                end_gpu_section("backward", bwd_start)
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_backward_done", device)
                 detached_loss = loss.detach()
@@ -552,19 +661,33 @@ def main() -> int:
                     if accum_loss_tensor is None
                     else accum_loss_tensor + detached_loss
                 )
+                if stop.requested and not stop_notice_printed:
+                    remaining = grad_accum - micro - 1
+                    print(
+                        "[train] stop requested during accumulation: "
+                        f"step={global_step + 1} micro={micro + 1}/{grad_accum}; "
+                        f"finishing {remaining} remaining microbatches before optimizer/save. "
+                        "Press again to force-exit.",
+                        flush=True,
+                    )
+                    stop_notice_printed = True
 
             if cfg["optim"].get("grad_clip"):
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg["optim"]["grad_clip"], foreach=True
                 )
+            opt_start = start_gpu_section("optimizer")
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            end_gpu_section("optimizer", opt_start)
 
             global_step += 1
+            interval_steps += 1
             if device.type == "cuda" and sync_each_step:
                 torch.cuda.synchronize()
-            meter.step(tokens_this_step)
+            meter.step(bytes_this_step)
+            interval_cpu_ms["step"] += (time.perf_counter() - step_t0) * 1000.0
 
             loss_for_step = (
                 accum_loss_tensor.detach().float()
@@ -588,14 +711,84 @@ def main() -> int:
             need_loss_scalar = global_step % log_every == 0 or should_save or args.dry_run
             cur_loss = float(loss_for_step.cpu()) if need_loss_scalar else None
 
-            if global_step % log_every == 0:
+            if need_loss_scalar:
                 assert cur_loss is not None
                 cur_ema = float(ema_loss_tensor.cpu())
                 cur_lr = scheduler.get_last_lr()[0]
-                cur_tok_s = meter.tokens_per_sec()
+                section_ms = collect_section_ms()
+                interval_dt = max(time.perf_counter() - interval_t0, 1e-9)
+                cur_bytes_s = interval_bytes / interval_dt
+                patch_count = (
+                    float(interval_patches_tensor.cpu())
+                    if interval_patches_tensor is not None
+                    else 0.0
+                )
+                cur_patches_s = patch_count / interval_dt if patch_count > 0 else 0.0
+                bytes_per_patch = interval_bytes / patch_count if patch_count > 0 else 0.0
+                seq_count = (
+                    interval_bytes / int(context_length)
+                    if context_length
+                    else 0.0
+                )
+                patches_per_seq = patch_count / seq_count if seq_count > 0 else 0.0
+                max_patch_per_seq = (
+                    float(interval_max_patch_tensor.cpu())
+                    if interval_max_patch_tensor is not None
+                    else 0.0
+                )
+                phase = (
+                    "steady"
+                    if global_step >= steady_after_steps and logs_emitted >= 2
+                    else "warmup"
+                )
+                patch_capacity = 0.0
+                max_patches = getattr(base_model, "max_patches", None)
+                if max_patches and context_length:
+                    patch_capacity = (interval_bytes / int(context_length)) * int(max_patches)
+                patch_util = patch_count / patch_capacity if patch_capacity > 0 else 0.0
+                max_patch_util = (
+                    max_patch_per_seq / int(max_patches)
+                    if max_patches
+                    else 0.0
+                )
+                patch_headroom = (
+                    int(max_patches) - max_patch_per_seq
+                    if max_patches
+                    else 0.0
+                )
+                denom_steps = max(interval_steps, 1)
+                fwd_ms = section_ms.get("forward", 0.0) / denom_steps
+                bwd_ms = section_ms.get("backward", 0.0) / denom_steps
+                opt_ms = section_ms.get("optimizer", 0.0) / denom_steps
+                batch_ms = interval_cpu_ms["batch_wait"] / denom_steps
+                h2d_ms = interval_cpu_ms["h2d"] / denom_steps
+                step_ms = interval_cpu_ms["step"] / denom_steps
+                profile_text = ""
+                if latest_section_profile:
+                    forward_micro_ms = fwd_ms / max(int(grad_accum), 1)
+                    if "arbor_ms" not in latest_section_profile and "profile_error" not in latest_section_profile:
+                        measured_overhead = (
+                            latest_section_profile.get("bytelm_ms", 0.0)
+                            + latest_section_profile.get("patching_ms", 0.0)
+                        )
+                        latest_section_profile["arbor_ms"] = max(0.0, forward_micro_ms - measured_overhead)
+                    profile_text = (
+                        " "
+                        f"ByteLM_ms={latest_section_profile.get('bytelm_ms', 0.0):.1f}"
+                        f" patching_ms={latest_section_profile.get('patching_ms', 0.0):.1f}"
+                        f" Arbor_ms={latest_section_profile.get('arbor_ms', 0.0):.1f}"
+                    )
+                    if "profile_error" in latest_section_profile:
+                        profile_text += " profile_error=1"
                 print(
                     f"step={global_step} loss={cur_loss:.4f} ema={cur_ema:.4f} "
-                    f"tok/s={cur_tok_s:.0f} lr={cur_lr:.2e}"
+                    f"bytes/s={cur_bytes_s:.0f} patches/s={cur_patches_s:.0f} "
+                    f"bytes/patch={bytes_per_patch:.2f} patches/seq={patches_per_seq:.0f} "
+                    f"max_patch/seq={max_patch_per_seq:.0f} patch_headroom={patch_headroom:.0f} "
+                    f"patch_util={patch_util * 100:.1f}% max_patch_util={max_patch_util * 100:.1f}% "
+                    f"fwd_ms={fwd_ms:.1f} bwd_ms={bwd_ms:.1f} opt_ms={opt_ms:.1f} "
+                    f"batch_ms={batch_ms:.1f} h2d_ms={h2d_ms:.1f} step_ms={step_ms:.1f} "
+                    f"phase={phase} lr={cur_lr:.2e}{profile_text}"
                 )
                 with metrics_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps({
@@ -603,9 +796,34 @@ def main() -> int:
                         "loss": round(cur_loss, 6),
                         "ema": round(cur_ema, 6),
                         "lr": cur_lr,
-                        "tok_s": round(cur_tok_s),
+                        "bytes_s": round(cur_bytes_s),
+                        "patches_s": round(cur_patches_s),
+                        "bytes_per_patch": round(bytes_per_patch, 6),
+                        "patches_per_seq": round(patches_per_seq, 6),
+                        "max_patch_per_seq": round(max_patch_per_seq, 6),
+                        "patch_headroom": round(patch_headroom, 6),
+                        "patch_util": round(patch_util, 6),
+                        "max_patch_util": round(max_patch_util, 6),
+                        "patch_capacity": round(patch_capacity, 3),
+                        "fwd_ms": round(fwd_ms, 3),
+                        "bwd_ms": round(bwd_ms, 3),
+                        "opt_ms": round(opt_ms, 3),
+                        "batch_ms": round(batch_ms, 3),
+                        "h2d_ms": round(h2d_ms, 3),
+                        "step_ms": round(step_ms, 3),
+                        "phase": phase,
+                        "section_profile": latest_section_profile,
                         "time": time.time(),
                     }) + "\n")
+                interval_t0 = time.perf_counter()
+                interval_bytes = 0
+                interval_steps = 0
+                interval_patches_tensor = None
+                interval_max_patch_tensor = None
+                logs_emitted += 1
+                for key in interval_cpu_ms:
+                    interval_cpu_ms[key] = 0.0
+                latest_section_profile = None
             accum_loss_tensor = None
 
             # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
@@ -661,8 +879,20 @@ def main() -> int:
             data_iter = make_data_iter()
             continue
 
+    if isinstance(data_iter, CudaBatchPrefetcher):
+        data_iter.close()
+    data_iter = None
+    if hasattr(train_loader, "shutdown_workers"):
+        train_loader.shutdown_workers()
     # 最終 prune の daemon スレッドが途中終了して checkpoint を部分削除しないよう待つ
     ckpt._await_thread()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        model = None
+        base_model = None
+        optimizer = None
+        scheduler = None
+        torch.cuda.empty_cache()
     return 0
 
 

@@ -21,7 +21,7 @@ patching_mode (3 択):
            凍結サブモジュールとして本体に内蔵され checkpoint にも一緒に入る。
 
 動的モード (space/entropy) の実装方式:
-  patch 数を max_patches (= max_bytes / min_patch_len) に固定 pad し、
+  patch 数を max_patches (既定は max_bytes / min_patch_len の worst-case) に固定 pad し、
   encoder/decoder は flat (B,T) のまま「同一 patch 内のみ許す」block 対角
   attention mask で処理する。これにより動的モードでも tensor 形状は固定。
   T が _WINDOW_CHUNK の倍数のときは T×T 密マスクの代わりに窓マスク
@@ -92,6 +92,8 @@ def _windowed_sdpa(
 @dataclass
 class ArborOutput:
     logits: torch.Tensor
+    patch_count: torch.Tensor | None = None
+    max_patch_count: torch.Tensor | None = None
 
 
 @dataclass
@@ -103,6 +105,7 @@ class ArborConfig:
     patch_size: int = 4            # static 用: 1 patch のバイト数
     min_patch_len: int = 2         # 動的用: これ未満では区切らない
     max_patch_len: int = 16        # 動的用: これに達したら強制的に区切る
+    max_patches: int | None = None # 動的用: 固定 pad する patch 数。None なら worst-case
     entropy_threshold: float = 1.5 # entropy 用: 次バイト H (nats) がこれを超えたら区切る
     entropy_model: dict | None = None       # entropy 用: ByteLM の構成 (inline dict)
     entropy_model_ckpt: str | None = None   # entropy 用: 初回構築時に重みを読む checkpoint dir
@@ -459,9 +462,16 @@ class ArborModel(nn.Module):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
         self.cfg = cfg
         self.dynamic = cfg.patching_mode != "static"
+        self.profile_sections = False
+        self._last_profile: dict[str, float] | None = None
         p, dl, dg = cfg.patch_size, cfg.local_hidden_size, cfg.hidden_size
         if self.dynamic:
-            self.max_patches = math.ceil(cfg.max_bytes / cfg.min_patch_len)
+            worst_case_patches = math.ceil(cfg.max_bytes / cfg.min_patch_len)
+            self.max_patches = cfg.max_patches or worst_case_patches
+            if self.max_patches <= 0 or self.max_patches > worst_case_patches:
+                raise ValueError(
+                    f"max_patches must be in [1, {worst_case_patches}], got {self.max_patches}"
+                )
         else:
             self.max_patches = (cfg.max_bytes + p - 1) // p
 
@@ -559,69 +569,160 @@ class ArborModel(nn.Module):
         logits = self.head(self.head_norm(d)).view(b, k * p, -1)
         if pad:
             logits = logits[:, :t]
-        return ArborOutput(logits=logits)
+        patch_count = torch.full((), b * k, dtype=torch.float32, device=logits.device)
+        max_patch_count = torch.full((), k, dtype=torch.float32, device=logits.device)
+        return ArborOutput(logits=logits, patch_count=patch_count, max_patch_count=max_patch_count)
 
     def _forward_dynamic(self, input_ids: torch.Tensor) -> ArborOutput:
         cfg = self.cfg
         b, t = input_ids.shape
+        profile_sections = bool(getattr(self, "profile_sections", False))
+        section_ms: dict[str, float] = {}
+
+        def timed_section(name: str, fn):
+            if not profile_sections:
+                return fn()
+            if input_ids.is_cuda:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                result = fn()
+                end.record()
+                end.synchronize()
+                section_ms[name] = section_ms.get(name, 0.0) + start.elapsed_time(end)
+                return result
+            start_t = time.perf_counter()
+            result = fn()
+            section_ms[name] = section_ms.get(name, 0.0) + (time.perf_counter() - start_t) * 1000.0
+            return result
+
         entropy_values = None
         if cfg.patching_mode == "entropy":
             if self.entropy_model is None:
                 raise ValueError("patching_mode=entropy には entropy_model が必要")
             # Keep only the data-dependent boundary walk out of torch.compile.
             # The frozen ByteLM itself is dense tensor work and benefits from compile.
-            entropy_values = self.entropy_model.next_byte_entropy(input_ids)
-        starts = compute_patch_starts(
-            input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
-            self.entropy_model, cfg.entropy_threshold, entropy_values,
-        )
-        patch_id = starts.long().cumsum(1) - 1             # (B, T) 各バイトの patch 番号
+            entropy_values = timed_section(
+                "bytelm_ms",
+                lambda: self.entropy_model.next_byte_entropy(input_ids),
+            )
+
+        def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
+            starts_local = compute_patch_starts(
+                input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
+                self.entropy_model, cfg.entropy_threshold, entropy_values,
+            )
+            # (B, T) 各バイトの patch 番号
+            return starts_local.long().cumsum(1) - 1, starts_local.sum(1).to(torch.float32)
+
+        patch_id, patch_counts = timed_section("patching_ms", build_patch_ids)
+        patch_count = patch_counts.sum()
+        max_patch_count = patch_counts.max()
         k = self.max_patches
+        torch._assert(
+            (patch_id < k).all(),
+            f"dynamic patch count exceeded max_patches={k}; increase model.max_patches",
+        )
 
-        x = self.byte_emb(input_ids)                       # (B, T, dl)
+        def run_arbor_body() -> torch.Tensor:
+            x = self.byte_emb(input_ids)                   # (B, T, dl)
 
-        # patch 内 attention マスク: T が chunk の倍数なら窓経路 (T×T を実体化
-        # しない)、端数 (生成 prefill 等) は従来の密マスク fallback
-        c, w = _WINDOW_CHUNK, cfg.max_patch_len
-        if t % c == 0 and t >= c:
-            # kv 側は両側 w を pad。pad 位置は patch_id=-1 で不一致を保証
-            qpid = patch_id.view(b, t // c, c)
-            kpid = F.pad(patch_id, (w, w), value=-1).unfold(1, c + 2 * w, c)
-            same_win = qpid.unsqueeze(3) == kpid.unsqueeze(2)  # (B, n, c, c+2w)
-            # 絶対位置: q = i*c + qi, kv = i*c - w + ki なので causal ⇔ qi + w >= ki
-            ar_q = torch.arange(c, device=x.device).unsqueeze(1)
-            ar_k = torch.arange(c + 2 * w, device=x.device).unsqueeze(0)
-            enc_mask: torch.Tensor | WindowMask = WindowMask(same_win, c, w)
-            dec_mask: torch.Tensor | WindowMask = WindowMask(same_win & (ar_q + w >= ar_k), c, w)
-        else:
-            same = patch_id.unsqueeze(2) == patch_id.unsqueeze(1)  # (B, T, T)
-            causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device))
-            enc_mask = same.unsqueeze(1)
-            dec_mask = (same & causal).unsqueeze(1)
+            # patch 内 attention マスク: T が chunk の倍数なら窓経路 (T×T を実体化
+            # しない)、端数 (生成 prefill 等) は従来の密マスク fallback
+            c, w = _WINDOW_CHUNK, cfg.max_patch_len
+            if t % c == 0 and t >= c:
+                # kv 側は両側 w を pad。pad 位置は patch_id=-1 で不一致を保証
+                qpid = patch_id.view(b, t // c, c)
+                kpid = F.pad(patch_id, (w, w), value=-1).unfold(1, c + 2 * w, c)
+                same_win = qpid.unsqueeze(3) == kpid.unsqueeze(2)  # (B, n, c, c+2w)
+                # 絶対位置: q = i*c + qi, kv = i*c - w + ki なので causal ⇔ qi + w >= ki
+                ar_q = torch.arange(c, device=x.device).unsqueeze(1)
+                ar_k = torch.arange(c + 2 * w, device=x.device).unsqueeze(0)
+                enc_mask: torch.Tensor | WindowMask = WindowMask(same_win, c, w)
+                dec_mask: torch.Tensor | WindowMask = WindowMask(same_win & (ar_q + w >= ar_k), c, w)
+            else:
+                same = patch_id.unsqueeze(2) == patch_id.unsqueeze(1)  # (B, T, T)
+                causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device))
+                enc_mask = same.unsqueeze(1)
+                dec_mask = (same & causal).unsqueeze(1)
 
-        # Local Encoder: patch 内 bidirectional (block 対角マスク)
-        h = x
-        for layer in self.encoder_layers:
-            h = self._maybe_ckpt(layer, h, enc_mask)
+            # Local Encoder: patch 内 bidirectional (block 対角マスク)
+            h = x
+            for layer in self.encoder_layers:
+                h = self._maybe_ckpt(layer, h, enc_mask)
 
-        # patch ごとに max-pool して (B, K, dl) へ。pad patch は 0 埋め
-        # (decoder から一切 gather されないため勾配は流れない)
-        idx = patch_id.unsqueeze(-1).expand(-1, -1, h.size(-1))
-        pooled = h.new_full((b, k, h.size(-1)), float("-inf"))
-        pooled.scatter_reduce_(1, idx, h, reduce="amax", include_self=True)
-        pooled = torch.where(torch.isinf(pooled), torch.zeros_like(pooled), pooled)
-        patches = self.patch_proj(pooled)                  # (B, K, dg)
+            # patch ごとに max-pool して (B, K, dl) へ。pad patch は 0 埋め
+            # (decoder から一切 gather されないため勾配は流れない)
+            idx = patch_id.unsqueeze(-1).expand(-1, -1, h.size(-1))
+            pooled = h.new_full((b, k, h.size(-1)), float("-inf"))
+            pooled.scatter_reduce_(1, idx, h, reduce="amax", include_self=True)
+            pooled = torch.where(torch.isinf(pooled), torch.zeros_like(pooled), pooled)
+            patches = self.patch_proj(pooled)              # (B, K, dg)
 
-        # global は plain causal でよい: 右シフト後、位置 j は patch j-1 を保持し、
-        # 使われる query t (有効 patch) に対して pad patch は必ず j > t 側に落ちる
-        g = self._run_global(patches)                      # (B, K, dl)
-        h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
+            # global は plain causal でよい: 右シフト後、位置 j は patch j-1 を保持し、
+            # 使われる query t (有効 patch) に対して pad patch は必ず j > t 側に落ちる
+            g = self._run_global(patches)                  # (B, K, dl)
+            h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
 
-        # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
-        d = x + h_byte
-        for layer in self.decoder_layers:
-            d = self._maybe_ckpt(layer, d, dec_mask)
-        return ArborOutput(logits=self.head(self.head_norm(d)))
+            # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
+            d = x + h_byte
+            for layer in self.decoder_layers:
+                d = self._maybe_ckpt(layer, d, dec_mask)
+            return self.head(self.head_norm(d))
+
+        logits = timed_section("arbor_ms", run_arbor_body)
+        if profile_sections:
+            self._last_profile = section_ms
+        return ArborOutput(
+            logits=logits,
+            patch_count=patch_count,
+            max_patch_count=max_patch_count,
+        )
+
+    @torch.no_grad()
+    def profile_patching_sections(self, input_ids: torch.Tensor) -> dict[str, float]:
+        """Measure entropy scoring and boundary construction without running Arbor body."""
+        if not self.dynamic:
+            return {}
+        cfg = self.cfg
+        section_ms: dict[str, float] = {}
+
+        def timed_section(name: str, fn):
+            if input_ids.is_cuda:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                result = fn()
+                end.record()
+                end.synchronize()
+                section_ms[name] = start.elapsed_time(end)
+                return result
+            start_t = time.perf_counter()
+            result = fn()
+            section_ms[name] = (time.perf_counter() - start_t) * 1000.0
+            return result
+
+        entropy_values = None
+        if cfg.patching_mode == "entropy":
+            if self.entropy_model is None:
+                raise ValueError("patching_mode=entropy には entropy_model が必要")
+            entropy_values = timed_section(
+                "bytelm_ms",
+                lambda: self.entropy_model.next_byte_entropy(input_ids),
+            )
+
+        def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
+            starts_local = compute_patch_starts(
+                input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
+                self.entropy_model, cfg.entropy_threshold, entropy_values,
+            )
+            return starts_local.long().cumsum(1) - 1, starts_local.sum(1).to(torch.float32)
+
+        patch_id, patch_counts = timed_section("patching_ms", build_patch_ids)
+        section_ms["patches_per_seq"] = float(patch_counts.float().mean().cpu())
+        section_ms["max_patch_per_seq"] = float(patch_counts.max().cpu())
+        section_ms["patch_id_max"] = float(patch_id.max().cpu() + 1)
+        return section_ms
 
     def _run_global(self, patches: torch.Tensor) -> torch.Tensor:
         """1 patch 右シフト + causal global を回し、local 次元へ射影して返す."""

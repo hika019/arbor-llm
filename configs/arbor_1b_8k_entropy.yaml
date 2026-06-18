@@ -5,21 +5,21 @@
 # 新規:   python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml
 # 再開:   python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml --resume latest
 #
-# static 版 (arbor_1b_8k.yaml) との違いは patching のみ。動的モードは patch 数を
-# max_bytes / min_patch_len に固定 pad して global を回す。threshold 2.0 の実 patch
-# 数は ~1900 だが pad 上限はこの式で決まるため、min_patch_len が global 系列長
-# (=速度/VRAM) と patch 粒度 (=品質) の両方を決める主ノブになる。
+# static 版 (arbor_1b_8k.yaml) との違いは patching のみ。動的モードは global 側を
+# max_patches に固定 pad して回す。未指定なら max_bytes / min_patch_len の worst-case。
+# 実 patch 数はデータに依存するため、bytes/patch, patches/seq, max_patch/seq,
+# patch_headroom をログで見ながら max_patches を詰める。
 #
 # 速度/品質バランスの実測 (RTX 4090 / WSL2, 窓 attention + compile ON, 定常値):
-#   min2/micro1: 24.3k tok/s, 17.5GiB, code patch 3.0B (最細)        → 200k ≈ 48 日
-#   min3/micro2: 43.3k tok/s, 20.5GiB, code patch 3.9B (法令は min2 と同一)→ 27 日  ★採用
-#   min4/micro2: 54.0k tok/s, 18.9GiB, code patch 5.2B (粗い)         → 22 日
+#   min2/micro1: 24.3k bytes/s, 17.5GiB, code patch 3.0B (最細)        → 200k ≈ 48 日
+#   min3/micro2: 43.3k bytes/s, 20.5GiB, code patch 3.9B (法令は min2 と同一)→ 27 日  ★採用
+#   min4/micro2: 54.0k bytes/s, 18.9GiB, code patch 5.2B (粗い)         → 22 日
 # min3 を採用 (速度ほぼ2倍で patch 粒度は最細に近い。性能>速度方針)。さらに速度が
 # 要るなら min_patch_len: 4 (+ micro2 維持) で 54k/22 日。
 #
 # 注1: micro2 は min2 だと VRAM 溢れ。min3 以上 (global 系列短縮) で初めて収まる。
-# 注2: compile_mode: max-autotune は逆効果 (step 330-355 実測 24k tok/s、
-#      rolling 表示も 14k tok/s 前後まで落ち、default の定常 ~46k tok/s を下回る)。
+# 注2: compile_mode: max-autotune は逆効果 (step 330-355 実測 24k bytes/s、
+#      rolling 表示も 14k bytes/s 前後まで落ち、default の定常 ~46k bytes/s を下回る)。
 #      autotune 候補探索中にエラー風ログが出ること自体はありうるが、本構成では
 #      速度面の採用理由が無い。
 # 注3: torch_compile と gradient_checkpointing の併用は torch 2.5 で backward が NaN
@@ -32,9 +32,10 @@ seed: 42
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
   patching_mode: entropy        # choices: static | space | entropy
-  min_patch_len: 3              # これ未満では区切らない (max_patches = ceil(8192/3) = 2731)
+  min_patch_len: 3              # これ未満では区切らない (worst-case patches = ceil(8192/3) = 2731)
   max_patch_len: 16             # これに達したら強制区切り
-  entropy_threshold: 2.0        # 次バイト H (nats)。混合加重で平均 ~4.3 bytes/patch
+  max_patches: 2304             # 固定 pad 上限。超過時は明示エラー (worst-case 2731)
+  entropy_threshold: 2.0        # 次バイト H (nats)。実効粒度は bytes/patch ログで確認する
   entropy_model:                # ByteLM の構成 (entropy_lm.yaml の model 節と一致させる)
     vocab_size: 260
     max_bytes: 32768
@@ -151,4 +152,6 @@ logging:
   wandb_project: arbor-llm
   log_every_steps: 5
   throughput_window: 50
+  steady_after_steps: 50
+  profile_sections_every_steps: 20
   best_ema_decay: 0.98
