@@ -994,9 +994,14 @@ def main() -> int:
             # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
             # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
             if should_save:
+                stop_save = stop.requested
                 validation_results: dict[str, float] | None = None
                 is_best = bool(best_improved_tensor.cpu())
-                if validation_enabled:
+                if stop_save and validation_enabled:
+                    print(
+                        "[train] stop checkpoint: skipping validation for fast shutdown"
+                    )
+                if validation_enabled and not stop_save:
                     val_t0 = time.perf_counter()
                     validation_results = evaluate_validation(
                         model,
