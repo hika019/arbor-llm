@@ -1,0 +1,190 @@
+# Arbor v2 1B / 8192 bytes entropy patching 版。
+# 軽量 ByteLM scorer (configs/entropy_lm_compact.yaml) を使う。
+
+run_name: arbor2_1b_8k_entropy_compact
+seed: 42
+
+model:
+  vocab_size: 260
+  patching_mode: entropy
+  min_patch_len: 3
+  max_patch_len: 16
+  entropy_threshold: 2.0        # 初期値。calibrate_entropy_threshold.py で校正する
+  entropy_model:
+    vocab_size: 260
+    max_bytes: 8192
+    hidden_size: 384
+    num_heads: 8
+    num_kv_heads: 2
+    intermediate_size: 1152
+    num_hidden_layers: 4
+    attention_window: 512
+    rope_theta: 10000.0
+    bitnet: false
+  entropy_model_ckpt: ./checkpoints/entropy_lm_compact/final
+  max_bytes: 8192
+  hidden_size: 2048
+  num_heads: 16
+  num_kv_heads: 4
+  intermediate_size: 5632
+  num_hidden_layers: 20
+  local_hidden_size: 768
+  local_num_heads: 12
+  local_num_kv_heads: 12
+  local_intermediate_size: 2048
+  num_local_encoder_layers: 2
+  num_local_decoder_layers: 4
+  rope_theta: 500000.0
+  norm_eps: 1.0e-5
+  bitnet: true
+  gradient_checkpointing: false
+
+data:
+  sources:
+    - id: fineweb2_ja
+      path: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.49
+    - id: wikipedia_ja
+      path: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      revision: main
+      license_policy: "CC BY-SA/GFDL attribution requirements"
+      weight_bytes: 0.07
+    - id: aozora_modern
+      path: "globis-university/aozorabunko-clean"
+      revision: main
+      license_policy: "Aozora public-domain/copyright-expired texts; prefer modern kana subset"
+      weight_bytes: 0.02
+      max_epochs: 3
+    - id: japan_law
+      path: "y2lan/japan-law"
+      text_column: "body"
+      revision: main
+      license_policy: "Japanese government legal text terms"
+      weight_bytes: 0.02
+      max_epochs: 5
+    - id: fineweb_edu_en
+      path: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.12
+    - id: fineweb_en
+      path: "HuggingFaceFW/fineweb"
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.05
+    - id: finemath_4plus
+      path: "HuggingFaceTB/finemath"
+      name: "finemath-4plus"
+      revision: main
+      license_policy: "dataset card terms; math web mixture"
+      weight_bytes: 0.06
+    - id: github_code_filtered
+      path: "loubnabnl/github-code-more-filtering"
+      text_column: "code"
+      revision: main
+      license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
+      weight_bytes: 0.15
+    - id: opc_code_web
+      path: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      revision: main
+      license_policy: "dataset card terms; code/web mixture"
+      weight_bytes: 0.02
+  streaming: true
+  packing: document
+  eos_token_id: 2
+  pad_token_id: 3
+  shuffle_buffer: 2000
+  context_length: 8192
+  num_workers: 0
+  prefetch_factor: 4
+  pin_memory: true
+
+optim:
+  optimizer: bnb_adamw_8bit
+  lr: 8.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  min_lr_ratio: 0.1
+  decay_end_ratio: 0.8
+  warmup_steps: 1000
+  total_steps: 200000
+
+speed:
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: true
+  torch_compile: true
+  compile_mode: default
+  cuda_prefetch: true
+  bitnet_weight_cache: auto
+  bitnet_weight_cache_gib: 1.25
+  bitnet_weight_cache_min_numel: 65536
+  sync_each_step: false
+  micro_batch_size: 2
+  grad_accum_steps: 32
+
+validation:
+  enabled: true
+  max_batches: 16
+  micro_batch_size: 2
+  domains:
+    ja_web:
+      source: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      revision: main
+      split: train
+      skip_samples: 200000
+    wikipedia_ja:
+      source: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      revision: main
+      split: train
+      skip_samples: 20000
+    english:
+      source: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      split: train
+      skip_samples: 200000
+    math:
+      source: "HuggingFaceTB/finemath"
+      name: "finemath-4plus"
+      revision: main
+      split: train
+      skip_samples: 20000
+    code:
+      source: "loubnabnl/github-code-more-filtering"
+      text_column: "code"
+      revision: main
+      split: train
+      skip_samples: 20000
+
+checkpoint:
+  dir: ./checkpoints/arbor2_1b_8k_entropy_compact
+  save_every_steps: 1000
+  keep_last_k: 3
+  keep_every_n_steps: 10000
+  async_save: false
+
+sampling:
+  enabled: true
+  prompts:
+    - "日本の四季は"
+    - "The most important thing in life is"
+    - "def fibonacci(n):"
+  max_new_bytes: 100
+  temperature: 0.8
+  top_p: 0.95
+  seed: 42
+
+logging:
+  wandb_project: arbor-llm
+  log_every_steps: 20
+  throughput_window: 50
+  best_ema_decay: 0.98

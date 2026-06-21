@@ -1,0 +1,127 @@
+# entropy patching 用の軽量 ByteLM。8k 本走向け。
+# 使い方:
+#   python -m src.train.train --config configs/entropy_lm_compact.yaml
+#   python scripts/calibrate_entropy_threshold.py \
+#     --config configs/arbor_1b_8k_entropy_compact.yaml \
+#     --checkpoint checkpoints/entropy_lm_compact/final \
+#     --target-bytes-per-patch 5.0 --write
+
+run_name: entropy_lm_compact
+seed: 2
+
+model:
+  arch: byte_lm
+  vocab_size: 260
+  max_bytes: 8192
+  hidden_size: 384
+  num_heads: 8
+  num_kv_heads: 2
+  intermediate_size: 1152
+  num_hidden_layers: 4
+  attention_window: 512
+  rope_theta: 10000.0
+  bitnet: false
+  gradient_checkpointing: false
+
+data:
+  sources:
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      weight: 0.31
+    - path: "range3/cc100-ja"
+      weight: 0.06
+    - path: "globis-university/aozorabunko-clean"
+      weight: 0.06
+    - path: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      weight: 0.04
+    - path: "y2lan/japan-law"
+      text_column: "body"
+      weight: 0.04
+    - path: "shidowake/chatbot-arena-ja_dedup_subset-5k"
+      weight: 0.05
+    - path: "sirgecko/dataset_japanesechatbot2"
+      weight: 0.04
+    - path: "sirgecko/dataset_japanesechatbot_sentence"
+      weight: 0.03
+    - path: "HuggingFaceFW/fineweb-edu"
+      weight: 0.07
+    - path: "manu/project_gutenberg"
+      split: "en"
+      weight: 0.03
+    - path: "vblagoje/cc_news"
+      weight: 0.02
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "kor_Hang"
+      weight: 0.015
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "deu_Latn"
+      weight: 0.015
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "fra_Latn"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "spa_Latn"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "cmn_Hani"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "rus_Cyrl"
+      weight: 0.012
+    - path: "HuggingFaceFW/fineweb-2"
+      name: "arb_Arab"
+      weight: 0.012
+    - path: "OpenAssistant/oasst1"
+      weight: 0.06
+    - path: "HuggingFaceTB/finemath"
+      name: "finemath-4plus"
+      weight: 0.03
+    - path: "loubnabnl/github-code-more-filtering"
+      text_column: "code"
+      weight: 0.05
+    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      weight: 0.02
+  streaming: true
+  shuffle_buffer: 2000
+  context_length: 8192
+  num_workers: 0
+  pin_memory: true
+  micro_batch_size: 8
+
+optim:
+  optimizer: adamw_fused
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  min_lr_ratio: 0.05
+  decay_end_ratio: 0.6
+  warmup_steps: 1000
+  total_steps: 500000
+
+speed:
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: false
+  torch_compile: true
+  cuda_prefetch: true
+  sync_each_step: false
+  micro_batch_size: 8
+  grad_accum_steps: 1
+
+checkpoint:
+  dir: ./checkpoints/entropy_lm_compact
+  save_every_steps: 1500
+  keep_last_k: 2
+  keep_every_n_steps: null
+  async_save: false
+
+sampling:
+  enabled: false
+
+logging:
+  log_every_steps: 50
+  throughput_window: 50
