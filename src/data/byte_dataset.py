@@ -320,8 +320,8 @@ class ByteStreamDataset(IterableDataset):
         off: int,
     ) -> Iterator[dict[str, torch.Tensor]]:
         pack: list[int] = []
+        pack_is_raw_byte: list[bool] = []
         boundary_label_positions: list[int] = []
-        raw_bytes_in_pack = 0
 
         def next_doc_bytes() -> bytes | None:
             while True:
@@ -343,15 +343,17 @@ class ByteStreamDataset(IterableDataset):
                 emitted_source_docs[source_idx] += 1
                 return data
 
-        def make_short_sample() -> dict[str, torch.Tensor]:
-            nonlocal pack, boundary_label_positions, raw_bytes_in_pack
-            seq = list(pack)
+        def make_sample(*, pad_final: bool = False) -> dict[str, torch.Tensor]:
+            nonlocal pack, pack_is_raw_byte, boundary_label_positions
+            seq = list(pack[:block])
+            raw_flags = list(pack_is_raw_byte[:block])
             labels_mask = torch.zeros(self.context_length, dtype=torch.bool)
             fill_tokens = min(sum(tok != self.pad_token_id for tok in seq[:self.context_length]), self.context_length)
             if len(seq) < block:
+                if not pad_final:
+                    raise RuntimeError("internal error: attempted to emit a short non-final pack")
                 seq.extend([self.pad_token_id] * (block - len(seq)))
-            else:
-                seq = seq[:block]
+                raw_flags.extend([False] * (block - len(raw_flags)))
             ids = torch.tensor(seq[:-1], dtype=torch.long)
             labels = torch.tensor(seq[1:], dtype=torch.long)
             for pos in boundary_label_positions:
@@ -359,11 +361,11 @@ class ByteStreamDataset(IterableDataset):
                     labels_mask[pos] = True
             labels_mask |= labels == self.pad_token_id
             labels[labels_mask] = -100
-            source_bytes = raw_bytes_in_pack
+            source_bytes = sum(raw_flags[:self.context_length])
             fill_ratio = fill_tokens / max(self.context_length, 1)
-            pack = []
-            boundary_label_positions = []
-            raw_bytes_in_pack = 0
+            pack = pack[block:]
+            pack_is_raw_byte = pack_is_raw_byte[block:]
+            boundary_label_positions = [pos - block for pos in boundary_label_positions if pos >= block]
             return {
                 "input_ids": ids,
                 "labels": labels,
@@ -376,33 +378,16 @@ class ByteStreamDataset(IterableDataset):
             raw = next_doc_bytes()
             if raw is None:
                 if pack:
-                    yield make_short_sample()
+                    yield make_sample(pad_final=True)
                 return
             tokens = [b + off for b in raw]
-            if len(tokens) >= block:
-                if pack:
-                    yield make_short_sample()
-                limit = len(tokens) - block + 1
-                for start in range(0, limit, block):
-                    seq = tokens[start:start + block]
-                    yield {
-                        "input_ids": torch.tensor(seq[:-1], dtype=torch.long),
-                        "labels": torch.tensor(seq[1:], dtype=torch.long),
-                        "source_id": torch.tensor(source_idx, dtype=torch.long),
-                        "fill_ratio": torch.tensor(1.0, dtype=torch.float32),
-                        "_source_bytes": self.context_length,
-                    }
-                continue
-
             doc_seq = tokens + [self.eos_token_id]
-            if pack and len(pack) + len(doc_seq) > block:
-                yield make_short_sample()
             if pack:
                 boundary_label_positions.append(len(pack) - 1)
             pack.extend(doc_seq)
-            raw_bytes_in_pack += len(raw)
-            if len(pack) == block:
-                yield make_short_sample()
+            pack_is_raw_byte.extend([True] * len(tokens) + [False])
+            while len(pack) >= block:
+                yield make_sample()
 
     def _iter_local_file(self, path_str: str) -> Iterator[dict[str, torch.Tensor]]:
         """ローカルファイルを mmap で参照し、context_length バイトずつ切り出す.

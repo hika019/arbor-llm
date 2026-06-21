@@ -149,3 +149,33 @@ def test_document_packing_masks_padding_labels(monkeypatch):
     assert sample["input_ids"].tolist() == [ord("a"), ord("b"), ord("c"), 2, 3, 3, 3, 3]
     assert sample["labels"].tolist() == [ord("b"), ord("c"), 2, -100, -100, -100, -100, -100]
     assert sample["fill_ratio"].item() == 0.5
+
+
+def test_document_packing_carries_over_instead_of_padding_when_more_docs_exist(monkeypatch):
+    ds = ByteStreamDataset(
+        sources=[{"path": "a", "weight_bytes": 1.0, "max_epochs": 1}],
+        context_length=6,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: (
+            [[{"text": "abc"}, {"text": "defgh"}, {"text": "ij"}]],
+            [{"path": "a", "weight_bytes": 1.0, "max_epochs": 1}],
+        ),
+    )
+
+    iterator = ds._iter_hf_document_packed()
+    first = next(iterator)
+    second = next(iterator)
+
+    assert first["input_ids"].tolist() == [ord("a"), ord("b"), ord("c"), 2, ord("d"), ord("e")]
+    assert first["labels"].tolist() == [ord("b"), ord("c"), 2, -100, ord("e"), ord("f")]
+    assert first["fill_ratio"].item() == 1.0
+    assert second["input_ids"].tolist() == [ord("g"), ord("h"), 2, ord("i"), ord("j"), 2]
+    assert second["labels"].tolist() == [ord("h"), 2, -100, ord("j"), 2, -100]
+    assert second["fill_ratio"].item() == 1.0
