@@ -121,6 +121,27 @@ def test_dynamic_forward_shape_and_grads(mode):
         assert all(not p.requires_grad for p in m.entropy_model.parameters())
 
 
+def test_bytelm_attention_window_matches_full_when_large():
+    torch.manual_seed(0)
+    base_cfg = dict(TINY_ENTROPY_LM, vocab_size=260, max_bytes=32)
+    full = ByteLM(base_cfg).eval()
+    windowed = ByteLM({**base_cfg, "attention_window": 32}).eval()
+    windowed.load_state_dict(full.state_dict())
+    x = torch.randint(4, 260, (2, 24))
+    with torch.inference_mode():
+        full_logits = full(x).logits
+        window_logits = windowed(x).logits
+    assert torch.allclose(window_logits, full_logits, atol=1e-5)
+
+
+def test_bytelm_attention_window_forward_shape():
+    torch.manual_seed(0)
+    m = ByteLM(dict(TINY_ENTROPY_LM, vocab_size=260, max_bytes=64, attention_window=8)).eval()
+    x = torch.randint(4, 260, (2, 32))
+    out = m(x)
+    assert out.logits.shape == (2, 32, 260)
+
+
 def test_space_boundaries():
     # "ab cd" -> 空白の直後 (c の位置) で新 patch
     ids = torch.tensor([[ord("a"), ord("b"), 0x20, ord("c"), ord("d")]]) + 4

@@ -355,6 +355,7 @@ def main() -> int:
     # checkpoint 保存とサンプル生成は compile 前のモデルで行う
     # (compile wrapper を保存すると state dict が _orig_mod. 付きになる)
     base_model = model
+    bitnet_cache_info: dict | None = None
 
     # ---- 重みのみの初期化 (--init-from): 長コンテキスト拡張などの continued pretraining ----
     # RoPE バッファは非永続 (config から再計算) なので max_bytes / rope_theta が
@@ -378,6 +379,34 @@ def main() -> int:
         print(
             f"[train] init_from={init_path} loaded in {time.perf_counter() - t0:.1f}s "
             "(weights only; optimizer/scheduler/step は新規)"
+        )
+
+    # ---- BitNet 訓練高速化: QKV/gate-up 融合と量子化重みcache ----
+    try:
+        from src.model.bitlinear import (
+            configure_bitlinear_training_cache,
+            refresh_bitlinear_training_cache,
+        )
+    except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
+        refresh_bitlinear_training_cache = None
+    else:
+        speed_cfg = cfg.get("speed", {})
+        bitnet_cache_info = configure_bitlinear_training_cache(
+            base_model,
+            enabled=speed_cfg.get("bitnet_weight_cache", "auto"),
+            grad_accum_steps=int(speed_cfg.get("grad_accum_steps", 1)),
+            max_cache_gib=speed_cfg.get("bitnet_weight_cache_gib", 1.25),
+            min_numel=int(speed_cfg.get("bitnet_weight_cache_min_numel", 65536)),
+        )
+        print(
+            "[train] bitnet_weight_cache="
+            f"{bitnet_cache_info['mode']} enabled={bitnet_cache_info['enabled']} "
+            f"cached_layers={bitnet_cache_info['cached_layers']}/"
+            f"{bitnet_cache_info['eligible_layers']} "
+            f"fused_groups={bitnet_cache_info['fused_groups']} "
+            f"cache={bitnet_cache_info['cache_gib']:.2f}GiB "
+            f"qkv_groups={bitnet_cache_info['qkv_groups']} "
+            f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
         )
 
     model = apply_compile_settings(model, cfg["speed"])
@@ -488,6 +517,10 @@ def main() -> int:
         meta, dl_state = ckpt.load(args.resume, base_model, optimizer, scheduler, map_location=device)
         print(f"[train] checkpoint loaded in {time.perf_counter() - t0:.1f}s")
         timing_mark("checkpoint_loaded", device)
+        if refresh_bitlinear_training_cache is not None:
+            refreshed = refresh_bitlinear_training_cache(base_model)
+            if refreshed:
+                print(f"[train] bitnet_weight_cache refreshed after resume layers={refreshed}")
         global_step = meta.global_step
         best_loss = meta.best_loss
         pending_prefetch_batch = None
@@ -780,6 +813,8 @@ def main() -> int:
                 )
             opt_start = start_gpu_section("optimizer")
             optimizer.step()
+            if refresh_bitlinear_training_cache is not None:
+                refresh_bitlinear_training_cache(base_model)
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             end_gpu_section("optimizer", opt_start)

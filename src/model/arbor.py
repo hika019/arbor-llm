@@ -109,6 +109,7 @@ class ArborConfig:
     entropy_threshold: float = 1.5 # entropy 用: 次バイト H (nats) がこれを超えたら区切る
     entropy_model: dict | None = None       # entropy 用: ByteLM の構成 (inline dict)
     entropy_model_ckpt: str | None = None   # entropy 用: 初回構築時に重みを読む checkpoint dir
+    attention_window: int | None = None     # ByteLM 用: causal attention を直近 N byte に制限
     # ---- local (byte 階層) ----
     local_hidden_size: int = 512
     local_num_heads: int = 8
@@ -225,9 +226,18 @@ class Attention(nn.Module):
         pos_offset: int = 0,
     ) -> torch.Tensor:
         b, t, _ = x.shape
-        q = self.wq(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.wk(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.wv(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        qkv_group = getattr(self, "_fast_qkv_group", None)
+        if self.training and qkv_group is not None and qkv_group.training_weight_cache_enabled:
+            q_width = self.n_heads * self.head_dim
+            kv_width = self.n_kv_heads * self.head_dim
+            q_raw, k_raw, v_raw = qkv_group(x).split((q_width, kv_width, kv_width), dim=-1)
+            q = q_raw.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+            k = k_raw.view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v_raw.view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        else:
+            q = self.wq(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+            k = self.wk(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.wv(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
         q, k = self.rope(q, k, pos_offset)
         is_incremental = False
         if kv_cache is not None:
@@ -268,8 +278,13 @@ class FeedForward(nn.Module):
         self.ffn_sub_norm = RMSNorm(hidden, norm_eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = F.relu(self.gate(x))
-        return self.down(self.ffn_sub_norm(a * a * self.up(x)))
+        group = getattr(self, "_fast_gate_up_group", None)
+        if self.training and group is not None and group.training_weight_cache_enabled:
+            gate, up = group(x).split((self.gate.out_features, self.up.out_features), dim=-1)
+        else:
+            gate, up = self.gate(x), self.up(x)
+        a = F.relu(gate)
+        return self.down(self.ffn_sub_norm(a * a * up))
 
 
 class Block(nn.Module):
@@ -323,6 +338,10 @@ class ByteLM(nn.Module):
         max_bytes = cfg.get("max_bytes", 2048)
         bitnet = cfg.get("bitnet", False)
         norm_eps = cfg.get("norm_eps", 1e-5)
+        attention_window = cfg.get("attention_window")
+        self.attention_window = None if attention_window is None else int(attention_window)
+        if self.attention_window is not None and self.attention_window <= 0:
+            raise ValueError("attention_window must be positive")
         rope = RotaryEmbedding(h // n_heads, max_bytes, cfg.get("rope_theta", 500000.0))
 
         self.embed = nn.Embedding(self.vocab_size, h)
@@ -339,14 +358,33 @@ class ByteLM(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> ArborOutput:
         x = self.embed(input_ids)
+        attn_mask = self._attention_mask(input_ids)
         for layer in self.layers:
             if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
 
-                x = checkpoint(layer, x, use_reentrant=False)
+                x = checkpoint(layer, x, attn_mask, use_reentrant=False)
             else:
-                x = layer(x)
+                x = layer(x, attn_mask)
         return ArborOutput(logits=self.head(self.norm(x)))
+
+    def _attention_mask(self, input_ids: torch.Tensor) -> "torch.Tensor | WindowMask | None":
+        if self.attention_window is None:
+            return None
+        b, t = input_ids.shape
+        w = min(int(self.attention_window), t)
+        c = _WINDOW_CHUNK
+        if t % c == 0 and t >= c:
+            ar_q = torch.arange(c, device=input_ids.device).view(1, 1, c, 1)
+            ar_k = torch.arange(c + 2 * w, device=input_ids.device).view(1, 1, 1, c + 2 * w)
+            chunk_start = (torch.arange(t // c, device=input_ids.device) * c).view(1, -1, 1, 1)
+            q_pos = chunk_start + ar_q
+            k_pos = chunk_start - w + ar_k
+            mask = (k_pos >= 0) & (k_pos <= q_pos) & (q_pos - k_pos < w)
+            return WindowMask(mask.expand(b, -1, -1, -1), c, w)
+        q = torch.arange(t, device=input_ids.device).unsqueeze(1)
+        k = torch.arange(t, device=input_ids.device).unsqueeze(0)
+        return ((k <= q) & (q - k < w)).view(1, 1, t, t)
 
     @torch.no_grad()
     def next_byte_entropy(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -452,6 +490,12 @@ class _LayerKVCache:
             self.k = torch.cat((self.k, k), dim=2)
             self.v = torch.cat((self.v, v), dim=2)
         return self.k, self.v
+
+    def trim(self, max_tokens: int) -> None:
+        if self.k is None or self.k.size(2) <= max_tokens:
+            return
+        self.k = self.k[:, :, -max_tokens:].contiguous()
+        self.v = self.v[:, :, -max_tokens:].contiguous()
 
 
 # -------------------------------------------------------------------- model
@@ -874,6 +918,8 @@ class ArborByteGenerator:
         x = lm.embed(torch.tensor([[byte_id]], dtype=torch.long, device=self.device))
         x = x.to(self.dtype)
         for layer, cache in zip(lm.layers, self.lm_caches):
+            if lm.attention_window is not None:
+                cache.trim(max(0, lm.attention_window - 1))
             x = layer(x, kv_cache=cache, pos_offset=pos)
         logp = F.log_softmax(lm.head(lm.norm(x)).float()[0, -1], dim=-1)
         self.prev_entropy = float(-(logp.exp() * logp).sum())

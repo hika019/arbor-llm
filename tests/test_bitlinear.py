@@ -5,7 +5,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.model.bitlinear import BitLinear, activation_quant, weight_quant
+from src.model.bitlinear import (
+    BitLinear,
+    BitLinearGroup,
+    activation_quant,
+    configure_bitlinear_training_cache,
+    weight_quant,
+)
 
 
 def test_weight_quant_is_ternary():
@@ -52,6 +58,73 @@ def test_ste_gradients_flow_through_quantization():
     x_q = activation_quant(x.detach())
     expected_grad_w = torch.ones(4, 16).t() @ x_q
     assert torch.allclose(lin.weight.grad, expected_grad_w, atol=1e-5)
+
+
+def test_training_weight_cache_matches_uncached_forward_and_grad():
+    torch.manual_seed(0)
+    uncached = BitLinear(32, 16)
+    cached = BitLinear(32, 16)
+    cached.load_state_dict(uncached.state_dict())
+    cached.enable_training_weight_cache(True)
+
+    x1 = torch.randn(4, 32, requires_grad=True)
+    x2 = x1.detach().clone().requires_grad_(True)
+    y1 = uncached(x1)
+    y2 = cached(x2)
+    assert torch.allclose(y2, y1, atol=1e-5)
+
+    y1.square().mean().backward()
+    y2.square().mean().backward()
+    assert torch.allclose(x2.grad, x1.grad, atol=1e-5)
+    assert torch.allclose(cached.weight.grad, uncached.weight.grad, atol=1e-5)
+
+
+def test_bitlinear_group_matches_individual_projections():
+    torch.manual_seed(0)
+    a = BitLinear(32, 16)
+    b = BitLinear(32, 24)
+    group = BitLinearGroup((a, b), kind="test")
+    group.enable_training_weight_cache(True)
+
+    x_group = torch.randn(3, 32, requires_grad=True)
+    x_ind = x_group.detach().clone().requires_grad_(True)
+    out_group = group(x_group)
+    out_ind = torch.cat((a(x_ind), b(x_ind)), dim=-1)
+    assert torch.allclose(out_group, out_ind, atol=1e-5)
+
+    out_group.square().sum().backward()
+    grad_x_group = x_group.grad.detach().clone()
+    grad_a_group = a.weight.grad.detach().clone()
+    grad_b_group = b.weight.grad.detach().clone()
+
+    a.weight.grad = None
+    b.weight.grad = None
+    out_ind.square().sum().backward()
+    assert torch.allclose(grad_x_group, x_ind.grad, atol=1e-5)
+    assert torch.allclose(grad_a_group, a.weight.grad, atol=1e-5)
+    assert torch.allclose(grad_b_group, b.weight.grad, atol=1e-5)
+
+
+def test_configure_training_cache_installs_projection_groups():
+    from src.model.arbor import ArborConfig, ArborModel
+
+    cfg = ArborConfig.from_dict(
+        dict(
+            vocab_size=260, patch_size=4, max_bytes=16,
+            hidden_size=32, num_heads=4, num_kv_heads=2, intermediate_size=64,
+            num_hidden_layers=1,
+            local_hidden_size=16, local_num_heads=2, local_num_kv_heads=2,
+            local_intermediate_size=32,
+            num_local_encoder_layers=1, num_local_decoder_layers=1,
+        )
+    )
+    model = ArborModel(cfg)
+    info = configure_bitlinear_training_cache(
+        model, enabled="fused", grad_accum_steps=2, max_cache_gib=0.01, min_numel=0
+    )
+    assert info["enabled"]
+    assert info["qkv_groups"] > 0
+    assert info["gate_up_groups"] > 0
 
 
 def test_bias_is_rejected():
