@@ -11,7 +11,11 @@ import torch
 
 
 def collate_packed(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    return {
+    out: dict[str, torch.Tensor] = {
         "input_ids": torch.stack([b["input_ids"] for b in batch], dim=0),
         "labels": torch.stack([b["labels"] for b in batch], dim=0),
     }
+    for key in ("source_id", "fill_ratio"):
+        if key in batch[0]:
+            out[key] = torch.stack([b[key] for b in batch], dim=0)
+    return out

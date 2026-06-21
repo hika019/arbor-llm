@@ -135,6 +135,69 @@ def should_restore_dataloader_state(saved_data_cfg: dict | None, current_data_cf
     return saved_data_cfg is None or saved_data_cfg == current_data_cfg
 
 
+@torch.no_grad()
+def evaluate_validation(
+    model: torch.nn.Module,
+    loaders: dict[str, object],
+    device: torch.device,
+    compute_dtype: torch.dtype,
+    use_autocast: bool,
+    max_batches: int,
+) -> dict[str, float]:
+    """Return domain bits-per-byte plus ``mean_bpb`` for configured loaders."""
+    was_training = model.training
+    model.eval()
+    results: dict[str, float] = {}
+    total_loss_sum = 0.0
+    total_labels = 0
+    amp_context = (
+        torch.autocast(device_type=device.type, dtype=compute_dtype)
+        if use_autocast
+        else nullcontext()
+    )
+    try:
+        for domain, loader in loaders.items():
+            loss_sum = 0.0
+            label_count = 0
+            iterator = iter(loader)
+            for _ in range(max_batches):
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
+                inputs = batch["input_ids"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
+                valid = labels != -100
+                n_valid = int(valid.sum().item())
+                if n_valid == 0:
+                    continue
+                with amp_context:
+                    out = model(inputs)
+                    loss = torch.nn.functional.cross_entropy(
+                        out.logits.flatten(0, 1),
+                        labels.flatten(),
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
+                loss_sum += float(loss.detach().cpu())
+                label_count += n_valid
+            if label_count > 0:
+                bpb = loss_sum / label_count / torch.log(torch.tensor(2.0)).item()
+                results[f"{domain}_bpb"] = bpb
+                total_loss_sum += loss_sum
+                total_labels += label_count
+            if hasattr(loader, "shutdown_workers"):
+                loader.shutdown_workers()
+        if total_labels > 0:
+            results["mean_bpb"] = (
+                total_loss_sum / total_labels / torch.log(torch.tensor(2.0)).item()
+            )
+        return results
+    finally:
+        if was_training:
+            model.train()
+
+
 class CudaBatchPrefetcher:
     """Move the next CPU batch to CUDA on a side stream while the current step runs."""
 
@@ -334,8 +397,37 @@ def main() -> int:
         data_cfg["micro_batch_size"] = speed_micro_batch
     else:
         data_cfg.setdefault("micro_batch_size", 4)
+    data_cfg.setdefault("seed", cfg.get("seed", 42))
     train_loader = build_byte_dataloader(data_cfg, split="train")
     timing_mark("dataloader_object_created", device)
+
+    validation_cfg = cfg.get("validation", {})
+    validation_loaders: dict[str, object] = {}
+    validation_enabled = bool(validation_cfg.get("enabled", False))
+    if validation_enabled:
+        domains = validation_cfg.get("domains", {})
+        if not domains:
+            raise SystemExit("[train] ERROR: validation.enabled=true だが validation.domains が空")
+        val_micro_batch = int(validation_cfg.get("micro_batch_size", data_cfg["micro_batch_size"]))
+        for domain_name, domain_cfg in domains.items():
+            val_data_cfg = dict(domain_cfg)
+            val_data_cfg.setdefault("context_length", data_cfg["context_length"])
+            val_data_cfg.setdefault("packing", data_cfg.get("packing", "concat"))
+            val_data_cfg.setdefault("byte_offset", data_cfg.get("byte_offset", 4))
+            val_data_cfg.setdefault("eos_token_id", data_cfg.get("eos_token_id", 2))
+            val_data_cfg.setdefault("pad_token_id", data_cfg.get("pad_token_id", 3))
+            val_data_cfg.setdefault("shuffle_buffer", 0)
+            val_data_cfg.setdefault("num_workers", 0)
+            val_data_cfg.setdefault("pin_memory", data_cfg.get("pin_memory", True))
+            val_data_cfg.setdefault("micro_batch_size", val_micro_batch)
+            val_data_cfg.setdefault("seed", cfg.get("seed", 42) + 10_000)
+            validation_loaders[domain_name] = build_byte_dataloader(val_data_cfg, split="validation")
+        print(
+            "[train] validation=ON domains={} max_batches={} best_metric=mean_bpb".format(
+                ",".join(validation_loaders.keys()),
+                int(validation_cfg.get("max_batches", 16)),
+            )
+        )
 
     # ---- optimizer / scheduler ----
     optimizer = build_optimizer(model.parameters(), cfg["optim"])
@@ -506,8 +598,8 @@ def main() -> int:
     optimizer.zero_grad(set_to_none=True)
     accum_loss_tensor: torch.Tensor | None = None
     best_loss_tensor = torch.tensor(best_loss, device=device, dtype=torch.float32)
-    # best 判定は単発 step ではなく EMA 損失で行う (train loss のノイズで
-    # "best" が偶然の低い step に張り付くのを防ぐ。validation best ではない点に注意)
+    # validation が無効な場合は EMA train loss を best に使う。validation が
+    # 有効なら checkpoint 保存時の mean bpb だけで best を更新する。
     ema_loss_tensor: torch.Tensor | None = None
     ema_decay = float(cfg["logging"].get("best_ema_decay", 0.98))
     # 「前回保存以降に best (EMA 最小) が更新されたか」。保存 step 単発の判定だと
@@ -517,6 +609,8 @@ def main() -> int:
     interval_bytes = 0
     interval_patches_tensor: torch.Tensor | None = None
     interval_max_patch_tensor: torch.Tensor | None = None
+    interval_fill_ratio_tensor: torch.Tensor | None = None
+    interval_fill_samples = 0
     interval_cpu_ms = {
         "batch_wait": 0.0,
         "h2d": 0.0,
@@ -609,6 +703,14 @@ def main() -> int:
                     timing_mark(f"step0_micro{micro}_batch_on_device", device)
                 bytes_this_step += inputs.numel()
                 interval_bytes += inputs.numel()
+                if "fill_ratio" in batch:
+                    fill_ratio = batch["fill_ratio"].detach().float()
+                    interval_fill_ratio_tensor = (
+                        fill_ratio.sum()
+                        if interval_fill_ratio_tensor is None
+                        else interval_fill_ratio_tensor + fill_ratio.sum()
+                    )
+                    interval_fill_samples += int(fill_ratio.numel())
                 amp_context = (
                     torch.autocast(device_type=device.type, dtype=compute_dtype)
                     if use_autocast
@@ -699,9 +801,10 @@ def main() -> int:
                 if ema_loss_tensor is None
                 else ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_for_step
             )
-            is_best_tensor = ema_loss_tensor < best_loss_tensor
-            best_improved_tensor = best_improved_tensor | is_best_tensor
-            best_loss_tensor = torch.minimum(best_loss_tensor, ema_loss_tensor)
+            if not validation_enabled:
+                is_best_tensor = ema_loss_tensor < best_loss_tensor
+                best_improved_tensor = best_improved_tensor | is_best_tensor
+                best_loss_tensor = torch.minimum(best_loss_tensor, ema_loss_tensor)
 
             should_save = (
                 global_step % save_every == 0
@@ -751,6 +854,11 @@ def main() -> int:
                     if max_patches
                     else 0.0
                 )
+                avg_fill_ratio = (
+                    float(interval_fill_ratio_tensor.cpu()) / interval_fill_samples
+                    if interval_fill_ratio_tensor is not None and interval_fill_samples > 0
+                    else 1.0
+                )
                 patch_headroom = (
                     int(max_patches) - max_patch_per_seq
                     if max_patches
@@ -780,12 +888,29 @@ def main() -> int:
                     )
                     if "profile_error" in latest_section_profile:
                         profile_text += " profile_error=1"
+                source_stats = (
+                    train_loader.source_stats()
+                    if hasattr(train_loader, "source_stats")
+                    else None
+                )
+                source_byte_ratios = None
+                if source_stats:
+                    emitted = source_stats.get("emitted_source_bytes") or []
+                    total_emitted = sum(float(v) for v in emitted)
+                    if total_emitted > 0:
+                        source_byte_ratios = {
+                            str(name): round(float(byte_count) / total_emitted, 6)
+                            for name, byte_count in zip(
+                                source_stats.get("source_names") or [], emitted
+                            )
+                        }
                 print(
                     f"step={global_step} loss={cur_loss:.4f} ema={cur_ema:.4f} "
                     f"bytes/s={cur_bytes_s:.0f} patches/s={cur_patches_s:.0f} "
                     f"bytes/patch={bytes_per_patch:.2f} patches/seq={patches_per_seq:.0f} "
                     f"max_patch/seq={max_patch_per_seq:.0f} patch_headroom={patch_headroom:.0f} "
                     f"patch_util={patch_util * 100:.1f}% max_patch_util={max_patch_util * 100:.1f}% "
+                    f"pack_fill={avg_fill_ratio * 100:.1f}% "
                     f"fwd_ms={fwd_ms:.1f} bwd_ms={bwd_ms:.1f} opt_ms={opt_ms:.1f} "
                     f"batch_ms={batch_ms:.1f} h2d_ms={h2d_ms:.1f} step_ms={step_ms:.1f} "
                     f"phase={phase} lr={cur_lr:.2e}{profile_text}"
@@ -804,6 +929,7 @@ def main() -> int:
                         "patch_headroom": round(patch_headroom, 6),
                         "patch_util": round(patch_util, 6),
                         "max_patch_util": round(max_patch_util, 6),
+                        "pack_fill": round(avg_fill_ratio, 6),
                         "patch_capacity": round(patch_capacity, 3),
                         "fwd_ms": round(fwd_ms, 3),
                         "bwd_ms": round(bwd_ms, 3),
@@ -813,6 +939,8 @@ def main() -> int:
                         "step_ms": round(step_ms, 3),
                         "phase": phase,
                         "section_profile": latest_section_profile,
+                        "source_byte_ratios": source_byte_ratios,
+                        "source_stats": source_stats,
                         "time": time.time(),
                     }) + "\n")
                 interval_t0 = time.perf_counter()
@@ -820,6 +948,8 @@ def main() -> int:
                 interval_steps = 0
                 interval_patches_tensor = None
                 interval_max_patch_tensor = None
+                interval_fill_ratio_tensor = None
+                interval_fill_samples = 0
                 logs_emitted += 1
                 for key in interval_cpu_ms:
                     interval_cpu_ms[key] = 0.0
@@ -829,8 +959,41 @@ def main() -> int:
             # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
             # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
             if should_save:
-                best_loss = float(best_loss_tensor.cpu())
+                validation_results: dict[str, float] | None = None
                 is_best = bool(best_improved_tensor.cpu())
+                if validation_enabled:
+                    val_t0 = time.perf_counter()
+                    validation_results = evaluate_validation(
+                        model,
+                        validation_loaders,
+                        device,
+                        compute_dtype,
+                        use_autocast,
+                        int(validation_cfg.get("max_batches", 16)),
+                    )
+                    mean_bpb = validation_results.get("mean_bpb")
+                    if mean_bpb is None:
+                        is_best = False
+                        print("[val] no valid labels; best not updated")
+                    else:
+                        val_score = torch.tensor(mean_bpb, device=device, dtype=torch.float32)
+                        is_best = bool((val_score < best_loss_tensor).cpu())
+                        best_loss_tensor = torch.minimum(best_loss_tensor, val_score)
+                        parts = " ".join(
+                            f"{k}={v:.4f}" for k, v in sorted(validation_results.items())
+                        )
+                        print(
+                            f"[val] step={global_step} {parts} "
+                            f"elapsed={time.perf_counter() - val_t0:.1f}s"
+                        )
+                    with metrics_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "step": global_step,
+                            "validation": validation_results,
+                            "best_metric": "validation_mean_bpb",
+                            "time": time.time(),
+                        }) + "\n")
+                best_loss = float(best_loss_tensor.cpu())
                 best_improved_tensor = torch.tensor(False, device=device)
                 meta = CheckpointMeta(
                     global_step=global_step,
@@ -844,6 +1007,10 @@ def main() -> int:
                     extra={
                         "git": git_info,
                         "run": run_info,
+                        "best_metric": (
+                            "validation_mean_bpb" if validation_enabled else "train_ema_loss"
+                        ),
+                        "validation": validation_results,
                     },
                 )
                 dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None

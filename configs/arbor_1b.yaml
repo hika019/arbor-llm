@@ -3,8 +3,8 @@
 # 新規:   python -m src.train.train --config configs/arbor_1b.yaml
 # 再開:   python -m src.train.train --config configs/arbor_1b.yaml --resume latest
 #
-# 約 0.95B params。静的 patching (9 bytes/patch) で形状固定 → torch.compile 常時 ON。
-# 8190 bytes ≈ 8k context。日本語ではおおむね 3 文字/patch、global は 910 patches。
+# 約 0.95B params。静的 patching (8 bytes/patch) で形状固定 → torch.compile 常時 ON。
+# 8192 bytes ≈ 8k context。global は 1024 patches。
 
 run_name: arbor2_1b
 seed: 42
@@ -12,8 +12,8 @@ seed: 42
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
   patching_mode: static         # choices: static | space | entropy
-  patch_size: 9                 # 1 patch = 9 bytes (静的)
-  max_bytes: 8190               # 学習 context (bytes) = 910 patches
+  patch_size: 8                 # 1 patch = 8 bytes (静的)
+  max_bytes: 8192               # 学習 context (bytes) = 1024 patches
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
   num_heads: 16
@@ -34,19 +34,67 @@ model:
   gradient_checkpointing: false # 活性が小さいので不要。OOM 時のみ true
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
-# 日本語主軸の混合: 日本語 60% + 英語 40% (うち news 15%)
+# 8K 本走と同じ byte 比率・document packing。cc_news / cc100-ja は使わない。
 data:
   sources:
-    - path: "HuggingFaceFW/fineweb-2"   # 日本語 web (NHK 等 news 含む)
+    - id: fineweb2_ja
+      path: "HuggingFaceFW/fineweb-2"
       name: "jpn_Jpan"
-      weight: 0.60
-    - path: "vblagoje/cc_news"          # 英語 news (CommonCrawl News)
-      weight: 0.15
-    - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
-      weight: 0.25
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.49
+    - id: wikipedia_ja
+      path: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      revision: main
+      license_policy: "CC BY-SA/GFDL attribution requirements"
+      weight_bytes: 0.07
+    - id: aozora_modern
+      path: "globis-university/aozorabunko-clean"
+      revision: main
+      license_policy: "Aozora public-domain/copyright-expired texts; prefer modern kana subset"
+      weight_bytes: 0.02
+      max_epochs: 3
+    - id: japan_law
+      path: "y2lan/japan-law"
+      text_column: "body"
+      revision: main
+      license_policy: "Japanese government legal text terms"
+      weight_bytes: 0.02
+      max_epochs: 5
+    - id: fineweb_edu_en
+      path: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.12
+    - id: fineweb_en
+      path: "HuggingFaceFW/fineweb"
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.05
+    - id: finemath_4plus
+      path: "HuggingFaceTB/finemath"
+      name: "finemath-4plus"
+      revision: main
+      license_policy: "dataset card terms; math web mixture"
+      weight_bytes: 0.06
+    - id: github_code_filtered
+      path: "loubnabnl/github-code-more-filtering"
+      text_column: "code"
+      revision: main
+      license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
+      weight_bytes: 0.15
+    - id: opc_code_web
+      path: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      revision: main
+      license_policy: "dataset card terms; code/web mixture"
+      weight_bytes: 0.02
   streaming: true
+  packing: document
+  eos_token_id: 2
+  pad_token_id: 3
   shuffle_buffer: 2000
-  context_length: 8190          # bytes。patch_size の倍数にする
+  context_length: 8192          # bytes。patch_size の倍数にする
   num_workers: 0                # 正確 resume は単一プロセス前提
   prefetch_factor: 4
   pin_memory: true
@@ -74,7 +122,7 @@ speed:
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
   sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
-  micro_batch_size: 2           # p9 で global 系列 910。OOM 時は 1 に下げて accum を 64 へ
+  micro_batch_size: 2           # p8 で global 系列 1024。OOM 時は 1 に下げて accum を 64 へ
   grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)
 
 checkpoint:

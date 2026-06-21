@@ -105,3 +105,47 @@ def test_local_file_resume_uses_byte_offset_without_double_skip(tmp_path):
     # block 単位 stride (重複なし): 1 サンプル目 "abcd" の次は "efgh"
     assert first["input_ids"].tolist() == [ord("a"), ord("b"), ord("c")]
     assert second["input_ids"].tolist() == [ord("e"), ord("f"), ord("g")]
+
+
+def test_document_packing_masks_cross_document_label(monkeypatch):
+    ds = ByteStreamDataset(
+        sources=[{"path": "a", "weight_bytes": 1.0}],
+        context_length=6,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: ([[{"text": "abc"}, {"text": "de"}]], [{"path": "a", "weight_bytes": 1.0}]),
+    )
+
+    sample = next(ds._iter_hf_document_packed())
+
+    assert sample["input_ids"].tolist() == [ord("a"), ord("b"), ord("c"), 2, ord("d"), ord("e")]
+    assert sample["labels"].tolist() == [ord("b"), ord("c"), 2, -100, ord("e"), 2]
+    assert sample["fill_ratio"].item() == 1.0
+
+
+def test_document_packing_masks_padding_labels(monkeypatch):
+    ds = ByteStreamDataset(
+        sources=[{"path": "a", "weight_bytes": 1.0, "max_epochs": 1}],
+        context_length=8,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: ([[{"text": "abc"}]], [{"path": "a", "weight_bytes": 1.0, "max_epochs": 1}]),
+    )
+
+    sample = next(ds._iter_hf_document_packed())
+
+    assert sample["input_ids"].tolist() == [ord("a"), ord("b"), ord("c"), 2, 3, 3, 3, 3]
+    assert sample["labels"].tolist() == [ord("b"), ord("c"), 2, -100, -100, -100, -100, -100]
+    assert sample["fill_ratio"].item() == 0.5

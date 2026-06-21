@@ -114,27 +114,6 @@ python -m src.train.train --config configs/arbor_1b.yaml --resume latest
   `ByteLM_ms` / `patching_ms` を no-grad probe で同期計測し、`Arbor_ms` は
   compiled forward 時間からの概算として出す。
 
-### 長コンテキスト学習 (8k ベース → 32k 拡張)
-
-`configs/arbor_1b_8k.yaml` は 8192 bytes (≈2k トークン等価) のベース学習で、
-code (codeparrot-clean / opc-fineweb-code-corpus) と math (finemath) を混合に含む。
-完了後に `configs/arbor_1b_32k.yaml` で 32768 bytes (≈8k トークン等価) へ拡張する:
-
-```bash
-# 1. 8k ベース本走 (実効バッチは arbor_1b.yaml と同じ 131k bytes/update)
-python -m src.train.train --config configs/arbor_1b_8k.yaml
-
-# 2. 32k 拡張 (重みのみ引き継ぐ continued pretraining。本走の ~10% step)
-python -m src.train.train --config configs/arbor_1b_32k.yaml \
-    --init-from ./checkpoints/arbor2_1b_8k/final
-```
-
-`--init-from` は model.safetensors の重みだけを読み、step / optimizer /
-scheduler / dataloader は新規に始める (`--resume` は全状態を復元するので
-拡張 run には使わない)。RoPE バッファは非永続 (config から再計算) なので、
-`max_bytes` / `rope_theta` を変えた config でもそのまま strict ロードできる。
-拡張側は rope_theta 500k→2M (NTK 流スケーリング) + 低 LR + 長文書多めの混合。
-
 ### entropy patching を使う手順 (区切り用 LM の学習)
 
 entropy モードは「次バイトの予測しにくさ」を測る小型バイト LM (ByteLM) を

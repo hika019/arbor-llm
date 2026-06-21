@@ -69,33 +69,62 @@ model:
 # ---- データ: static 版と同一混合 (ByteLM はこの上位集合で学習済み) ----
 data:
   sources:
-    # ---- 日本語 0.60 ----
-    - path: "HuggingFaceFW/fineweb-2"   # 日本語 web
+    - id: fineweb2_ja
+      path: "HuggingFaceFW/fineweb-2"   # 日本語 web
       name: "jpn_Jpan"
-      weight: 0.41
-    - path: "y2lan/japan-law"           # 法令 (条文体。小規模だが all_exhausted で循環)
-      text_column: "body"
-      weight: 0.00
-    - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
-      weight: 0.01
-    - path: "wikimedia/wikipedia"       # 百科事典文体
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.49
+    - id: wikipedia_ja
+      path: "wikimedia/wikipedia"
       name: "20231101.ja"
-      weight: 0.18
-    # ---- 英語 0.17 ----
-    - path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
-      weight: 0.13
-    - path: "vblagoje/cc_news"          # 英語 news
-      weight: 0.04
-    # ---- code / math 0.23 ----
-    - path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
+      revision: main
+      license_policy: "CC BY-SA/GFDL attribution requirements"
+      weight_bytes: 0.07
+    - id: aozora_modern
+      path: "globis-university/aozorabunko-clean"
+      revision: main
+      license_policy: "Aozora public-domain/copyright-expired texts; prefer modern kana subset"
+      weight_bytes: 0.02
+      max_epochs: 3
+    - id: japan_law
+      path: "y2lan/japan-law"           # 法令 (条文体。小規模)
+      text_column: "body"
+      revision: main
+      license_policy: "Japanese government legal text terms"
+      weight_bytes: 0.02
+      max_epochs: 5
+    - id: fineweb_edu_en
+      path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.12
+    - id: fineweb_en
+      path: "HuggingFaceFW/fineweb"
+      revision: main
+      license_policy: "dataset card terms; web crawl mixture"
+      weight_bytes: 0.05
+    - id: finemath_4plus
+      path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
       name: "finemath-4plus"
-      weight: 0.08
-    - path: "loubnabnl/github-code-more-filtering"  # 多言語 GitHub コード (32 言語)
+      revision: main
+      license_policy: "dataset card terms; math web mixture"
+      weight_bytes: 0.06
+    - id: github_code_filtered
+      path: "loubnabnl/github-code-more-filtering"  # license/generated/vendor/secret/dup filter 前提
       text_column: "code"
-      weight: 0.10
-    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.05
+      revision: main
+      license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
+      weight_bytes: 0.15
+    - id: opc_code_web
+      path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
+      revision: main
+      license_policy: "dataset card terms; code/web mixture"
+      weight_bytes: 0.02
   streaming: true
+  packing: document
+  eos_token_id: 2
+  pad_token_id: 3
   shuffle_buffer: 2000
   context_length: 8192          # bytes
   num_workers: 0                # 正確 resume は単一プロセス前提
@@ -114,7 +143,7 @@ optim:
   min_lr_ratio: 0.1            # lr 下限 = ピークの 10% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
-  total_steps: 100000
+  total_steps: 200000
 
 # ---- スループット ----
 speed:
@@ -127,6 +156,41 @@ speed:
   sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
   micro_batch_size: 2           # min3 で global 系列が縮み micro2 が収まる (peak 20.5GiB 実測)
   grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update, static 版と同じ)
+
+validation:
+  enabled: true
+  max_batches: 16
+  micro_batch_size: 2
+  domains:
+    ja_web:
+      source: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      revision: main
+      split: train
+      skip_samples: 200000
+    wikipedia_ja:
+      source: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      revision: main
+      split: train
+      skip_samples: 20000
+    english:
+      source: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      split: train
+      skip_samples: 200000
+    math:
+      source: "HuggingFaceTB/finemath"
+      name: "finemath-4plus"
+      revision: main
+      split: train
+      skip_samples: 20000
+    code:
+      source: "loubnabnl/github-code-more-filtering"
+      text_column: "code"
+      revision: main
+      split: train
+      skip_samples: 20000
 
 checkpoint:
   dir: ./checkpoints/arbor2_1b_8k_entropy
@@ -152,5 +216,5 @@ logging:
   log_every_steps: 25
   throughput_window: 50
   steady_after_steps: 50
-  profile_sections_every_steps: 20
+  profile_sections_every_steps: 0
   best_ema_decay: 0.98

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import mmap
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -37,7 +38,14 @@ class ByteStreamDataset(IterableDataset):
     def __init__(self, source: str | None = None, context_length: int = 2048,
                  split: str = "train", shuffle_buffer: int = 0,
                  text_column: str = "text", byte_offset: int = 4,
-                 sources: list[dict[str, Any]] | None = None) -> None:
+                 sources: list[dict[str, Any]] | None = None,
+                 packing: str = "concat",
+                 eos_token_id: int = 2,
+                 pad_token_id: int = 3,
+                 seed: int = 42,
+                 skip_samples: int = 0,
+                 name: str | None = None,
+                 revision: str | None = None) -> None:
         """byte_offset: バイト値 b を token id (b + offset) に写す.
 
         BLT は 0..3 を BOE/BOS/EOS/BPE の特殊 ID として使い, 生バイトは
@@ -64,7 +72,14 @@ class ByteStreamDataset(IterableDataset):
         self.split = split
         self.shuffle_buffer = shuffle_buffer
         self.text_column = text_column
+        self.name = name
+        self.revision = revision
         self.byte_offset = byte_offset
+        self.packing = packing
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.seed = seed
+        self.skip_samples = skip_samples
         self._state = _ResumeState()
 
     # --- state_dict: 学習ループから保存/復元される -----------------------
@@ -80,6 +95,11 @@ class ByteStreamDataset(IterableDataset):
         if self.source is not None and self.source.startswith("file:"):
             yield from self._iter_local_file(self.source[len("file:"):])
             return
+        if self.packing == "document":
+            yield from self._iter_hf_document_packed()
+            return
+        if self.packing != "concat":
+            raise ValueError(f"unknown data.packing: {self.packing}")
         yield from self._iter_hf_stream()
 
     def _build_hf_stream(self):
@@ -91,17 +111,25 @@ class ByteStreamDataset(IterableDataset):
         """
         from datasets import load_dataset
 
-        def _one(path, name, col, split):
-            ds = load_dataset(path, name=name, split=split, streaming=True)
+        def _one(path, name, col, split, revision=None, skip_samples=0):
+            kwargs = {"split": split, "streaming": True}
+            if revision:
+                kwargs["revision"] = revision
+            ds = load_dataset(path, name=name, **kwargs)
             if col != "text":
                 ds = ds.rename_column(col, "text")
             ds = ds.select_columns(["text"])  # スキーマ衝突回避 (混合時)
+            if skip_samples:
+                ds = ds.skip(int(skip_samples))
             return ds
 
         if not self.sources:
-            ds = _one(self.source, None, self.text_column, self.split)
+            ds = _one(
+                self.source, self.name, self.text_column, self.split,
+                self.revision, self.skip_samples,
+            )
             if self.shuffle_buffer > 0:
-                ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=42)
+                ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
             return ds
 
         from datasets import interleave_datasets
@@ -112,20 +140,57 @@ class ByteStreamDataset(IterableDataset):
                 s["path"], s.get("name"),
                 s.get("text_column", self.text_column),
                 s.get("split", self.split),
+                s.get("revision"),
+                s.get("skip_samples", self.skip_samples),
             ))
-            weights.append(float(s.get("weight", 1.0)))
+            weights.append(float(s.get("weight_bytes", s.get("weight", 1.0))))
         total = sum(weights) or 1.0
         probs = [w / total for w in weights]
         # all_exhausted: 巨大コーパスでは実質無限。比率を保ちつつ枯渇分は再サンプル.
         ds = interleave_datasets(
-            streams, probabilities=probs, seed=42,
+            streams, probabilities=probs, seed=self.seed,
             stopping_strategy="all_exhausted",
         )
         if self.shuffle_buffer > 0:
             # source ごとに shuffle すると buffer_size * source数 の行を保持し、
             # WSL の小さめの RAM 上限では OOM になりやすい。混合後に一度だけ shuffle する。
-            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=42)
+            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
         return ds
+
+    def _build_hf_source_streams(self):
+        """Return per-source HF streams normalized to a ``text`` column."""
+        from datasets import load_dataset
+
+        specs = self.sources or [{
+            "path": self.source,
+            "name": self.name,
+            "revision": self.revision,
+            "text_column": self.text_column,
+            "split": self.split,
+            "weight_bytes": 1.0,
+        }]
+        streams = []
+        for idx, s in enumerate(specs):
+            kwargs = {
+                "split": s.get("split", self.split),
+                "streaming": True,
+            }
+            if s.get("revision"):
+                kwargs["revision"] = s["revision"]
+            ds = load_dataset(s["path"], name=s.get("name"), **kwargs)
+            col = s.get("text_column", self.text_column)
+            if col != "text":
+                ds = ds.rename_column(col, "text")
+            ds = ds.select_columns(["text"])
+            skip_samples = int(s.get("skip_samples", self.skip_samples))
+            if skip_samples:
+                ds = ds.skip(skip_samples)
+            if self.shuffle_buffer > 0:
+                # Divide the configured buffer across sources to avoid multiplying memory use.
+                per_source_buffer = max(1, self.shuffle_buffer // max(len(specs), 1))
+                ds = ds.shuffle(buffer_size=per_source_buffer, seed=self.seed + idx)
+            streams.append(ds)
+        return streams, [dict(s) for s in specs]
 
     def _iter_hf_stream(self) -> Iterator[dict[str, torch.Tensor]]:
         try:
@@ -169,6 +234,175 @@ class ByteStreamDataset(IterableDataset):
                     self._state.extra["hf_state"] = row_state
                     self._state.extra["ring"] = bytes(ring)
                 yield {"input_ids": ids, "labels": tgt}
+
+    def _iter_hf_document_packed(self) -> Iterator[dict[str, torch.Tensor]]:
+        """Yield fixed-length samples while preserving document boundaries.
+
+        Short documents are packed as ``doc EOS doc EOS ...``. Labels whose
+        target crosses from an EOS token into the next document are masked with
+        ``-100``. Until model-side attention reset exists, each sample contains
+        documents from only one source.
+        """
+        try:
+            streams, specs = self._build_hf_source_streams()
+        except ImportError as e:
+            raise RuntimeError("`datasets` が必要 (pip install datasets)") from e
+
+        source_iters = [iter(ds) for ds in streams]
+        weights = [float(s.get("weight_bytes", s.get("weight", 1.0))) for s in specs]
+        total_weight = sum(weights) or 1.0
+        probs = [w / total_weight for w in weights]
+        emitted_source_bytes = list(
+            self._state.extra.get("emitted_source_bytes", [0 for _ in specs])
+        )
+        emitted_source_docs = list(
+            self._state.extra.get("emitted_source_docs", [0 for _ in specs])
+        )
+        source_epochs = list(self._state.extra.get("source_epochs", [0 for _ in specs]))
+        active = [True for _ in specs]
+        rng = random.Random(self.seed + self._state.samples_emitted)
+        off = self.byte_offset
+        block = self.context_length + 1
+        source_names = [
+            s.get("id") or s.get("name") or s.get("path") or f"source_{i}"
+            for i, s in enumerate(specs)
+        ]
+        source_generators = [
+            self._source_document_samples(
+                idx, streams, source_iters, specs, source_epochs,
+                emitted_source_docs, block, off,
+            )
+            for idx in range(len(specs))
+        ]
+
+        def choose_source() -> int | None:
+            live = [i for i, is_active in enumerate(active) if is_active]
+            if not live:
+                return None
+            if sum(emitted_source_bytes[i] for i in live) == 0:
+                return rng.choices(live, weights=[probs[i] for i in live], k=1)[0]
+            return min(live, key=lambda i: emitted_source_bytes[i] / max(probs[i], 1e-12))
+
+        while True:
+            idx = choose_source()
+            if idx is None:
+                return
+            try:
+                sample = next(source_generators[idx])
+            except StopIteration:
+                active[idx] = False
+                continue
+            source_bytes = int(sample.pop("_source_bytes"))
+            emitted_source_bytes[idx] += source_bytes
+            self._state.samples_emitted += 1
+            stats = {
+                "source_names": source_names,
+                "target_byte_probs": probs,
+                "emitted_source_bytes": emitted_source_bytes,
+                "emitted_source_docs": emitted_source_docs,
+                "source_epochs": source_epochs,
+            }
+            self._state.extra["source_stats"] = stats
+            self._state.extra["emitted_source_bytes"] = emitted_source_bytes
+            self._state.extra["emitted_source_docs"] = emitted_source_docs
+            self._state.extra["source_epochs"] = source_epochs
+            yield sample
+
+    def _source_document_samples(
+        self,
+        source_idx: int,
+        streams: list[Any],
+        source_iters: list[Iterator],
+        specs: list[dict[str, Any]],
+        source_epochs: list[int],
+        emitted_source_docs: list[int],
+        block: int,
+        off: int,
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        pack: list[int] = []
+        boundary_label_positions: list[int] = []
+        raw_bytes_in_pack = 0
+
+        def next_doc_bytes() -> bytes | None:
+            while True:
+                try:
+                    row = next(source_iters[source_idx])
+                except StopIteration:
+                    source_epochs[source_idx] += 1
+                    max_epochs = specs[source_idx].get("max_epochs")
+                    if max_epochs is not None and source_epochs[source_idx] >= int(max_epochs):
+                        return None
+                    source_iters[source_idx] = iter(streams[source_idx])
+                    continue
+                text = row.get("text")
+                if not text:
+                    continue
+                data = text.encode("utf-8", errors="ignore")
+                if not data:
+                    continue
+                emitted_source_docs[source_idx] += 1
+                return data
+
+        def make_short_sample() -> dict[str, torch.Tensor]:
+            nonlocal pack, boundary_label_positions, raw_bytes_in_pack
+            seq = list(pack)
+            labels_mask = torch.zeros(self.context_length, dtype=torch.bool)
+            fill_tokens = min(sum(tok != self.pad_token_id for tok in seq[:self.context_length]), self.context_length)
+            if len(seq) < block:
+                seq.extend([self.pad_token_id] * (block - len(seq)))
+            else:
+                seq = seq[:block]
+            ids = torch.tensor(seq[:-1], dtype=torch.long)
+            labels = torch.tensor(seq[1:], dtype=torch.long)
+            for pos in boundary_label_positions:
+                if 0 <= pos < self.context_length:
+                    labels_mask[pos] = True
+            labels_mask |= labels == self.pad_token_id
+            labels[labels_mask] = -100
+            source_bytes = raw_bytes_in_pack
+            fill_ratio = fill_tokens / max(self.context_length, 1)
+            pack = []
+            boundary_label_positions = []
+            raw_bytes_in_pack = 0
+            return {
+                "input_ids": ids,
+                "labels": labels,
+                "source_id": torch.tensor(source_idx, dtype=torch.long),
+                "fill_ratio": torch.tensor(fill_ratio, dtype=torch.float32),
+                "_source_bytes": source_bytes,
+            }
+
+        while True:
+            raw = next_doc_bytes()
+            if raw is None:
+                if pack:
+                    yield make_short_sample()
+                return
+            tokens = [b + off for b in raw]
+            if len(tokens) >= block:
+                if pack:
+                    yield make_short_sample()
+                limit = len(tokens) - block + 1
+                for start in range(0, limit, block):
+                    seq = tokens[start:start + block]
+                    yield {
+                        "input_ids": torch.tensor(seq[:-1], dtype=torch.long),
+                        "labels": torch.tensor(seq[1:], dtype=torch.long),
+                        "source_id": torch.tensor(source_idx, dtype=torch.long),
+                        "fill_ratio": torch.tensor(1.0, dtype=torch.float32),
+                        "_source_bytes": self.context_length,
+                    }
+                continue
+
+            doc_seq = tokens + [self.eos_token_id]
+            if pack and len(pack) + len(doc_seq) > block:
+                yield make_short_sample()
+            if pack:
+                boundary_label_positions.append(len(pack) - 1)
+            pack.extend(doc_seq)
+            raw_bytes_in_pack += len(raw)
+            if len(pack) == block:
+                yield make_short_sample()
 
     def _iter_local_file(self, path_str: str) -> Iterator[dict[str, torch.Tensor]]:
         """ローカルファイルを mmap で参照し、context_length バイトずつ切り出す.
@@ -239,16 +473,31 @@ class _ResumableLoader(DataLoader):
             iterator._shutdown_workers()
         self._iterator = None
 
+    def source_stats(self) -> dict[str, Any] | None:
+        ds = self.dataset
+        if not hasattr(ds, "state_dict"):
+            return None
+        extra = ds.state_dict().get("extra", {})
+        stats = extra.get("source_stats")
+        return dict(stats) if isinstance(stats, dict) else None
+
 
 def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
     ds = ByteStreamDataset(
         source=cfg.get("source"),
         sources=cfg.get("sources"),
         context_length=cfg["context_length"],
-        split=split,
+        split=cfg.get("split", split),
         shuffle_buffer=cfg.get("shuffle_buffer", 0),
         text_column=cfg.get("text_column", "text"),
+        name=cfg.get("name"),
+        revision=cfg.get("revision"),
         byte_offset=cfg.get("byte_offset", 4),
+        packing=cfg.get("packing", "concat"),
+        eos_token_id=cfg.get("eos_token_id", 2),
+        pad_token_id=cfg.get("pad_token_id", 3),
+        seed=cfg.get("seed", 42),
+        skip_samples=cfg.get("skip_samples", 0),
     )
     num_workers = cfg.get("num_workers", 4)
     if num_workers > 1 and not cfg.get("allow_multi_worker_iterable", False):
