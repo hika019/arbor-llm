@@ -65,9 +65,6 @@ pip install -r requirements.txt
 検証済み環境: Python 3.12 / torch 2.5.1+cu121 / transformers 4.57+ / datasets 4.8 /
 bitsandbytes 0.49 (RTX 4090, WSL2)。`source scripts/env.sh` で venv +
 CUDA アロケータ設定 (expandable_segments) + inductor 設定が入る。
-BLT repo の clone / submodule / third_party 配置は不要 (旧 BLT fork 依存は廃止)。
-`third_party/blt` がローカルに存在する環境もあるが、これは Git 管理外の旧作業ツリーを
-無視するために `.gitignore` へ残しているだけで、現行コードからは参照しない。
 
 動的 patching の CUDA extension は初回実行時に `.torch_extensions/` へ JIT build
 される。`scripts/env.sh` が新しすぎる gcc を PATH に入れていても、extension 側は

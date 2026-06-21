@@ -2,7 +2,7 @@
 
 ## 現在の状態
 
-- **旧アーキテクチャ (third_party BLT fork + 部分 BitNet) は全廃**。
+- **旧アーキテクチャ (BLT fork + 部分 BitNet) は全廃**。
   自己完結の Arbor v2 (静的 patching 階層 Transformer × BitNet b1.58 公式レシピ) に移行。
   旧 checkpoint (step 4492) も削除済み (ユーザー指示で互換性破棄)。
 - **1B 本走 (952.8M params) を fresh start 済み** (`logs/run_arbor2_1b.log`)。
