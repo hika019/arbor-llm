@@ -43,13 +43,13 @@ data:
       name: "jpn_Jpan"
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
-      weight_bytes: 0.39
+      weight_bytes: 0.465
     - id: wikipedia_ja
       path: "wikimedia/wikipedia"
       name: "20231101.ja"
       revision: main
       license_policy: "CC BY-SA/GFDL attribution requirements"
-      weight_bytes: 0.17
+      weight_bytes: 0.19
     - id: aozora_modern
       path: "globis-university/aozorabunko-clean"
       revision: main
@@ -61,7 +61,7 @@ data:
       text_column: "body"
       revision: main
       license_policy: "Japanese government legal text terms"
-      weight_bytes: 0.02
+      weight_bytes: 0.005
       max_epochs: 5
     - id: fineweb_edu_en
       path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
@@ -84,12 +84,12 @@ data:
       text_column: "code"
       revision: main
       license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
-      weight_bytes: 0.15
+      weight_bytes: 0.08
     - id: opc_code_web
       path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
       revision: main
       license_policy: "dataset card terms; code/web mixture"
-      weight_bytes: 0.02
+      weight_bytes: 0.01
   streaming: true
   packing: document
   eos_token_id: 2
