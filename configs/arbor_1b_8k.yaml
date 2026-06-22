@@ -103,13 +103,13 @@ data:
 # ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
 optim:
   optimizer: bnb_adamw_8bit     # choices: lion | bnb_adamw_8bit | adamw_fused
-  lr: 8.0e-4
+  lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
   scheduler: cosine_warmup
-  min_lr_ratio: 0.1            # lr 下限 = ピークの 10% (0 で従来の完全減衰)
+  min_lr_ratio: 0.02            # lr 下限 = ピークの 10% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
   total_steps: 200000
@@ -187,6 +187,6 @@ sampling:
 
 logging:
   wandb_project: arbor-llm
-  log_every_steps: 50
+  log_every_steps: 20
   throughput_window: 50
   best_ema_decay: 0.98
