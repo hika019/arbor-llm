@@ -10,8 +10,9 @@
 設計:
 - モデル構成は checkpoint ディレクトリ内の config.yaml を正とする
   (学習時の実効 config が保存されているので、現在の configs/ と乖離していても安全)。
-- BLT は KV cache を持たないため、1 バイト生成するごとに全系列を再フォワードする。
-  単発のサンプル生成・動作確認用であり、スループットは求めない。
+- 既定では 1 バイト生成するごとに全系列を再フォワードする。
+  単発のサンプル生成・動作確認用であり、スループットより一致性を優先する。
+- `--cache` を指定した場合だけ ArborByteGenerator の KV cache を使う。
 - 重みは生成中固定なので BitLinear の packed weight cache を有効化して再利用する。
 - token = byte値 + 4 (0..3 は BLT の BOE/BOS/EOS/PAD 特殊 ID)。サンプリング時は
   特殊 ID を必ずマスクする。出力は UTF-8 incremental decoder で逐次復号する。
@@ -146,12 +147,12 @@ def generate_stream(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.bfloat16,
     seed: int | None = None,
-    use_cache: bool = True,
+    use_cache: bool = False,
 ) -> Iterator[str]:
     """1 バイトずつ生成し、UTF-8 として確定した文字列片を逐次 yield する.
 
-    ArborModel なら既定で 2 階層 KV cache (ArborByteGenerator) を使う。
-    use_cache=False でフルフォワード方式 (検証用・遅い) に切り替え。
+    既定はフルフォワード方式。use_cache=True の場合だけ ArborModel で
+    2 階層 KV cache (ArborByteGenerator) を使う。
     """
     from src.model.arbor import ArborByteGenerator, ArborModel
 
@@ -247,8 +248,11 @@ def main() -> int:
     p.add_argument("--top-k", default=0, type=int)
     p.add_argument("--top-p", default=0.95, type=float)
     p.add_argument("--seed", default=None, type=int)
-    p.add_argument("--no-cache", action="store_true",
-                   help="KV cache を使わずフルフォワードで生成 (検証用・遅い)")
+    cache_group = p.add_mutually_exclusive_group()
+    cache_group.add_argument("--cache", action="store_true",
+                             help="ArborByteGenerator の KV cache を使う (実験的・高速)")
+    cache_group.add_argument("--no-cache", action="store_true",
+                             help="KV cache を使わずフルフォワードで生成 (既定)")
     args = p.parse_args()
 
     if not args.interactive and args.prompt is None:
@@ -275,7 +279,7 @@ def main() -> int:
             max_new_bytes=args.max_new_bytes, temperature=args.temperature,
             top_k=args.top_k, top_p=args.top_p,
             max_context=max_context, seed=args.seed,
-            use_cache=not args.no_cache,
+            use_cache=args.cache,
         ):
             sys.stdout.write(piece)
             sys.stdout.flush()

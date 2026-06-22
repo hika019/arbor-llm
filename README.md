@@ -170,10 +170,11 @@ python -m src.infer.generate --ckpt 5000 --ckpt-dir checkpoints/arbor2_1b_8k_ent
 
 モデル構成は checkpoint 内の `config.yaml` から自動復元される。
 `--ckpt latest` / `best` / step 数は `--ckpt-dir` で指定した run ディレクトリ内で解決される。
-生成は 2 階層 KV cache (global は patch 確定ごとに追記、local は patch 内のみ
-再計算) + BitLinear 推論凍結 (packed ternary / dequant キャッシュ) を使う。
-1B 実測 27 B/s (4090/WSL2。フルフォワード方式 `--no-cache` 比 ~4 倍)。
-それ以上はカーネル起動レイテンシ律速 (issues.md 参照)。
+生成は既定でフルフォワード方式を使う。単発の品質確認では、KV cache 経路の
+数値差より checkpoint 本体の出力を優先するため。BitLinear は推論凍結
+(packed ternary / dequant キャッシュ) を使う。2 階層 KV cache
+(global は patch 確定ごとに追記、local は patch 内のみ再計算) は
+`--cache` を指定した場合だけ使う実験的高速化。
 
 ## HuggingFace 形式エクスポート
 

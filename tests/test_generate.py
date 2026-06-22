@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import pytest
 
 from src.infer.generate import (
     BYTE_OFFSET,
@@ -10,7 +11,7 @@ from src.infer.generate import (
     _strip_compile_prefix,
     generate_text,
 )
-from src.model.arbor import ArborOutput
+from src.model.arbor import ArborConfig, ArborModel, ArborOutput
 
 
 class _NextByteModel(nn.Module):
@@ -65,6 +66,30 @@ def test_special_ids_are_masked():
     m = _SpecialTokenLover()
     out = generate_text(m, "x", max_new_bytes=3, temperature=0.0)
     assert out == "AAA"
+
+
+def test_arbor_generate_defaults_to_full_forward(monkeypatch):
+    class _FailingGenerator:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("cache should be opt-in")
+
+    import src.model.arbor as arbor_mod
+
+    monkeypatch.setattr(arbor_mod, "ArborByteGenerator", _FailingGenerator)
+    cfg = dict(
+        vocab_size=260, patch_size=4, max_bytes=16,
+        hidden_size=32, num_heads=2, num_kv_heads=2, intermediate_size=64,
+        num_hidden_layers=1,
+        local_hidden_size=16, local_num_heads=2, local_num_kv_heads=2,
+        local_intermediate_size=32,
+        num_local_encoder_layers=1, num_local_decoder_layers=1,
+    )
+    torch.manual_seed(0)
+    m = ArborModel(ArborConfig.from_dict(cfg)).eval()
+
+    generate_text(m, "x", max_new_bytes=1, temperature=0.0)
+    with pytest.raises(RuntimeError, match="cache should be opt-in"):
+        generate_text(m, "x", max_new_bytes=1, temperature=0.0, use_cache=True)
 
 
 def test_sample_next_greedy_and_topk():
