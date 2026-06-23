@@ -62,6 +62,61 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # CUDA 12
 pip install -r requirements.txt
 ```
 
+別環境で `.venv` を作り直した場合は、学習前に最低限これを確認する:
+
+```bash
+python - <<'PY'
+import torch, datasets
+print("torch", torch.__version__, "cuda", torch.cuda.is_available())
+print("datasets", datasets.__version__)
+try:
+    import bitsandbytes as bnb
+    print("bitsandbytes", bnb.__version__)
+except Exception as e:
+    print("bitsandbytes unavailable:", type(e).__name__, e)
+PY
+```
+
+- `RuntimeError: \`datasets\` が必要 (pip install datasets)` /
+  `ModuleNotFoundError: No module named 'datasets'`:
+  `pip install -r requirements.txt` が入っていない。HF streaming データセットを読む
+  本走 config (`configs/arbor_1b.yaml` など) では `datasets` が必須。
+- `[optim] bitsandbytes 未導入: AdamW(fused) にフォールバック`:
+  学習自体は続くが、`optim.optimizer: bnb_adamw_8bit` の VRAM 節約が効かない。
+  本走では `pip install -r requirements.txt` で `bitsandbytes` も入れる。
+  CUDA/PyTorch との ABI 不一致で import できない場合は、いったん
+  `optim.optimizer: adamw_fused` に落として起動確認する。
+
+HF Hub から本走データを streaming する環境では、未認証アクセスだと rate limit /
+timeout で止まりやすい。`configs/arbor_1b.yaml` は fineweb-2 / wikipedia /
+fineweb-edu / finemath / code など複数 dataset の parquet を起動直後に解決するため、
+RunPod 等の別環境では先に token と timeout を設定する:
+
+```bash
+export HF_TOKEN=hf_...
+export HF_HUB_DOWNLOAD_TIMEOUT=60
+export HF_HUB_ETAG_TIMEOUT=60
+```
+
+`Warning: You are sending unauthenticated requests to the HF Hub` が出る場合は
+`HF_TOKEN` が見えていない。`The read operation timed out` が出る場合はネットワーク
+または Hub 側の応答待ちなので、token 設定後に再実行する。
+
+`Killed` だけが出て traceback が無い場合、Python 例外ではなく OS / コンテナ側の
+強制終了であることが多い。まず CPU RAM の OOM kill を確認する:
+
+```bash
+cat /sys/fs/cgroup/memory.events 2>/dev/null || true
+dmesg -T | tail -50 2>/dev/null || true
+free -h
+```
+
+`oom_kill` が増えている場合は、VRAM が足りていてもホストRAMが足りない。1B 本走は
+32GB級GPUに加えて十分な CPU RAM と安定した外向きネットワークが必要。小さな環境では
+先に `configs/smoke.yaml` で依存関係とデータ読み込みを確認し、本走は
+`speed.micro_batch_size: 1` / `speed.grad_accum_steps: 64`、または source 数を減らした
+試験 config で切り分ける。
+
 検証済み環境: Python 3.12 / torch 2.5.1+cu121 / transformers 4.57+ / datasets 4.8 /
 bitsandbytes 0.49 (RTX 4090, WSL2)。`source scripts/env.sh` で venv +
 CUDA アロケータ設定 (expandable_segments) + inductor 設定が入る。
@@ -88,6 +143,9 @@ python -m src.train.train --config configs/arbor_1b.yaml
 
 # 最新 checkpoint から再開
 python -m src.train.train --config configs/arbor_1b.yaml --resume latest
+
+# checkpoint の optimizer state は維持し、LR の基準値だけ現在の config に変える
+python -m src.train.train --config configs/arbor_1b.yaml --resume latest --rebase-lr-on-resume
 ```
 
 - `Ctrl+C` (SIGINT) / `kill -TERM` で次 step 境界に安全保存して終了。二度押しで強制終了。
@@ -98,6 +156,10 @@ python -m src.train.train --config configs/arbor_1b.yaml --resume latest
   (最初から流し直して skip しない)。RNG・dataloader 位置も復元。
 - **resume 時の config 不一致はエラー** (checkpoint 内 config.yaml と model 節を照合)。
   意図的に変える場合のみ `--allow-config-mismatch`。
+- **resume は optimizer/scheduler state も復元する**。そのため途中で config の
+  `optim.lr` を変えただけでは、checkpoint 内の LR が優先される。LR だけを変えて
+  Adam の momentum 等は引き継ぎたい場合は `--rebase-lr-on-resume` を付ける。
+  optimizer / scheduler を完全に初期化して重みだけ使う場合は `--init-from`。
 - checkpoint のロードは strict (部分ロードを黙って通さない)。保存は compile 前の
   モデルで行うので `_orig_mod.` prefix 問題も起きない。
 - `best` は **train loss の EMA** が最良だった checkpoint (validation best ではない)。

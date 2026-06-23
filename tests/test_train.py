@@ -5,6 +5,7 @@ import torch
 
 from src.train.train import resolve_precision
 from src.train.train import CudaBatchPrefetcher
+from src.train.train import rebase_scheduler_lr
 from src.train.train import should_restore_dataloader_state
 
 
@@ -45,6 +46,31 @@ def test_should_not_restore_dataloader_state_when_data_config_changed():
     }
 
     assert not should_restore_dataloader_state(saved_data_cfg, current_data_cfg)
+
+
+def test_rebase_scheduler_lr_preserves_step_but_changes_base_lr():
+    p = torch.nn.Parameter(torch.ones(()))
+    opt = torch.optim.SGD([p], lr=8.0e-4)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: 0.5)
+
+    opt.step()
+    sched.step()
+    old_sched_state = sched.state_dict()
+    old_opt_state = opt.state_dict()
+
+    opt2 = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=2.0e-4)
+    sched2 = torch.optim.lr_scheduler.LambdaLR(opt2, lambda step: 0.5)
+    opt2.load_state_dict(old_opt_state)
+    sched2.load_state_dict(old_sched_state)
+
+    assert sched2.base_lrs == [8.0e-4]
+    lrs = rebase_scheduler_lr(opt2, sched2, 2.0e-4)
+
+    assert sched2.last_epoch == old_sched_state["last_epoch"]
+    assert sched2.base_lrs == [2.0e-4]
+    assert lrs == [1.0e-4]
+    assert opt2.param_groups[0]["lr"] == pytest.approx(1.0e-4)
+    assert sched2.get_last_lr() == [1.0e-4]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")

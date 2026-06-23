@@ -78,6 +78,13 @@ def parse_args() -> argparse.Namespace:
         "--allow-config-mismatch", action="store_true",
         help="resume 時に checkpoint の model 設定と現在の config が違っても続行する",
     )
+    p.add_argument(
+        "--rebase-lr-on-resume", action="store_true",
+        help=(
+            "resume 時に optimizer/scheduler state は復元しつつ、LR の基準値だけ "
+            "現在の config の optim.lr に差し替える"
+        ),
+    )
     return p.parse_args()
 
 
@@ -133,6 +140,47 @@ def run_metadata(args: argparse.Namespace, device: torch.device) -> dict[str, ob
 def should_restore_dataloader_state(saved_data_cfg: dict | None, current_data_cfg: dict) -> bool:
     """Return whether checkpoint dataloader state is compatible with current data config."""
     return saved_data_cfg is None or saved_data_cfg == current_data_cfg
+
+
+def rebase_scheduler_lr(
+    optimizer: torch.optim.Optimizer,
+    scheduler: object,
+    base_lr: float,
+) -> list[float]:
+    """Keep resume progress but change the scheduler's base LR.
+
+    Loading a checkpoint restores both optimizer param group LR and LambdaLR
+    base_lrs from the checkpoint. This helper is for intentional mid-run LR
+    changes: Adam moments/scheduler step are preserved, but the peak/base LR is
+    replaced by the current config value.
+    """
+    if base_lr <= 0:
+        raise ValueError(f"optim.lr must be positive: {base_lr}")
+    groups = optimizer.param_groups
+    for group in groups:
+        group["initial_lr"] = base_lr
+
+    if hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [base_lr for _ in groups]
+
+    last_epoch = int(getattr(scheduler, "last_epoch", 0))
+    lr_lambdas = getattr(scheduler, "lr_lambdas", None)
+    if lr_lambdas is not None:
+        lrs = [base_lr * float(fn(last_epoch)) for fn in lr_lambdas]
+        if len(lrs) == 1 and len(groups) > 1:
+            lrs = lrs * len(groups)
+    else:
+        lrs = [base_lr for _ in groups]
+    if len(lrs) != len(groups):
+        raise ValueError(
+            f"scheduler LR count mismatch: lrs={len(lrs)} param_groups={len(groups)}"
+        )
+
+    for group, lr in zip(groups, lrs):
+        group["lr"] = lr
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = list(lrs)
+    return lrs
 
 
 @torch.no_grad()
@@ -486,10 +534,12 @@ def main() -> int:
         resolved = ckpt.resolve(args.resume)
         saved_cfg_file = resolved / "config.yaml" if resolved else None
         saved_data_cfg = None
+        saved_optim_cfg = None
         if saved_cfg_file is not None and saved_cfg_file.exists():
             saved_cfg = yaml.safe_load(saved_cfg_file.read_text()) or {}
             saved_model_cfg = saved_cfg.get("model", {})
             saved_data_cfg = saved_cfg.get("data")
+            saved_optim_cfg = saved_cfg.get("optim")
             if saved_model_cfg and saved_model_cfg != cfg["model"]:
                 diff_keys = sorted(
                     k for k in set(saved_model_cfg) | set(cfg["model"])
@@ -517,6 +567,38 @@ def main() -> int:
         meta, dl_state = ckpt.load(args.resume, base_model, optimizer, scheduler, map_location=device)
         print(f"[train] checkpoint loaded in {time.perf_counter() - t0:.1f}s")
         timing_mark("checkpoint_loaded", device)
+        optim_diff_keys = (
+            sorted(
+                k for k in set(saved_optim_cfg or {}) | set(cfg["optim"])
+                if (saved_optim_cfg or {}).get(k) != cfg["optim"].get(k)
+            )
+            if saved_optim_cfg
+            else []
+        )
+        config_base_lr = float(cfg["optim"]["lr"])
+        loaded_base_lrs = [float(v) for v in getattr(scheduler, "base_lrs", [])]
+        loaded_current_lrs = [float(v) for v in scheduler.get_last_lr()]
+        lr_base_mismatch = any(
+            abs(v - config_base_lr) > max(1e-12, abs(config_base_lr) * 1e-9)
+            for v in loaded_base_lrs
+        )
+        if args.rebase_lr_on_resume:
+            lrs = rebase_scheduler_lr(optimizer, scheduler, config_base_lr)
+            print(
+                "[train] rebase_lr_on_resume=ON "
+                f"optim_diff={optim_diff_keys} "
+                f"old_base_lrs={[f'{v:.3e}' for v in loaded_base_lrs]} "
+                f"old_current_lr={loaded_current_lrs[0]:.3e} "
+                f"base_lr={config_base_lr:.3e} current_lr={lrs[0]:.3e}"
+            )
+        elif optim_diff_keys or lr_base_mismatch:
+            print(
+                "[train] WARNING: checkpoint の optimizer/scheduler state は復元済み。"
+                f" optim_diff={optim_diff_keys} "
+                f"checkpoint_base_lrs={[f'{v:.3e}' for v in loaded_base_lrs]} "
+                f"config_lr={config_base_lr:.3e} current_lr={loaded_current_lrs[0]:.3e}. "
+                "LR だけ変えて続行するなら --rebase-lr-on-resume を付ける。"
+            )
         if refresh_bitlinear_training_cache is not None:
             refreshed = refresh_bitlinear_training_cache(base_model)
             if refreshed:

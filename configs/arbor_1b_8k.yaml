@@ -109,7 +109,7 @@ optim:
   weight_decay: 0.1
   grad_clip: 1.0
   scheduler: cosine_warmup
-  min_lr_ratio: 0.02            # lr 下限 = ピークの 10% (0 で従来の完全減衰)
+  min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
   total_steps: 200000
