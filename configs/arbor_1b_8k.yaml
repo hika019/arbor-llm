@@ -122,7 +122,7 @@ speed:
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
-  bitnet_weight_cache: auto     # 実験的CUDA kernelなし。BitNetのforward用量子化重みをstep間で再利用
+  bitnet_weight_cache: off     # 実験的CUDA kernelなし。BitNetのforward用量子化重みをstep間で再利用
   bitnet_weight_cache_gib: 1.25
   bitnet_weight_cache_min_numel: 65536
   sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
