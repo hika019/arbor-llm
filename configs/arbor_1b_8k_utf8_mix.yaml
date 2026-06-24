@@ -6,7 +6,7 @@
 # 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (8 bytes/patch)
 # なので global は 1024 patches。実効バッチは 64 seq = 524k bytes/update。
 
-run_name: arbor2_1b_8k_utf8_mix
+run_name: arbor2_1b_8k_utf8_mix_filter
 seed: 42
 
 model:
@@ -172,7 +172,7 @@ validation:
       skip_samples: 20000
 
 checkpoint:
-  dir: ./checkpoints/arbor2_1b_8k_utf8_mix
+  dir: ./checkpoints/arbor2_1b_8k_utf8_mix_filter
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000
