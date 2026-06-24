@@ -16,6 +16,10 @@ __pycache__/
 /export/
 /wandb/
 /data/
+!/data/
+/data/*
+!/data/probes/
+!/data/probes/tiny_ja.txt
 *.safetensors
 *.pt
 *.bin

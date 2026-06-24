@@ -9,6 +9,7 @@ from src.infer.generate import (
     BYTE_OFFSET,
     _sample_next,
     _strip_compile_prefix,
+    generate_byte_stream,
     generate_text,
 )
 from src.model.arbor import ArborConfig, ArborModel, ArborOutput
@@ -48,6 +49,32 @@ class _SpecialTokenLover(nn.Module):
         return ArborOutput(logits=logits)
 
 
+class _InvalidContinuationLover(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> ArborOutput:
+        b, s = x.shape
+        logits = torch.full((b, s, 260), -10.0)
+        logits[:, -1, 0x82 + BYTE_OFFSET] = 20.0
+        logits[:, -1, ord("A") + BYTE_OFFSET] = 10.0
+        return ArborOutput(logits=logits)
+
+
+class _LateUtf8LeadLover(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> ArborOutput:
+        b, s = x.shape
+        logits = torch.full((b, s, 260), -10.0)
+        logits[:, -1, 0xE3 + BYTE_OFFSET] = 20.0
+        logits[:, -1, ord("A") + BYTE_OFFSET] = 10.0
+        return ArborOutput(logits=logits)
+
+
 def test_greedy_follows_mapping():
     # 'a' -> 'b' -> 'c' -> 'a' の循環
     m = _NextByteModel({ord("a"): ord("b"), ord("b"): ord("c"), ord("c"): ord("a")})
@@ -65,8 +92,45 @@ def test_utf8_multibyte_incremental_decode():
 def test_utf8_incomplete_tail_is_ignored_by_default():
     # 生成上限が UTF-8 の途中で止まっても、CLI 既定では置換文字を出さない。
     m = _NextByteModel({ord("x"): 0xE3, 0xE3: 0x81, 0x81: 0x82})
-    out = generate_text(m, "x", max_new_bytes=2, temperature=0.0)
+    out = generate_text(m, "x", max_new_bytes=2, temperature=0.0, utf8_mask=False)
     assert out == ""
+
+
+def test_utf8_mask_avoids_incomplete_tail():
+    m = _LateUtf8LeadLover()
+    out = generate_text(m, "x", max_new_bytes=2, temperature=0.0)
+    assert out == "AA"
+
+
+def test_utf8_backslashreplace_exposes_invalid_bytes():
+    m = _NextByteModel({ord("x"): 0xFF, 0xFF: 0xFF})
+    out = generate_text(
+        m,
+        "x",
+        max_new_bytes=2,
+        temperature=0.0,
+        decode_errors="backslashreplace",
+        utf8_mask=False,
+    )
+    assert out == "\\xff\\xff"
+
+
+def test_utf8_mask_blocks_invalid_continuation_after_ascii():
+    m = _InvalidContinuationLover()
+    out = generate_text(m, "x", max_new_bytes=1, temperature=0.0)
+    assert out == "A"
+
+
+def test_utf8_mask_allows_required_continuations():
+    m = _NextByteModel({ord("x"): 0xE3, 0xE3: 0x81, 0x81: 0x82})
+    out = generate_text(m, "x", max_new_bytes=3, temperature=0.0)
+    assert out == "あ"
+
+
+def test_generate_byte_stream_returns_raw_bytes():
+    m = _NextByteModel({ord("x"): 0xE3, 0xE3: 0x81, 0x81: 0x82})
+    out = list(generate_byte_stream(m, "x", max_new_bytes=3, temperature=0.0))
+    assert out == [0xE3, 0x81, 0x82]
 
 
 def test_special_ids_are_masked():

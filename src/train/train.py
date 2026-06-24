@@ -337,6 +337,42 @@ def resolve_precision(name: str) -> tuple[torch.dtype, bool]:
     raise ValueError(f"unknown speed.precision: {name}")
 
 
+def byte_kind_loss_stats(
+    losses: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    cpu: bool = True,
+) -> dict[str, float | torch.Tensor]:
+    """Return count/loss sums for UTF-8 byte classes from unreduced CE losses."""
+    valid = labels != -100
+    if not bool(valid.any()):
+        return {}
+    flat_losses = losses.reshape(-1)
+    flat_labels = labels.reshape(-1)
+    valid_losses = flat_losses[valid.reshape(-1)]
+    byte_values = flat_labels[valid.reshape(-1)] - 4
+    masks = {
+        "ascii": (byte_values >= 0) & (byte_values < 0x80),
+        "utf8_cont": (byte_values >= 0x80) & (byte_values <= 0xBF),
+        "utf8_lead": (byte_values >= 0xC0) & (byte_values <= 0xF7),
+        "other": (byte_values >= 0xF8) | (byte_values < 0),
+    }
+    out: dict[str, float | torch.Tensor] = {}
+    for name, mask in masks.items():
+        count = mask.sum()
+        loss_sum = valid_losses[mask].detach().float().sum()
+        if cpu:
+            count_f = float(count.cpu())
+            if count_f == 0.0:
+                continue
+            out[f"{name}_count"] = count_f
+            out[f"{name}_loss_sum"] = float(loss_sum.cpu())
+        else:
+            out[f"{name}_count"] = count.detach()
+            out[f"{name}_loss_sum"] = loss_sum.detach()
+    return out
+
+
 def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Module:
     """Apply torch.compile according to speed config and return the trainable model."""
     # Arbor v2 は静的 patching で形状固定なので compile が素直に効く (既定 ON)
@@ -636,6 +672,7 @@ def main() -> int:
     sync_each_step = bool(cfg["speed"].get("sync_each_step", False))
     cuda_prefetch = bool(cfg["speed"].get("cuda_prefetch", False)) and device.type == "cuda"
     log_every = cfg["logging"].get("log_every_steps", 20)
+    byte_kind_metrics = bool(cfg["logging"].get("byte_kind_metrics", False))
     total_steps = cfg["optim"]["total_steps"]
     micro_batch = data_cfg.get("micro_batch_size")
     context_length = data_cfg.get("context_length")
@@ -682,6 +719,15 @@ def main() -> int:
             )
         )
 
+    # checkpoint 保存時の固定 good/bad target probe (任意)。
+    probes_cfg = cfg.get("probes", {})
+    probes_enabled = bool(probes_cfg.get("enabled", False))
+    if probes_enabled:
+        probe_items = probes_cfg.get("items", [])
+        if not probe_items:
+            raise SystemExit("[train] ERROR: probes.enabled=true だが probes.items が空")
+        print(f"[train] probes=ON items={len(probe_items)}")
+
     def sample_at_checkpoint(step_dir: Path, step: int) -> None:
         from src.infer.generate import generate_samples
 
@@ -709,6 +755,38 @@ def main() -> int:
         finally:
             base_model.train()
 
+    def probes_at_checkpoint(step_dir: Path, step: int) -> dict[str, dict[str, float]] | None:
+        from src.eval.probes import run_text_probes
+
+        try:
+            t0 = time.perf_counter()
+            results = run_text_probes(
+                base_model,
+                probes_cfg.get("items", []),
+                device=device,
+                dtype=compute_dtype,
+            )
+            with metrics_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "step": step,
+                    "probe": results,
+                    "time": time.time(),
+                }, ensure_ascii=False) + "\n")
+            (step_dir / "probes.json").write_text(
+                json.dumps({"step": step, "probe": results}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            parts = " ".join(
+                f"{name}:good={vals['good_bpb']:.4f} "
+                f"bad_min={vals['bad_min_bpb']:.4f} margin={vals['margin']:.4f}"
+                for name, vals in results.items()
+            )
+            print(f"[probe] step={step} {parts} elapsed={time.perf_counter() - t0:.1f}s")
+            return results
+        except Exception as e:  # noqa: BLE001 - probe 失敗で学習は止めない
+            print(f"[probe] failed (continuing training): {type(e).__name__}: {e}")
+            return None
+
     model.train()
     optimizer.zero_grad(set_to_none=True)
     accum_loss_tensor: torch.Tensor | None = None
@@ -726,6 +804,7 @@ def main() -> int:
     interval_max_patch_tensor: torch.Tensor | None = None
     interval_fill_ratio_tensor: torch.Tensor | None = None
     interval_fill_samples = 0
+    interval_byte_kind: dict[str, torch.Tensor] = {}
     interval_cpu_ms = {
         "batch_wait": 0.0,
         "h2d": 0.0,
@@ -852,9 +931,24 @@ def main() -> int:
                     end_gpu_section("forward", fwd_start)
                     if global_step == 0:
                         timing_mark(f"step0_micro{micro}_forward_done", device)
-                    loss = torch.nn.functional.cross_entropy(
-                        out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
-                    ) / grad_accum
+                    if byte_kind_metrics:
+                        flat_losses = torch.nn.functional.cross_entropy(
+                            out.logits.flatten(0, 1),
+                            labels.flatten(),
+                            ignore_index=-100,
+                            reduction="none",
+                        )
+                        valid = labels.flatten() != -100
+                        loss = flat_losses[valid].mean() / grad_accum
+                        stats = byte_kind_loss_stats(flat_losses, labels, cpu=False)
+                        for key, value in stats.items():
+                            if not torch.is_tensor(value):
+                                value = torch.tensor(value, device=device)
+                            interval_byte_kind[key] = interval_byte_kind.get(key, value.new_zeros(())) + value
+                    else:
+                        loss = torch.nn.functional.cross_entropy(
+                            out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
+                        ) / grad_accum
                 if out.patch_count is not None:
                     pc = out.patch_count.detach()
                     interval_patches_tensor = pc if interval_patches_tensor is None else interval_patches_tensor + pc
@@ -1011,6 +1105,18 @@ def main() -> int:
                     else None
                 )
                 source_byte_ratios = None
+                byte_kind_bpb = None
+                if byte_kind_metrics and interval_byte_kind:
+                    log2 = torch.log(torch.tensor(2.0)).item()
+                    byte_kind_bpb = {}
+                    for name in ("ascii", "utf8_lead", "utf8_cont", "other"):
+                        count_tensor = interval_byte_kind.get(f"{name}_count")
+                        loss_tensor = interval_byte_kind.get(f"{name}_loss_sum")
+                        count = float(count_tensor.cpu()) if count_tensor is not None else 0.0
+                        loss_sum = float(loss_tensor.cpu()) if loss_tensor is not None else 0.0
+                        if count > 0:
+                            byte_kind_bpb[f"{name}_bpb"] = round(loss_sum / count / log2, 6)
+                            byte_kind_bpb[f"{name}_count"] = int(count)
                 if source_stats:
                     emitted = source_stats.get("emitted_source_bytes") or []
                     total_emitted = sum(float(v) for v in emitted)
@@ -1056,6 +1162,7 @@ def main() -> int:
                         "step_ms": round(step_ms, 3),
                         "phase": phase,
                         "section_profile": latest_section_profile,
+                        "byte_kind_bpb": byte_kind_bpb,
                         "source_byte_ratios": source_byte_ratios,
                         "source_stats": source_stats,
                         "time": time.time(),
@@ -1067,6 +1174,7 @@ def main() -> int:
                 interval_max_patch_tensor = None
                 interval_fill_ratio_tensor = None
                 interval_fill_samples = 0
+                interval_byte_kind = {}
                 logs_emitted += 1
                 for key in interval_cpu_ms:
                     interval_cpu_ms[key] = 0.0
@@ -1157,6 +1265,8 @@ def main() -> int:
                 )
                 if sampling_enabled:
                     sample_at_checkpoint(saved_dir, global_step)
+                if probes_enabled:
+                    probes_at_checkpoint(saved_dir, global_step)
 
             if stop.requested:
                 print("[train] stop requested, exiting cleanly.")

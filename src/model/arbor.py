@@ -5,22 +5,24 @@
     bytes (B, T)
       └ byte embedding (FP, d_local)
       └ Local Encoder: patch 内 attention (n_enc 層)
-      └ patch 化 (3 モード, 下記)
+      └ patch 化 (下記)
       └ Global Transformer: 1 patch 右シフト + causal (n_global 層) -> h_t
             h_t は「patch t より前の全バイト」だけを見る
       └ Local Decoder: 入力 = byte_emb[i] + proj(h_patch(i)) を patch 内 causal で処理
       └ head (FP): logits[i] は bytes[0..i] のみから次バイトを予測
 
-patching_mode (3 択):
+patching_mode:
   static   固定長 patch_size バイトで機械的に区切る (MegaByte 方式)。
            形状が完全に固定なので torch.compile がフルに効く。既定・本走用。
+  utf8     UTF-8 の文字先頭 byte だけを境界候補にする char-aware patching。
+           min/max_patch_len で長さを制限する dynamic mode。
   space    空白・改行の直後で区切る (BLT の space patching)。日本語は句読点・
            改行頼みで patch が長くなりがち。min/max_patch_len で長さを制限。
   entropy  小型バイト LM (entropy_model) の次バイト予測エントロピーが
            threshold を超えた位置で区切る (BLT 本命方式)。entropy_model は
            凍結サブモジュールとして本体に内蔵され checkpoint にも一緒に入る。
 
-動的モード (space/entropy) の実装方式:
+動的モード (utf8/space/entropy) の実装方式:
   patch 数を max_patches (既定は max_bytes / min_patch_len の worst-case) に固定 pad し、
   encoder/decoder は flat (B,T) のまま「同一 patch 内のみ許す」block 対角
   attention mask で処理する。これにより動的モードでも tensor 形状は固定。
@@ -32,8 +34,8 @@ patching_mode (3 択):
   pad された patch 行は decoder から一切 gather されないため勾配が流れず、
   ゼロ行の RMSNorm backward 増幅問題 (next.md 参照) も起こさない。
 
-因果性 (3 モード共通):
-  - 境界判定は過去バイトのみに依存 (space: 直前バイト / entropy: causal LM)
+因果性:
+  - 境界判定は因果的 (utf8: 現在 byte / space: 直前バイト / entropy: causal LM)
   - patch t の表現は global の 1 patch 右シフトにより bytes[< patch t 開始] に
     しか影響しない。encoder が patch 内 bidirectional でも漏れない
   - tests/test_arbor.py が全モードで「未来バイト変更が過去 logits に漏れない」
@@ -45,6 +47,7 @@ SubLN / ReLU² gated FFN / bias 無し。Embedding・射影・head・Norm は FP
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -101,7 +104,7 @@ class ArborConfig:
     vocab_size: int = 260          # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
     max_bytes: int = 2048          # 学習 context (bytes)
     # ---- patching ----
-    patching_mode: str = "static"  # choices: static | space | entropy
+    patching_mode: str = "static"  # choices: static | utf8 | space | entropy
     patch_size: int = 4            # static 用: 1 patch のバイト数
     min_patch_len: int = 2         # 動的用: これ未満では区切らない
     max_patch_len: int = 16        # 動的用: これに達したら強制的に区切る
@@ -408,6 +411,11 @@ def build_byte_lm(model_cfg: dict[str, Any]) -> ByteLM:
 _SPACE_BYTES = (0x20, 0x09, 0x0A, 0x0D)  # space, tab, LF, CR
 
 
+def _is_utf8_char_start_byte(byte: int) -> bool:
+    """Return whether byte can start a UTF-8 code point."""
+    return byte < 0x80 or 0xC2 <= byte <= 0xF4
+
+
 @torch.compiler.disable
 def compute_patch_starts(
     input_ids: torch.Tensor,
@@ -420,6 +428,7 @@ def compute_patch_starts(
 ) -> torch.Tensor:
     """patch 開始位置の bool tensor (B, T) を返す。判定は過去バイトのみに依存 (causal).
 
+    - utf8:    現在バイトが UTF-8 文字先頭なら新 patch を開始
     - space:   直前バイトが空白系なら新 patch を開始
     - entropy: 直前位置での次バイト予測エントロピーが threshold 超なら開始
     その後 min_len (それ未満では区切らない) / max_len (達したら強制区切り) を適用。
@@ -434,7 +443,11 @@ def compute_patch_starts(
         raise ValueError("max_patch_len must be >= min_patch_len")
 
     b, t = input_ids.shape
-    if mode == "space":
+    if mode == "utf8":
+        cur = input_ids - BYTE_OFFSET
+        raw = ((cur < 0x80) | ((cur >= 0xC2) & (cur <= 0xF4))).to(torch.bool)
+        raw[:, 0] = False
+    elif mode == "space":
         prev = input_ids[:, :-1] - BYTE_OFFSET
         is_space = torch.zeros_like(prev, dtype=torch.bool)
         for sb in _SPACE_BYTES:
@@ -502,7 +515,7 @@ class _LayerKVCache:
 class ArborModel(nn.Module):
     def __init__(self, cfg: ArborConfig):
         super().__init__()
-        if cfg.patching_mode not in ("static", "space", "entropy"):
+        if cfg.patching_mode not in ("static", "utf8", "space", "entropy"):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
         self.cfg = cfg
         self.dynamic = cfg.patching_mode != "static"
@@ -587,6 +600,30 @@ class ArborModel(nn.Module):
             return self._forward_dynamic(input_ids)
         return self._forward_static(input_ids)
 
+    @torch.compiler.disable
+    def _debug_context_contribution(
+        self,
+        byte_emb: torch.Tensor,
+        global_context: torch.Tensor,
+        decoder_input: torch.Tensor,
+    ) -> None:
+        """Print context-vs-byte RMS once when ARBOR_DEBUG_CONTEXT=1."""
+        if getattr(self, "_debug_context_printed", False):
+            return
+        self._debug_context_printed = True
+        with torch.no_grad():
+            byte_rms = byte_emb.float().pow(2).mean().sqrt()
+            global_rms = global_context.float().pow(2).mean().sqrt()
+            decoder_rms = decoder_input.float().pow(2).mean().sqrt()
+            print(
+                "[ctx] "
+                f"byte_emb_rms={byte_rms.item():.6f} "
+                f"global_context_rms={global_rms.item():.6f} "
+                f"decoder_input_rms={decoder_rms.item():.6f} "
+                f"global_byte_ratio={(global_rms / byte_rms.clamp_min(1e-8)).item():.6f}",
+                flush=True,
+            )
+
     def _forward_static(self, input_ids: torch.Tensor) -> ArborOutput:
         b, t = input_ids.shape
         p = self.cfg.patch_size
@@ -607,6 +644,8 @@ class ArborModel(nn.Module):
 
         # Local Decoder: byte_emb[i] + h_patch(i) を patch 内 causal で
         d = x.view(b, k, p, -1) + g.unsqueeze(2)
+        if os.environ.get("ARBOR_DEBUG_CONTEXT", "0") == "1":
+            self._debug_context_contribution(x, g, d)
         d = d.view(b * k, p, -1)
         for layer in self.decoder_layers:
             d = self._maybe_ckpt(layer, d)
@@ -710,6 +749,8 @@ class ArborModel(nn.Module):
 
             # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
             d = x + h_byte
+            if os.environ.get("ARBOR_DEBUG_CONTEXT", "0") == "1":
+                self._debug_context_contribution(x, h_byte, d)
             for layer in self.decoder_layers:
                 d = self._maybe_ckpt(layer, d, dec_mask)
             return self.head(self.head_norm(d))
@@ -858,7 +899,7 @@ class ArborByteGenerator:
     def push(self, byte_id: int) -> torch.Tensor:
         if len(self.byte_ids) >= self.cfg.max_bytes:
             self._rebuild(keep=self.cfg.max_bytes // 2)
-        if self._starts_new_patch():
+        if self._starts_new_patch(byte_id):
             self._commit_patch()
         self.cur_patch.append(byte_id)
         self.byte_ids.append(byte_id)
@@ -867,7 +908,7 @@ class ArborByteGenerator:
         return self._decode_current()
 
     # ----------------------------------------------------------- internal
-    def _starts_new_patch(self) -> bool:
+    def _starts_new_patch(self, next_byte_id: int | None = None) -> bool:
         """次に push されるバイトが新しい patch を始めるか (compute_patch_starts と同条件)."""
         run = len(self.cur_patch)
         if run == 0:
@@ -879,6 +920,10 @@ class ArborByteGenerator:
             return True
         if run < cfg.min_patch_len:
             return False
+        if cfg.patching_mode == "utf8":
+            if next_byte_id is None:
+                return False
+            return _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
         if cfg.patching_mode == "space":
             return (self.byte_ids[-1] - BYTE_OFFSET) in _SPACE_BYTES
         return self.prev_entropy > cfg.entropy_threshold
@@ -928,7 +973,7 @@ class ArborByteGenerator:
         tail = self.byte_ids[-keep:]
         self.reset()
         for byte_id in tail:
-            if self._starts_new_patch():
+            if self._starts_new_patch(byte_id):
                 self._commit_patch()
             self.cur_patch.append(byte_id)
             self.byte_ids.append(byte_id)

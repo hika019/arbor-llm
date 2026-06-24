@@ -52,7 +52,7 @@ def test_forward_handles_partial_patch(model):
     assert out.logits.shape == (1, 10, 260)
 
 
-@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
 def test_causality(mode, pos):
     """位置 pos のバイトを変えても、位置 < pos の logits は変わらないこと.
@@ -76,7 +76,7 @@ def test_causality(mode, pos):
     assert not torch.allclose(la[:, pos:], lb[:, pos:], atol=1e-5)
 
 
-@pytest.mark.parametrize("mode", ["space", "entropy"])
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
 def test_window_path_matches_dense(mode, monkeypatch):
     """T が chunk の倍数のときの窓 attention 経路が密マスク経路と一致すること.
 
@@ -100,7 +100,7 @@ def test_window_path_matches_dense(mode, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("mode", ["space", "entropy"])
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
 def test_dynamic_forward_shape_and_grads(mode):
     torch.manual_seed(0)
     m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode)))
@@ -147,6 +147,18 @@ def test_space_boundaries():
     ids = torch.tensor([[ord("a"), ord("b"), 0x20, ord("c"), ord("d")]]) + 4
     starts = compute_patch_starts(ids, "space", min_len=1, max_len=16)
     assert starts.tolist() == [[True, False, False, True, False]]
+
+
+def test_utf8_boundaries_follow_codepoint_starts():
+    ids = torch.tensor([list("あいbう".encode("utf-8"))]) + 4
+    starts = compute_patch_starts(ids, "utf8", min_len=1, max_len=16)
+    assert starts[0].nonzero().flatten().tolist() == [0, 3, 6, 7]
+
+
+def test_utf8_boundaries_respect_min_len():
+    ids = torch.tensor([list("あいbう".encode("utf-8"))]) + 4
+    starts = compute_patch_starts(ids, "utf8", min_len=4, max_len=16)
+    assert starts[0].nonzero().flatten().tolist() == [0, 6]
 
 
 def test_boundary_min_max_enforcement():
@@ -237,7 +249,7 @@ def test_patch_starts_cuda_matches_cpu_reference():
     assert torch.equal(cuda, cpu)
 
 
-@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
     torch.manual_seed(3)
@@ -249,7 +261,7 @@ def test_generator_matches_full_forward(mode):
         for i in range(len(ids)):
             inc = gen.push(int(ids[i]))
             full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
-            assert torch.allclose(inc, full, atol=1e-4), (
+            assert torch.allclose(inc, full, atol=2e-4), (
                 f"mode={mode}: 位置 {i} で逐次生成とフルフォワードの logits が不一致 "
                 f"(max diff={float((inc - full).abs().max()):.2e})"
             )

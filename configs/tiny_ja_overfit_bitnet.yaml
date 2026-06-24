@@ -1,0 +1,96 @@
+run_name: tiny_ja_overfit_bitnet
+seed: 42
+
+model:
+  vocab_size: 260
+  patch_size: 8
+  max_bytes: 256
+  hidden_size: 128
+  num_heads: 4
+  num_kv_heads: 2
+  intermediate_size: 384
+  num_hidden_layers: 2
+  local_hidden_size: 64
+  local_num_heads: 2
+  local_num_kv_heads: 2
+  local_intermediate_size: 192
+  num_local_encoder_layers: 1
+  num_local_decoder_layers: 1
+  rope_theta: 10000.0
+  bitnet: true
+  gradient_checkpointing: false
+
+data:
+  source: "file:./data/probes/tiny_ja.txt"
+  streaming: true
+  shuffle_buffer: 0
+  context_length: 256
+  num_workers: 0
+  prefetch_factor: 2
+  pin_memory: true
+  micro_batch_size: 8
+  text_column: text
+
+optim:
+  optimizer: adamw_fused
+  lr: 1.0e-3
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  warmup_steps: 10
+  total_steps: 500
+
+speed:
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: true
+  torch_compile: false
+  cuda_prefetch: true
+  bitnet_weight_cache: auto
+  bitnet_weight_cache_gib: 0.10
+  bitnet_weight_cache_min_numel: 0
+  sync_each_step: false
+  micro_batch_size: 8
+  grad_accum_steps: 1
+
+checkpoint:
+  dir: ./checkpoints/tiny_ja_overfit_bitnet
+  save_every_steps: 100
+  keep_last_k: 2
+  keep_every_n_steps: null
+  async_save: false
+
+sampling:
+  enabled: true
+  prompts:
+    - "日本には春、夏、秋、冬という四つの季節があり、"
+    - "この装置には赤、青、緑、黄色という四つのボタンがあり、"
+  max_new_bytes: 96
+  temperature: 0.0
+  top_p: 1.0
+  seed: 42
+
+probes:
+  enabled: true
+  items:
+    - name: ja_seasons
+      prompt: "日本には春、夏、秋、冬という四つの季節があり、"
+      target: "それぞれに異なる気候と風景を楽しむことができる。"
+      bad_targets:
+        - "あっという間においしくなった。"
+        - "天然記念物になるという。"
+    - name: ja_buttons
+      prompt: "この装置には赤、青、緑、黄色という四つのボタンがあり、"
+      target: "それぞれに異なる機能が割り当てられている。"
+      bad_targets:
+        - "あっという間においしくなった。"
+        - "天然記念物になるという。"
+
+logging:
+  wandb_project: arbor-llm
+  log_every_steps: 10
+  throughput_window: 10
+  byte_kind_metrics: true
+  best_ema_decay: 0.98

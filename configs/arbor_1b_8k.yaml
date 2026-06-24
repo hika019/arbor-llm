@@ -185,8 +185,25 @@ sampling:
   top_p: 0.95
   seed: 42
 
+probes:
+  enabled: true
+  items:
+    - name: ja_seasons
+      prompt: "日本には春、夏、秋、冬という四つの季節があり、"
+      target: "それぞれに異なる気候と風景を楽しむことができる。"
+      bad_targets:
+        - "あっという間においしくなった。"
+        - "天然記念物になるという。"
+    - name: ja_buttons
+      prompt: "この装置には赤、青、緑、黄色という四つのボタンがあり、"
+      target: "それぞれに異なる機能が割り当てられている。"
+      bad_targets:
+        - "あっという間においしくなった。"
+        - "天然記念物になるという。"
+
 logging:
   wandb_project: arbor-llm
   log_every_steps: 20
   throughput_window: 50
+  byte_kind_metrics: true
   best_ema_decay: 0.98

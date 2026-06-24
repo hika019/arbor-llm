@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from src.train.train import resolve_precision
+from src.train.train import byte_kind_loss_stats
 from src.train.train import CudaBatchPrefetcher
 from src.train.train import rebase_scheduler_lr
 from src.train.train import should_restore_dataloader_state
@@ -46,6 +47,22 @@ def test_should_not_restore_dataloader_state_when_data_config_changed():
     }
 
     assert not should_restore_dataloader_state(saved_data_cfg, current_data_cfg)
+
+
+def test_byte_kind_loss_stats_groups_utf8_classes():
+    labels = torch.tensor([[ord("A") + 4, 0xE3 + 4, 0x81 + 4, 0xF8 + 4, -100]])
+    losses = torch.tensor([1.0, 2.0, 3.0, 4.0, 99.0])
+
+    stats = byte_kind_loss_stats(losses, labels)
+
+    assert stats["ascii_count"] == 1.0
+    assert stats["ascii_loss_sum"] == 1.0
+    assert stats["utf8_lead_count"] == 1.0
+    assert stats["utf8_lead_loss_sum"] == 2.0
+    assert stats["utf8_cont_count"] == 1.0
+    assert stats["utf8_cont_loss_sum"] == 3.0
+    assert stats["other_count"] == 1.0
+    assert stats["other_loss_sum"] == 4.0
 
 
 def test_rebase_scheduler_lr_preserves_step_but_changes_base_lr():
