@@ -18,6 +18,9 @@ from typing import Any, Iterator
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
+from src.data.text_filter import evaluate_text_filter
+from src.data.text_filter import resolve_text_filter_config
+
 
 @dataclass
 class _ResumeState:
@@ -322,6 +325,7 @@ class ByteStreamDataset(IterableDataset):
         pack: list[int] = []
         pack_is_raw_byte: list[bool] = []
         boundary_label_positions: list[int] = []
+        text_filter = resolve_text_filter_config(specs[source_idx].get("text_filter"))
 
         def next_doc_bytes() -> bytes | None:
             while True:
@@ -337,6 +341,15 @@ class ByteStreamDataset(IterableDataset):
                 text = row.get("text")
                 if not text:
                     continue
+                if text_filter is not None:
+                    decision = evaluate_text_filter(text, text_filter)
+                    stats = self._state.extra.setdefault("text_filter_stats", {})
+                    source_key = specs[source_idx].get("id") or str(source_idx)
+                    source_stats = stats.setdefault(source_key, {"accepted": 0, "rejected": 0})
+                    if not decision.accepted:
+                        source_stats["rejected"] += 1
+                        continue
+                    source_stats["accepted"] += 1
                 data = text.encode("utf-8", errors="ignore")
                 if not data:
                     continue

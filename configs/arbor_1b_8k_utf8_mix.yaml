@@ -47,6 +47,8 @@ data:
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
       weight_bytes: 0.599
+      text_filter:
+        preset: ja_web_v1
     - id: wikipedia_ja
       path: "wikimedia/wikipedia"
       name: "20231101.ja"

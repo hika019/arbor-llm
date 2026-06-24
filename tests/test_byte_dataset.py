@@ -4,6 +4,7 @@ import pytest
 
 from src.data.byte_dataset import ByteStreamDataset
 from src.data.byte_dataset import build_byte_dataloader
+from src.data.text_filter import evaluate_text_filter
 
 
 def test_hf_stream_uses_byte_offset(monkeypatch):
@@ -127,6 +128,87 @@ def test_document_packing_masks_cross_document_label(monkeypatch):
     assert sample["input_ids"].tolist() == [ord("a"), ord("b"), ord("c"), 2, ord("d"), ord("e")]
     assert sample["labels"].tolist() == [ord("b"), ord("c"), 2, -100, ord("e"), 2]
     assert sample["fill_ratio"].item() == 1.0
+
+
+def test_ja_web_text_filter_accepts_paragraph_text():
+    text = 3 * (
+        "日本の四季には春、夏、秋、冬があり、それぞれに異なる気候と風景があります。"
+        "春には桜が咲き、夏には海や山の行楽が楽しまれます。"
+        "秋には紅葉が色づき、冬には雪景色や温かい料理が人々の暮らしを彩ります。"
+        "地域によって季節の移ろい方は少しずつ異なり、同じ日本の中でも多様な文化が育まれてきました。"
+        "こうした変化は観光や農業だけでなく、日々の服装や食事にも深く関わっています。"
+    )
+
+    result = evaluate_text_filter(text, {"preset": "ja_web_v1"})
+
+    assert result.accepted
+    assert result.reasons == ()
+
+
+def test_ja_web_text_filter_rejects_boilerplate_listing():
+    text = """
+    ログイン
+    会員登録
+    お問い合わせ
+    サイトマップ
+    ランキング
+    関連記事
+    続きを読む
+    Copyright 2025 Example All rights reserved
+    https://example.com/item/1
+    https://example.com/item/2
+    """
+
+    result = evaluate_text_filter(text, {"preset": "ja_web_v1"})
+
+    assert not result.accepted
+    assert "boilerplate" in result.reasons
+
+
+def test_ja_web_text_filter_rejects_suspicious_sequences():
+    text = 3 * (
+        "保険の選択では、保証内容と毎月の保険??料を比べることが大切です。"
+        "資料を読みながら、聞??いておきたい点を整理して相談すると判断しやすくなります。"
+        "家族構成や働き方によって必要な保障は変わるため、複数の商品を比較します。"
+    )
+
+    result = evaluate_text_filter(text, {"preset": "ja_web_v1"})
+
+    assert not result.accepted
+    assert "suspicious_sequences" in result.reasons
+
+
+def test_document_packing_skips_rejected_documents(monkeypatch):
+    accepted = 3 * (
+        "日本の四季には春、夏、秋、冬があり、それぞれに異なる気候と風景があります。"
+        "春には桜が咲き、夏には海や山の行楽が楽しまれます。"
+        "秋には紅葉が色づき、冬には雪景色や温かい料理が人々の暮らしを彩ります。"
+        "地域によって季節の移ろい方は少しずつ異なり、同じ日本の中でも多様な文化が育まれてきました。"
+        "こうした変化は観光や農業だけでなく、日々の服装や食事にも深く関わっています。"
+    )
+    rejected = "ログイン\n会員登録\nお問い合わせ\nランキング\n関連記事\nCopyright\nhttps://example.com"
+    ds = ByteStreamDataset(
+        sources=[{"id": "fineweb2_ja", "path": "a", "weight_bytes": 1.0, "max_epochs": 1, "text_filter": {"preset": "ja_web_v1"}}],
+        context_length=16,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: (
+            [[{"text": rejected}, {"text": accepted}]],
+            [{"id": "fineweb2_ja", "path": "a", "weight_bytes": 1.0, "max_epochs": 1, "text_filter": {"preset": "ja_web_v1"}}],
+        ),
+    )
+
+    sample = next(ds._iter_hf_document_packed())
+    state = ds.state_dict()
+
+    assert sample["input_ids"][0].item() == accepted.encode("utf-8")[0]
+    assert state["extra"]["text_filter_stats"]["fineweb2_ja"] == {"accepted": 1, "rejected": 1}
 
 
 def test_document_packing_masks_padding_labels(monkeypatch):
