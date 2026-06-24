@@ -148,6 +148,7 @@ def generate_stream(
     dtype: torch.dtype = torch.bfloat16,
     seed: int | None = None,
     use_cache: bool = False,
+    decode_errors: str = "ignore",
 ) -> Iterator[str]:
     """1 バイトずつ生成し、UTF-8 として確定した文字列片を逐次 yield する.
 
@@ -167,7 +168,7 @@ def generate_stream(
     if seed is not None:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    decoder = codecs.getincrementaldecoder("utf-8")(errors=decode_errors)
     use_autocast = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
 
     gen: ArborByteGenerator | None = None
@@ -248,6 +249,10 @@ def main() -> int:
     p.add_argument("--top-k", default=0, type=int)
     p.add_argument("--top-p", default=0.95, type=float)
     p.add_argument("--seed", default=None, type=int)
+    p.add_argument("--max-context", default=None, type=int,
+                   help="推論時に使う最大文脈長。既定は checkpoint の model.max_bytes")
+    p.add_argument("--decode-errors", default="ignore", choices=("ignore", "replace", "strict"),
+                   help="UTF-8 として未確定/不正な生成バイトの扱い")
     cache_group = p.add_mutually_exclusive_group()
     cache_group.add_argument("--cache", action="store_true",
                              help="ArborByteGenerator の KV cache を使う (実験的・高速)")
@@ -261,7 +266,13 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_dir = resolve_checkpoint(args.ckpt, args.ckpt_dir)
     cfg = load_checkpoint_config(ckpt_dir, args.config)
-    max_context = int(cfg.get("model", {}).get("max_position_embeddings", 2048))
+    model_cfg = cfg.get("model", {})
+    max_context = int(
+        args.max_context
+        or model_cfg.get("max_bytes")
+        or model_cfg.get("max_position_embeddings")
+        or 2048
+    )
 
     print(f"[generate] checkpoint={ckpt_dir}")
     t0 = time.perf_counter()
@@ -280,6 +291,7 @@ def main() -> int:
             top_k=args.top_k, top_p=args.top_p,
             max_context=max_context, seed=args.seed,
             use_cache=args.cache,
+            decode_errors=args.decode_errors,
         ):
             sys.stdout.write(piece)
             sys.stdout.flush()

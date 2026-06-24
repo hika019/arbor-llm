@@ -62,6 +62,13 @@ def test_utf8_multibyte_incremental_decode():
     assert out == "ああ"
 
 
+def test_utf8_incomplete_tail_is_ignored_by_default():
+    # 生成上限が UTF-8 の途中で止まっても、CLI 既定では置換文字を出さない。
+    m = _NextByteModel({ord("x"): 0xE3, 0xE3: 0x81, 0x81: 0x82})
+    out = generate_text(m, "x", max_new_bytes=2, temperature=0.0)
+    assert out == ""
+
+
 def test_special_ids_are_masked():
     m = _SpecialTokenLover()
     out = generate_text(m, "x", max_new_bytes=3, temperature=0.0)
