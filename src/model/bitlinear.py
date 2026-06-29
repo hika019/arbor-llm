@@ -19,15 +19,16 @@
 torch.compile が全体を融合でき、CPU でもそのまま動く。学習は BF16 シャドウ重みが
 master。
 
-推論パス (任意): `freeze_for_inference()` を呼ぶと ternary 重みを 2bit/値で pack
-した uint8 バッファを事前計算し、以後の eval forward は Triton カーネル
-(int8 活性 × packed ternary) で計算する。重み読み出しが bf16 比 1/8 になるため
-batch=1 の生成 (メモリ帯域律速) が速くなる。Triton/CUDA が無い環境では
-dequantize 済み重みのキャッシュにフォールバックする (毎回の再量子化を省く)。
+推論パス (任意): `freeze_for_inference()` を呼ぶと dequantize 済み ternary 重みを
+キャッシュし、以後の eval forward で毎回の重み再量子化を省く。実験的な
+packed ternary Triton カーネルは `ARBOR_PACKED_BITLINEAR_INFERENCE=1` のときだけ
+有効にする。packed 経路は速いが、行数によって通常 eval forward と丸めが変わり、
+逐次生成の argmax が分岐し得るため既定では使わない。
 """
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -304,15 +305,16 @@ class BitLinear(nn.Module):
     def freeze_for_inference(self) -> None:
         """ternary 重みを事前計算して以後の eval forward を高速化する (重みは凍結前提).
 
-        - 小バッチ (M <= _SMALL_M): dequantize 済み重みキャッシュ + cuBLAS。
-          活性量子化は fake_quantize 1 カーネルに融合する
-        - 大バッチ: packed ternary Triton カーネル (重み読み出し 1/8)
+        - 既定: dequantize 済み重みキャッシュ + cuBLAS。
+        - `ARBOR_PACKED_BITLINEAR_INFERENCE=1`: 大バッチで packed ternary Triton
+          カーネルを使う。速度診断用で、品質比較では既定経路を使う。
         """
         with torch.no_grad():
             scale = self.weight.abs().mean().clamp_min(1e-5).float()
             w_int = (self.weight.float() / scale).round().clamp(-1, 1).to(torch.int8)
             self._w_dq = (w_int.float() * scale).to(self.weight.dtype)
-            if triton is not None and self.weight.is_cuda:
+            use_packed = os.environ.get("ARBOR_PACKED_BITLINEAR_INFERENCE", "0") == "1"
+            if use_packed and triton is not None and self.weight.is_cuda:
                 self._w_packed = pack_ternary_weight(w_int)
             else:
                 self._w_packed = None

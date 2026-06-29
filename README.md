@@ -36,8 +36,8 @@ bytes (T=2048)                          token = byte + 4, vocab 260, tokenizer �
     GPU 上に閉じる (CPU はテスト用 torch 実装)。動作確認用の小規模設定が
     `configs/trial_space.yaml` / `configs/trial_entropy.yaml`。
   - 因果性 (未来バイト→過去 logits の漏れ無し) は 3 モードともテストで検証済み。
-- 学習は BF16 シャドウ重みの QAT。BitNet の推論側の利点 (packed ternary kernel に
-  よる省メモリ・高速化) は未実装で、現状の推論は bf16 で on-the-fly 量子化する。
+- 学習は BF16 シャドウ重みの QAT。推論は BitLinear の dequant キャッシュで
+  毎回の重み再量子化を省く。packed ternary Triton 経路は速度診断用の明示 opt-in。
 
 実測 (RTX 4090 / WSL2, synthetic, `micro_batch=8` `T=2048` compile 込み):
 **51.2k bytes/s, VRAM 16.1 GiB** (旧 BLT 版の本走実測 ~13k bytes/s から大幅改善)。
@@ -234,7 +234,8 @@ python -m src.infer.generate --ckpt 5000 --ckpt-dir checkpoints/arbor2_1b_8k_ent
 `--ckpt latest` / `best` / step 数は `--ckpt-dir` で指定した run ディレクトリ内で解決される。
 生成は既定でフルフォワード方式を使う。単発の品質確認では、KV cache 経路の
 数値差より checkpoint 本体の出力を優先するため。BitLinear は推論凍結
-(packed ternary / dequant キャッシュ) を使う。2 階層 KV cache
+(dequant キャッシュ) を使う。packed ternary Triton 経路は
+`ARBOR_PACKED_BITLINEAR_INFERENCE=1` の明示指定時だけ有効にする。2 階層 KV cache
 (global は patch 確定ごとに追記、local は patch 内のみ再計算) は
 `--cache` を指定した場合だけ使う実験的高速化。
 

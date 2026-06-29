@@ -190,6 +190,7 @@ sampling:
   temperature: 0.8
   top_p: 0.95
   seed: 42
+  use_cache: false              # true で checkpoint 時サンプル生成を高速化 (比較厳密性は下がる)
 
 probes:
   enabled: true

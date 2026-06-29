@@ -718,6 +718,8 @@ def main() -> int:
                 sampling_cfg.get("max_new_bytes", 100),
             )
         )
+        if bool(sampling_cfg.get("use_cache", False)):
+            print("[train] sampling.use_cache=ON")
 
     # checkpoint 保存時の固定 good/bad target probe (任意)。
     probes_cfg = cfg.get("probes", {})
@@ -743,6 +745,7 @@ def main() -> int:
                 top_p=float(sampling_cfg.get("top_p", 0.95)),
                 max_context=int(context_length) if context_length else 2048,
                 seed=int(sampling_cfg.get("seed", 42)),
+                use_cache=bool(sampling_cfg.get("use_cache", False)),
             )
             lines = [f"# step {step}"]
             for prompt, text in samples:

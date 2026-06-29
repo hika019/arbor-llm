@@ -150,12 +150,12 @@ def load_inference_model(
     model.eval()
 
     if freeze_bitlinear:
-        # 推論では重みが固定なので BitLinear を packed ternary に凍結して高速化
+        # 推論では重みが固定なので BitLinear の量子化重みをキャッシュする。
         from src.model.bitlinear import freeze_bitlinear_for_inference
 
         n_frozen = freeze_bitlinear_for_inference(model)
         if n_frozen:
-            print(f"[generate] bitlinear_frozen={n_frozen} layers (packed ternary inference)")
+            print(f"[generate] bitlinear_frozen={n_frozen} layers (cached ternary inference)")
     else:
         print("[generate] bitlinear_frozen=0 layers (--no-freeze-bitlinear)")
     return model
@@ -321,6 +321,7 @@ def generate_samples(
     top_p: float = 0.95,
     max_context: int = 2048,
     seed: int | None = 42,
+    use_cache: bool = False,
 ) -> list[tuple[str, str]]:
     """学習ループの checkpoint 時サンプル生成用。(prompt, completion) のリストを返す.
 
@@ -333,6 +334,7 @@ def generate_samples(
             model, prompt,
             max_new_bytes=max_new_bytes, temperature=temperature,
             top_p=top_p, max_context=max_context, seed=seed,
+            use_cache=use_cache,
             utf8_mask=True,
         )
         out.append((prompt, text))
@@ -369,7 +371,7 @@ def main() -> int:
     p.add_argument(
         "--no-freeze-bitlinear",
         action="store_true",
-        help="BitLinear の packed ternary 推論凍結を無効化する (診断用)",
+        help="BitLinear の推論用量子化重みキャッシュを無効化する (診断用)",
     )
     p.add_argument(
         "--no-utf8-mask",

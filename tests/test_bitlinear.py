@@ -150,6 +150,7 @@ def test_frozen_inference_matches_eval_forward():
     ref = lin(x)
     lin.freeze_for_inference()
     assert lin.frozen
+    assert lin._w_packed is None
     out = lin(x)
     assert torch.allclose(out, ref, atol=1e-4), float((out - ref).abs().max())
     # train モードに戻すと学習パスに切り替わる (凍結値は使われない)
@@ -160,12 +161,13 @@ def test_frozen_inference_matches_eval_forward():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_frozen_packed_kernel_matches_reference_cuda():
+def test_frozen_inference_matches_reference_cuda():
     torch.manual_seed(0)
     lin = BitLinear(128, 96).to(device="cuda", dtype=torch.bfloat16).eval()
     x = torch.randn(9, 128, device="cuda", dtype=torch.bfloat16)
     ref = lin(x).float()
     lin.freeze_for_inference()
     out = lin(x).float()
-    assert lin._w_packed is not None or lin._w_dq is not None
+    assert lin._w_packed is None
+    assert lin._w_dq is not None
     assert torch.allclose(out, ref, atol=3e-2, rtol=1e-2), float((out - ref).abs().max())
