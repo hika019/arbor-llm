@@ -81,6 +81,8 @@ data:
       revision: main
       license_policy: "dataset card terms; math web mixture"
       weight_bytes: 0.06
+      text_filter:
+        preset: en_web_quality_v1
     - id: github_code_filtered
       path: "loubnabnl/github-code-more-filtering"  # license/generated/vendor/secret/dup filter 前提
       text_column: "code"
@@ -92,6 +94,8 @@ data:
       revision: main
       license_policy: "dataset card terms; code/web mixture"
       weight_bytes: 0.01
+      text_filter:
+        preset: en_web_quality_v1
   streaming: true
   packing: document
   eos_token_id: 2
@@ -135,7 +139,7 @@ speed:
 
 validation:
   enabled: true
-  max_batches: 16
+  max_batches: 64
   micro_batch_size: 2
   domains:
     ja_web:

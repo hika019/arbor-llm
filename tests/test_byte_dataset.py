@@ -90,6 +90,90 @@ def test_hf_stream_exact_resume_via_state_dict(monkeypatch):
     assert second["input_ids"].tolist() == [ord("e"), ord("f"), ord("g")]
 
 
+def test_document_packing_resume_restores_per_source_stream_states(monkeypatch):
+    specs = [{"path": "a", "weight_bytes": 1.0}, {"path": "b", "weight_bytes": 1.0}]
+    rows_a = [{"text": "abc"}, {"text": "def"}]
+    rows_b = [{"text": "XYZ"}, {"text": "UVW"}]
+    ds = ByteStreamDataset(
+        sources=specs,
+        context_length=3,
+        byte_offset=0,
+        packing="document",
+        seed=1,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: ([_FakeStatefulStream(rows_a), _FakeStatefulStream(rows_b)], specs),
+    )
+
+    iterator = ds._iter_hf_document_packed()
+    first = next(iterator)
+    second = next(iterator)
+    state = ds.state_dict()
+
+    restored = ByteStreamDataset(
+        sources=specs,
+        context_length=3,
+        byte_offset=0,
+        packing="document",
+        seed=1,
+    )
+    monkeypatch.setattr(
+        restored,
+        "_build_hf_source_streams",
+        lambda: ([_FakeStatefulStream(rows_a), _FakeStatefulStream(rows_b)], specs),
+    )
+    restored.load_state_dict(state)
+    third = next(restored._iter_hf_document_packed())
+
+    assert first["input_ids"].tolist() == [ord("a"), ord("b"), ord("c")]
+    assert second["input_ids"].tolist() == [ord("X"), ord("Y"), ord("Z")]
+    assert third["input_ids"].tolist() == [ord("d"), ord("e"), ord("f")]
+
+
+def test_document_packing_resume_restores_in_progress_pack_buffer(monkeypatch):
+    specs = [{"path": "a", "weight_bytes": 1.0, "max_epochs": 1}]
+    rows = [{"text": "abc"}, {"text": "defgh"}, {"text": "ij"}]
+    ds = ByteStreamDataset(
+        sources=specs,
+        context_length=6,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: ([_FakeStatefulStream(rows)], specs),
+    )
+
+    first = next(ds._iter_hf_document_packed())
+    state = ds.state_dict()
+
+    restored = ByteStreamDataset(
+        sources=specs,
+        context_length=6,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+    )
+    monkeypatch.setattr(
+        restored,
+        "_build_hf_source_streams",
+        lambda: ([_FakeStatefulStream(rows)], specs),
+    )
+    restored.load_state_dict(state)
+    second = next(restored._iter_hf_document_packed())
+
+    assert first["input_ids"].tolist() == [ord("a"), ord("b"), ord("c"), 2, ord("d"), ord("e")]
+    assert first["labels"].tolist() == [ord("b"), ord("c"), 2, -100, ord("e"), ord("f")]
+    assert second["input_ids"].tolist() == [ord("g"), ord("h"), 2, ord("i"), ord("j"), 2]
+    assert second["labels"].tolist() == [ord("h"), 2, -100, ord("j"), 2, -100]
+
+
 def test_local_file_resume_uses_byte_offset_without_double_skip(tmp_path):
     data_file = tmp_path / "bytes.txt"
     data_file.write_text("abcdefghijklmnopqrstuvwxyz")

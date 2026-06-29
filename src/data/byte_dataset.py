@@ -251,6 +251,22 @@ class ByteStreamDataset(IterableDataset):
         except ImportError as e:
             raise RuntimeError("`datasets` が必要 (pip install datasets)") from e
 
+        source_count = len(streams)
+        document_stream_states = list(
+            self._state.extra.get("document_stream_states", [None for _ in range(source_count)])
+        )
+        if len(document_stream_states) != source_count:
+            document_stream_states = [None for _ in range(source_count)]
+        for stream, stream_state in zip(streams, document_stream_states):
+            if stream_state is not None and hasattr(stream, "load_state_dict"):
+                stream.load_state_dict(stream_state)
+
+        document_pack_states = list(
+            self._state.extra.get("document_pack_states", [{} for _ in range(source_count)])
+        )
+        if len(document_pack_states) != source_count:
+            document_pack_states = [{} for _ in range(source_count)]
+
         source_iters = [iter(ds) for ds in streams]
         weights = [float(s.get("weight_bytes", s.get("weight", 1.0))) for s in specs]
         total_weight = sum(weights) or 1.0
@@ -273,7 +289,8 @@ class ByteStreamDataset(IterableDataset):
         source_generators = [
             self._source_document_samples(
                 idx, streams, source_iters, specs, source_epochs,
-                emitted_source_docs, block, off,
+                emitted_source_docs, document_stream_states,
+                document_pack_states, block, off,
             )
             for idx in range(len(specs))
         ]
@@ -309,6 +326,8 @@ class ByteStreamDataset(IterableDataset):
             self._state.extra["emitted_source_bytes"] = emitted_source_bytes
             self._state.extra["emitted_source_docs"] = emitted_source_docs
             self._state.extra["source_epochs"] = source_epochs
+            self._state.extra["document_stream_states"] = document_stream_states
+            self._state.extra["document_pack_states"] = document_pack_states
             yield sample
 
     def _source_document_samples(
@@ -319,13 +338,30 @@ class ByteStreamDataset(IterableDataset):
         specs: list[dict[str, Any]],
         source_epochs: list[int],
         emitted_source_docs: list[int],
+        document_stream_states: list[Any],
+        document_pack_states: list[dict[str, Any]],
         block: int,
         off: int,
     ) -> Iterator[dict[str, torch.Tensor]]:
-        pack: list[int] = []
-        pack_is_raw_byte: list[bool] = []
-        boundary_label_positions: list[int] = []
+        restored_pack = document_pack_states[source_idx] if source_idx < len(document_pack_states) else {}
+        if not isinstance(restored_pack, dict):
+            restored_pack = {}
+        pack: list[int] = list(restored_pack.get("pack", []))
+        pack_is_raw_byte: list[bool] = list(restored_pack.get("pack_is_raw_byte", []))
+        boundary_label_positions: list[int] = list(restored_pack.get("boundary_label_positions", []))
         text_filter = resolve_text_filter_config(specs[source_idx].get("text_filter"))
+
+        def save_source_resume_state() -> None:
+            document_pack_states[source_idx] = {
+                "pack": list(pack),
+                "pack_is_raw_byte": list(pack_is_raw_byte),
+                "boundary_label_positions": list(boundary_label_positions),
+            }
+            stream = streams[source_idx]
+            if hasattr(stream, "state_dict"):
+                document_stream_states[source_idx] = stream.state_dict()
+            self._state.extra["document_stream_states"] = document_stream_states
+            self._state.extra["document_pack_states"] = document_pack_states
 
         def next_doc_bytes() -> bytes | None:
             while True:
@@ -391,7 +427,9 @@ class ByteStreamDataset(IterableDataset):
             raw = next_doc_bytes()
             if raw is None:
                 if pack:
-                    yield make_sample(pad_final=True)
+                    sample = make_sample(pad_final=True)
+                    save_source_resume_state()
+                    yield sample
                 return
             tokens = [b + off for b in raw]
             doc_seq = tokens + [self.eos_token_id]
@@ -400,7 +438,9 @@ class ByteStreamDataset(IterableDataset):
             pack.extend(doc_seq)
             pack_is_raw_byte.extend([True] * len(tokens) + [False])
             while len(pack) >= block:
-                yield make_sample()
+                sample = make_sample()
+                save_source_resume_state()
+                yield sample
 
     def _iter_local_file(self, path_str: str) -> Iterator[dict[str, torch.Tensor]]:
         """ローカルファイルを mmap で参照し、context_length バイトずつ切り出す.

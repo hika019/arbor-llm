@@ -7,6 +7,7 @@ from typing import Any
 
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+|[A-Za-z0-9_.-]+\.(?:com|jp|net|org|info|biz)\b")
+_LIST_LINE_RE = re.compile(r"^\s*(?:[-*•]+|\d+[.)]|[A-Za-z][.)])\s+")
 
 JA_WEB_V1_FILTER: dict[str, Any] = {
     "min_chars": 300,
@@ -61,6 +62,71 @@ JA_WEB_V1_FILTER: dict[str, Any] = {
 }
 
 
+EN_WEB_QUALITY_V1_FILTER: dict[str, Any] = {
+    "min_chars": 450,
+    "min_alpha_ratio": 0.55,
+    "max_url_count": 4,
+    "max_url_char_ratio": 0.04,
+    "max_digit_symbol_ratio": 0.40,
+    "max_repeated_line_ratio": 0.25,
+    "max_short_line_ratio": 0.60,
+    "max_list_line_ratio": 0.45,
+    "min_sentence_end_count": 3,
+    "drop_if_boilerplate_hits_at_least": 3,
+    "drop_if_html_js_hits_at_least": 2,
+    "max_suspicious_sequence_count": 0,
+    "short_line_chars": 18,
+    "boilerplate_terms": [
+        "accept cookies",
+        "cookie preferences",
+        "privacy policy",
+        "terms of service",
+        "sign in",
+        "log in",
+        "create account",
+        "subscribe",
+        "newsletter",
+        "navigation",
+        "main menu",
+        "sitemap",
+        "all rights reserved",
+        "click here",
+        "enable javascript",
+        "page not found",
+        "error 404",
+        "access denied",
+        "buy now",
+        "add to cart",
+        "checkout",
+        "shopping cart",
+        "product details",
+        "customer reviews",
+        "related products",
+        "price",
+        "sku",
+        "shipping",
+        "returns",
+    ],
+    "html_js_terms": [
+        "<div",
+        "</",
+        "&nbsp;",
+        "function",
+        "window.",
+        "document.",
+        "var ",
+        "const ",
+        "onclick",
+    ],
+}
+
+
+_PRESET_FILTERS: dict[str, dict[str, Any]] = {
+    "ja_web_v1": JA_WEB_V1_FILTER,
+    "en_web_quality_v1": EN_WEB_QUALITY_V1_FILTER,
+}
+
+
 @dataclass(frozen=True)
 class TextFilterResult:
     accepted: bool
@@ -74,9 +140,9 @@ def resolve_text_filter_config(config: dict[str, Any] | None) -> dict[str, Any] 
     resolved: dict[str, Any] = {}
     preset = config.get("preset")
     if preset:
-        if preset != "ja_web_v1":
+        if preset not in _PRESET_FILTERS:
             raise ValueError(f"unknown text_filter preset: {preset}")
-        resolved.update(JA_WEB_V1_FILTER)
+        resolved.update(_PRESET_FILTERS[preset])
     resolved.update({k: v for k, v in config.items() if k != "preset"})
     return resolved
 
@@ -88,7 +154,7 @@ def evaluate_text_filter(text: str, config: dict[str, Any] | None) -> TextFilter
 
     compact = "".join(ch for ch in text if not ch.isspace())
     total = len(compact)
-    hira = kata = kanji = ascii_count = digit_symbol = sentence_end = 0
+    hira = kata = kanji = ascii_count = alpha_count = digit_symbol = sentence_end = 0
     for ch in compact:
         code = ord(ch)
         if 0x3040 <= code <= 0x309F:
@@ -99,10 +165,12 @@ def evaluate_text_filter(text: str, config: dict[str, Any] | None) -> TextFilter
             kanji += 1
         if code < 128:
             ascii_count += 1
+        if ch.isalpha():
+            alpha_count += 1
         category = unicodedata.category(ch)
         if ch.isdigit() or category.startswith("P") or category.startswith("S"):
             digit_symbol += 1
-        if ch in "。！？!?":
+        if ch in "。！？!?.":
             sentence_end += 1
 
     urls = _URL_RE.findall(text)
@@ -111,6 +179,7 @@ def evaluate_text_filter(text: str, config: dict[str, Any] | None) -> TextFilter
     line_count = len(lines)
     short_limit = int(cfg.get("short_line_chars", 12))
     short_lines = sum(1 for line in lines if len(line) <= short_limit)
+    list_lines = sum(1 for line in lines if _LIST_LINE_RE.match(line))
     repeated_lines = line_count - len(set(lines))
     lower_text = text.lower()
     boilerplate_hits = sum(1 for term in cfg.get("boilerplate_terms", []) if term.lower() in lower_text)
@@ -123,10 +192,12 @@ def evaluate_text_filter(text: str, config: dict[str, Any] | None) -> TextFilter
         "ja_char_ratio": (hira + kata + kanji) / denom,
         "kana_ratio": (hira + kata) / denom,
         "ascii_ratio": ascii_count / denom,
+        "alpha_ratio": alpha_count / denom,
         "digit_symbol_ratio": digit_symbol / denom,
         "url_count": float(len(urls)),
         "url_char_ratio": url_chars / denom,
         "short_line_ratio": short_lines / max(line_count, 1),
+        "list_line_ratio": list_lines / max(line_count, 1),
         "repeated_line_ratio": repeated_lines / max(line_count, 1),
         "sentence_end_count": float(sentence_end),
         "boilerplate_hits": float(boilerplate_hits),
@@ -141,6 +212,8 @@ def evaluate_text_filter(text: str, config: dict[str, Any] | None) -> TextFilter
         reasons.append("low_ja_ratio")
     if metrics["kana_ratio"] < float(cfg.get("min_kana_ratio", 0.0)):
         reasons.append("low_kana_ratio")
+    if metrics["alpha_ratio"] < float(cfg.get("min_alpha_ratio", 0.0)):
+        reasons.append("low_alpha_ratio")
     if metrics["url_count"] > float(cfg.get("max_url_count", float("inf"))):
         reasons.append("too_many_urls")
     if metrics["url_char_ratio"] > float(cfg.get("max_url_char_ratio", float("inf"))):
@@ -153,6 +226,8 @@ def evaluate_text_filter(text: str, config: dict[str, Any] | None) -> TextFilter
         reasons.append("too_many_repeated_lines")
     if metrics["short_line_ratio"] > float(cfg.get("max_short_line_ratio", float("inf"))):
         reasons.append("too_many_short_lines")
+    if metrics["list_line_ratio"] > float(cfg.get("max_list_line_ratio", float("inf"))):
+        reasons.append("too_many_list_lines")
     if metrics["sentence_end_count"] < float(cfg.get("min_sentence_end_count", 0)):
         reasons.append("too_few_sentences")
     if boilerplate_hits >= int(cfg.get("drop_if_boilerplate_hits_at_least", 10**9)):
