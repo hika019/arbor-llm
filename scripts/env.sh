@@ -12,9 +12,12 @@ if [[ -d "${MAMBA_ENV}/bin" ]]; then
   export PATH="${MAMBA_ENV}/bin:${PATH}"
   export CC="${MAMBA_ENV}/bin/gcc"
   export CXX="${MAMBA_ENV}/bin/g++"
-  # Python.h を triton/JIT が探せるよう include path を補う
-  export C_INCLUDE_PATH="${MAMBA_ENV}/include/python3.12:${C_INCLUDE_PATH:-}"
-  export CPLUS_INCLUDE_PATH="${MAMBA_ENV}/include/python3.12:${CPLUS_INCLUDE_PATH:-}"
+  # Python.h を triton/JIT が探せるよう include path を補う。
+  # /usr/include/python3.12/Python.h は <x86_64-linux-gnu/python3.12/pyconfig.h> を
+  # 相対 include するため、multiarch ヘッダの親である /usr/include も必要
+  # (無いと新しい compile グラフ形状が出る度に triton launcher のビルドが失敗する)。
+  export C_INCLUDE_PATH="${MAMBA_ENV}/include/python3.12:/usr/include:${C_INCLUDE_PATH:-}"
+  export CPLUS_INCLUDE_PATH="${MAMBA_ENV}/include/python3.12:/usr/include:${CPLUS_INCLUDE_PATH:-}"
 fi
 
 if [[ -f "${PROJECT_DIR}/.venv/bin/activate" ]]; then
