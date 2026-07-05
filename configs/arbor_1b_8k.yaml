@@ -139,7 +139,7 @@ speed:
 
 validation:
   enabled: true
-  max_batches: 128
+  max_batches: 64
   micro_batch_size: 2
   domains:
     ja_web:

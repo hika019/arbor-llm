@@ -751,6 +751,10 @@ def main() -> int:
             for prompt, text in samples:
                 print(f"[sample] step={step} prompt={prompt!r} -> {text!r}")
                 lines.append(f"\n## prompt: {prompt}\n{text}")
+            # checkpoint がまだ background thread で書き込み中なら、ここで待つ
+            # (step_dir はそれまで存在しない)。待ち時間は generate_samples の
+            # GPU 処理と write の重なりぶん相殺されるので、通常はほぼ即座に返る。
+            ckpt.wait_for_pending_save()
             (step_dir / "samples.txt").write_text("\n".join(lines), encoding="utf-8")
             print(f"[sample] wrote {step_dir / 'samples.txt'} in {time.perf_counter() - t0:.1f}s")
         except Exception as e:  # noqa: BLE001 - サンプル生成失敗で学習は止めない
@@ -775,6 +779,7 @@ def main() -> int:
                     "probe": results,
                     "time": time.time(),
                 }, ensure_ascii=False) + "\n")
+            ckpt.wait_for_pending_save()
             (step_dir / "probes.json").write_text(
                 json.dumps({"step": step, "probe": results}, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -1262,11 +1267,13 @@ def main() -> int:
                     base_model, optimizer, scheduler, dl_state, meta, config=effective_cfg,
                     is_best=is_best,
                     is_final=global_step >= total_steps,
+                    force_sync=stop_save,
                 )
                 save_seconds = time.perf_counter() - t0
                 print(
                     f"[train] saved checkpoint @ step={global_step}"
                     f"{' (best)' if is_best else ''} in {save_seconds:.1f}s"
+                    f"{' (background write continues)' if ckpt.async_save and not stop_save and global_step < total_steps else ''}"
                 )
                 if sampling_enabled:
                     sample_at_checkpoint(saved_dir, global_step)

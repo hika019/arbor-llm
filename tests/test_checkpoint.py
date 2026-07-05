@@ -77,3 +77,78 @@ def test_checkpoint_meta_preserves_unknown_fields_in_extra():
 
     assert meta.global_step == 1
     assert meta.extra["future_field"] == "kept"
+
+
+def test_async_save_snapshots_before_mutation(tmp_path):
+    """The background write must use a CPU snapshot taken at save()-call time,
+    not whatever the live tensors look like when the thread actually runs."""
+    model = _model()
+    optimizer = _optimizer(model)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    # give AdamW some state so optimizer_state actually has tensors to snapshot
+    optimizer.zero_grad()
+    model(torch.ones(1, 3)).sum().backward()
+    optimizer.step()
+
+    manager = CheckpointManager(tmp_path, keep_last_k=2, keep_every_n_steps=None, async_save=True)
+    weight_at_save_time = model.weight.detach().clone()
+    manager.save(model, optimizer, None, None, CheckpointMeta(global_step=1))
+
+    # Mutate live model/optimizer state right after save() returns, exactly
+    # like the training loop's next micro-batch would.
+    with torch.no_grad():
+        model.weight.fill_(999.0)
+    for state in optimizer.state.values():
+        for v in state.values():
+            if torch.is_tensor(v):
+                v.fill_(999.0)
+
+    manager.wait_for_pending_save()
+
+    restored = _model()
+    meta, _ = manager.load(1, restored, map_location="cpu")
+    assert meta.global_step == 1
+    assert torch.equal(restored.weight, weight_at_save_time), (
+        "checkpoint captured the post-save mutation instead of the save()-time snapshot"
+    )
+
+
+def test_final_save_is_synchronous(tmp_path):
+    model = _model()
+    optimizer = _optimizer(model)
+    manager = CheckpointManager(tmp_path, keep_last_k=2, keep_every_n_steps=None, async_save=True)
+
+    manager.save(model, optimizer, None, None, CheckpointMeta(global_step=1), is_final=True)
+
+    # No wait_for_pending_save() call: files must already exist on disk.
+    assert (tmp_path / "step_0000000001" / "model.safetensors").exists()
+    assert manager._thread is None
+
+
+def test_force_sync_save_is_synchronous(tmp_path):
+    model = _model()
+    optimizer = _optimizer(model)
+    manager = CheckpointManager(tmp_path, keep_last_k=2, keep_every_n_steps=None, async_save=True)
+
+    manager.save(model, optimizer, None, None, CheckpointMeta(global_step=1), force_sync=True)
+
+    assert (tmp_path / "step_0000000001" / "model.safetensors").exists()
+    assert manager._thread is None
+
+
+def test_async_save_exception_surfaces_on_wait(tmp_path, monkeypatch):
+    import src.train.checkpoint as checkpoint_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk full (simulated)")
+
+    monkeypatch.setattr(checkpoint_mod, "safe_save", boom)
+
+    model = _model()
+    optimizer = _optimizer(model)
+    manager = CheckpointManager(tmp_path, keep_last_k=2, keep_every_n_steps=None, async_save=True)
+    manager.save(model, optimizer, None, None, CheckpointMeta(global_step=1))
+
+    with pytest.raises(RuntimeError, match="background checkpoint save failed"):
+        manager.wait_for_pending_save()
