@@ -33,4 +33,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # メモリ不足になる環境だけ、source 前に 4 などへ明示的に下げる。
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+# stdout をファイルにリダイレクトする本番run向け: block buffering だと
+# print が溜まるまでログに出ず監視しづらいので常に unbuffered にする。
+export PYTHONUNBUFFERED=1
 echo "[env] venv + micromamba gcc 有効化済み. gcc=$(gcc --version | head -1)"
