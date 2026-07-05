@@ -953,10 +953,12 @@ def main() -> int:
                             out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
                         ) / grad_accum
                 if out.patch_count is not None:
-                    pc = out.patch_count.detach()
+                    # compile_mode=reduce-overhead (CUDA Graphs) では次 replay で
+                    # グラフ出力バッファが上書きされるため、保持する前に clone が必要
+                    pc = out.patch_count.detach().clone()
                     interval_patches_tensor = pc if interval_patches_tensor is None else interval_patches_tensor + pc
                 if out.max_patch_count is not None:
-                    max_pc = out.max_patch_count.detach()
+                    max_pc = out.max_patch_count.detach().clone()
                     interval_max_patch_tensor = (
                         max_pc
                         if interval_max_patch_tensor is None
