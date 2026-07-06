@@ -444,24 +444,28 @@ def byte_kind_loss_stats(
     *,
     cpu: bool = True,
 ) -> dict[str, float | torch.Tensor]:
-    """Return count/loss sums for UTF-8 byte classes from unreduced CE losses."""
-    valid = labels != -100
-    if not bool(valid.any()):
-        return {}
-    flat_losses = losses.reshape(-1)
+    """Return count/loss sums for UTF-8 byte classes from unreduced CE losses.
+
+    boolean インデックス (`losses[mask]`) や `.any()` は出力形状/値がデータ依存の
+    ため device→host 同期を強制する。micro-batch 毎に呼ばれる関数なので、同期が
+    入ると CPU の先行が毎回リセットされ GPU に launch gap が積もる (profiler 実測で
+    cudaStreamSynchronize 9回/micro の主犯だった)。マスク乗算 + sum のみ:
+    cpu=False では同期ゼロで tensor を返す。
+    """
+    flat_losses = losses.reshape(-1).detach().float()
     flat_labels = labels.reshape(-1)
-    valid_losses = flat_losses[valid.reshape(-1)]
-    byte_values = flat_labels[valid.reshape(-1)] - 4
+    valid = flat_labels != -100
+    byte_values = flat_labels - 4
     masks = {
-        "ascii": (byte_values >= 0) & (byte_values < 0x80),
-        "utf8_cont": (byte_values >= 0x80) & (byte_values <= 0xBF),
-        "utf8_lead": (byte_values >= 0xC0) & (byte_values <= 0xF7),
-        "other": (byte_values >= 0xF8) | (byte_values < 0),
+        "ascii": valid & (byte_values >= 0) & (byte_values < 0x80),
+        "utf8_cont": valid & (byte_values >= 0x80) & (byte_values <= 0xBF),
+        "utf8_lead": valid & (byte_values >= 0xC0) & (byte_values <= 0xF7),
+        "other": valid & ((byte_values >= 0xF8) | (byte_values < 0)),
     }
     out: dict[str, float | torch.Tensor] = {}
     for name, mask in masks.items():
         count = mask.sum()
-        loss_sum = valid_losses[mask].detach().float().sum()
+        loss_sum = (flat_losses * mask).sum()
         if cpu:
             count_f = float(count.cpu())
             if count_f == 0.0:
@@ -1014,12 +1018,44 @@ def main() -> int:
         print("[train] cuda_prefetch=ON")
     if cpu_prefetch_depth > 0:
         print(f"[train] cpu_prefetch=ON depth={cpu_prefetch_depth}")
+
+    # ---- 単発 torch.profiler (ARBOR_TORCH_PROFILE="wait,active") ----
+    # 例: ARBOR_TORCH_PROFILE=25,2 → 25 optimizer step 待って 2 step 分の
+    # CPU+CUDA トレースを logs/ に chrome trace として書き出し、以後は通常続行。
+    # optimizer 境界の GPU アイドル (dmon で sm が 1 step 毎に落ちる) の調査用。
+    prof_spec = os.environ.get("ARBOR_TORCH_PROFILE")
+    prof_wait: int | None = None
+    prof_active = 0
+    if prof_spec:
+        try:
+            prof_wait, prof_active = (int(x) for x in prof_spec.split(","))
+            print(f"[train] torch profiler armed: wait={prof_wait} active={prof_active}")
+        except ValueError:
+            print(f"[train] WARNING: ARBOR_TORCH_PROFILE='{prof_spec}' は 'wait,active' 形式でないため無視")
+            prof_wait = None
+    torch_prof = None
+    prof_steps_done = 0
     if sync_each_step:
         print("[train] sync_each_step=ON")
 
     data_iter = make_data_iter()
     while global_step < total_steps:
         try:
+            if prof_wait is not None and torch_prof is None and prof_steps_done == prof_wait:
+                try:
+                    torch.cuda.synchronize()
+                    torch_prof = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                    )
+                    torch_prof.__enter__()
+                    print(f"[train] torch profiler started @ step={global_step}", flush=True)
+                except Exception as exc:  # noqa: BLE001 - 調査用機能で学習は止めない
+                    print(f"[train] WARNING: torch profiler start failed: {exc}", flush=True)
+                    torch_prof = None
+                    prof_wait = None
             step_t0 = time.perf_counter()
             bytes_this_step = 0
             for micro in range(grad_accum):
@@ -1083,8 +1119,12 @@ def main() -> int:
                             ignore_index=-100,
                             reduction="none",
                         )
-                        valid = labels.flatten() != -100
-                        loss = flat_losses[valid].mean() / grad_accum
+                        # flat_losses[valid].mean() は boolean インデックスで
+                        # device→host 同期するため、マスク乗算 + sum で同値を取る
+                        valid_f = (labels.flatten() != -100).to(flat_losses.dtype)
+                        loss = (flat_losses * valid_f).sum() / (
+                            valid_f.sum().clamp_min(1.0) * grad_accum
+                        )
                         stats = byte_kind_loss_stats(flat_losses, labels, cpu=False)
                         for key, value in stats.items():
                             if not torch.is_tensor(value):
@@ -1148,6 +1188,30 @@ def main() -> int:
                 torch.cuda.synchronize()
             meter.step(bytes_this_step)
             interval_cpu_ms["step"] += (time.perf_counter() - step_t0) * 1000.0
+
+            prof_steps_done += 1
+            if (
+                torch_prof is not None
+                and prof_wait is not None
+                and prof_steps_done >= prof_wait + prof_active
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    torch_prof.__exit__(None, None, None)
+                    trace_path = Path("logs") / f"torch_profile_step{global_step}.json"
+                    torch_prof.export_chrome_trace(str(trace_path))
+                    print(f"[train] torch profiler trace written: {trace_path}", flush=True)
+                    print(
+                        torch_prof.key_averages().table(
+                            sort_by="self_cpu_time_total", row_limit=30
+                        ),
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[train] WARNING: torch profiler export failed: {exc}", flush=True)
+                finally:
+                    torch_prof = None
+                    prof_wait = None
 
             loss_for_step = (
                 accum_loss_tensor.detach().float()
