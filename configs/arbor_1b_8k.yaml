@@ -173,7 +173,7 @@ validation:
       skip_samples: 20000
 
 checkpoint:
-  dir: /home/hi/checkpoints/arbor2_1b_8k_filter   # ext4 側。/mnt/d (drvfs) への torch.save は遅く破損クラッシュ実績あり
+  dir: ./checkpoints/arbor2_1b_8k_filter   # 実体は /home/hi/checkpoints (ext4) へのsymlink。drvfs直書きは遅く破損クラッシュ実績あり
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000
