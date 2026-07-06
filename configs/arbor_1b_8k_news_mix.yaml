@@ -1,12 +1,15 @@
-# Arbor v2 1B / 8192 bytes ベース学習 (arbor_1b.yaml の長コンテキスト + code/math 入り版)
+# Arbor v2 1B / 8192 bytes ニュース混合 continued pretraining
 #
-# 新規:   python -m src.train.train --config configs/arbor_1b_8k.yaml
-# 再開:   python -m src.train.train --config configs/arbor_1b_8k.yaml --resume latest
+# 推奨:
+#   python -m src.train.train --config configs/arbor_1b_8k_news_mix.yaml \
+#     --init-from checkpoints/arbor2_1b_8k_filter/step_0000050000
+# 再開:
+#   python -m src.train.train --config configs/arbor_1b_8k_news_mix.yaml --resume latest
 #
 # 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (8 bytes/patch)
 # なので global は 1024 patches。実効バッチは 64 seq = 524k bytes/update。
 
-run_name: arbor2_1b_8k_filter
+run_name: arbor2_1b_8k_news_mix
 seed: 42
 
 model:
@@ -43,7 +46,7 @@ data:
       name: "jpn_Jpan"
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
-      weight_bytes: 0.465
+      weight_bytes: 0.485
       text_filter:
         preset: ja_web_v1
     - id: wikipedia_ja
@@ -51,7 +54,7 @@ data:
       name: "20231101.ja"
       revision: main
       license_policy: "CC BY-SA/GFDL attribution requirements"
-      weight_bytes: 0.19
+      weight_bytes: 0.12
     - id: aozora_modern
       path: "globis-university/aozorabunko-clean"
       revision: main
@@ -69,18 +72,18 @@ data:
       path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
-      weight_bytes: 0.12
+      weight_bytes: 0.16
     - id: fineweb_en
       path: "HuggingFaceFW/fineweb"
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
-      weight_bytes: 0.05
+      weight_bytes: 0.06
     - id: finemath_4plus
       path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
       name: "finemath-4plus"
       revision: main
       license_policy: "dataset card terms; math web mixture"
-      weight_bytes: 0.06
+      weight_bytes: 0.05
       text_filter:
         preset: en_web_quality_v1
     - id: github_code_filtered
@@ -88,14 +91,32 @@ data:
       text_column: "code"
       revision: main
       license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
-      weight_bytes: 0.08
+      weight_bytes: 0.06
     - id: opc_code_web
       path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
       revision: main
       license_policy: "dataset card terms; code/web mixture"
-      weight_bytes: 0.01
+      weight_bytes: 0.015
       text_filter:
         preset: en_web_quality_v1
+    - id: news_ja
+      path: "atsushi3110/news-ja"       # 日本語ニュース JSONL (url, text)
+      revision: main
+      license_policy: "Apache-2.0 tag on HF; source/provenance should be sampled before public use"
+      weight_bytes: 0.015
+      text_filter:
+        preset: ja_web_v1
+        min_chars: 180
+        min_sentence_end_count: 2
+    - id: jawiki_news_paragraphs
+      path: "hpprc/jawiki-news-paragraphs" # Wikinews 段落。短すぎる項目は filter で落とす
+      revision: main
+      license_policy: "CC BY-SA 4.0"
+      weight_bytes: 0.01
+      text_filter:
+        preset: ja_web_v1
+        min_chars: 160
+        min_sentence_end_count: 2
   streaming: true
   packing: document
   eos_token_id: 2
@@ -171,9 +192,14 @@ validation:
       revision: main
       split: train
       skip_samples: 20000
+    news_ja:
+      source: "atsushi3110/news-ja"
+      revision: main
+      split: train
+      skip_samples: 20000
 
 checkpoint:
-  dir: /home/hi/checkpoints/arbor2_1b_8k_filter   # ext4 側。/mnt/d (drvfs) への torch.save は遅く破損クラッシュ実績あり
+  dir: /home/hi/checkpoints/arbor2_1b_8k_news_mix   # ext4 側。/mnt/d (drvfs) への torch.save は遅く破損クラッシュ実績あり
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000

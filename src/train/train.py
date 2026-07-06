@@ -191,8 +191,16 @@ def evaluate_validation(
     compute_dtype: torch.dtype,
     use_autocast: bool,
     max_batches: int,
+    batch_cache: dict[str, list[dict[str, torch.Tensor]]] | None = None,
 ) -> dict[str, float]:
-    """Return domain bits-per-byte plus ``mean_bpb`` for configured loaders."""
+    """Return domain bits-per-byte plus ``mean_bpb`` for configured loaders.
+
+    ``batch_cache`` を渡すと、各 domain の batch を初回評価時に CPU 側へ保持し
+    以降はそれを再利用する。streaming loader は iter() の度に HF Hub から
+    ストリームを開き直して skip_samples 分を読み飛ばすため、キャッシュ無しだと
+    validation の度に数十秒〜数分のダウンロードが走り、かつ評価データが
+    呼び出し毎にぶれる。
+    """
     was_training = model.training
     model.eval()
     results: dict[str, float] = {}
@@ -205,14 +213,23 @@ def evaluate_validation(
     )
     try:
         for domain, loader in loaders.items():
+            if batch_cache is not None and domain in batch_cache:
+                batches: list[dict[str, torch.Tensor]] = batch_cache[domain]
+            else:
+                batches = []
+                iterator = iter(loader)
+                for _ in range(max_batches):
+                    try:
+                        batches.append(next(iterator))
+                    except StopIteration:
+                        break
+                if hasattr(loader, "shutdown_workers"):
+                    loader.shutdown_workers()
+                if batch_cache is not None:
+                    batch_cache[domain] = batches
             loss_sum = 0.0
             label_count = 0
-            iterator = iter(loader)
-            for _ in range(max_batches):
-                try:
-                    batch = next(iterator)
-                except StopIteration:
-                    break
+            for batch in batches:
                 inputs = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
                 valid = labels != -100
@@ -234,8 +251,6 @@ def evaluate_validation(
                 results[f"{domain}_bpb"] = bpb
                 total_loss_sum += loss_sum
                 total_labels += label_count
-            if hasattr(loader, "shutdown_workers"):
-                loader.shutdown_workers()
         if total_labels > 0:
             results["mean_bpb"] = (
                 total_loss_sum / total_labels / torch.log(torch.tensor(2.0)).item()
@@ -535,6 +550,9 @@ def main() -> int:
             val_data_cfg.setdefault("micro_batch_size", val_micro_batch)
             val_data_cfg.setdefault("seed", cfg.get("seed", 42) + 10_000)
             validation_loaders[domain_name] = build_byte_dataloader(val_data_cfg, split="validation")
+        # 初回 validation で読んだ batch を保持して再利用する (domain 毎 ~17MB)。
+        # 2 回目以降はネットワークアクセス無し・毎回同一データで bpb を比較できる。
+        validation_batch_cache: dict[str, list[dict[str, torch.Tensor]]] = {}
         print(
             "[train] validation=ON domains={} max_batches={} best_metric=mean_bpb".format(
                 ",".join(validation_loaders.keys()),
@@ -1210,6 +1228,7 @@ def main() -> int:
                         compute_dtype,
                         use_autocast,
                         int(validation_cfg.get("max_batches", 16)),
+                        batch_cache=validation_batch_cache,
                     )
                     mean_bpb = validation_results.get("mean_bpb")
                     if mean_bpb is None:
