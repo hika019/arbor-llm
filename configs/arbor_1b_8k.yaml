@@ -128,6 +128,7 @@ speed:
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
+  cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
   bitnet_weight_cache: auto    # grad_accum内の量子化重み再計算を1回に削減 (bench実測+12.6%throughput)
   bitnet_weight_cache_gib: 1.25
   bitnet_weight_cache_min_numel: 65536

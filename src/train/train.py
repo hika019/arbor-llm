@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import deque
 from contextlib import nullcontext
 import hashlib
+import itertools
 import json
 import os
 import platform
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -322,6 +325,89 @@ class CudaBatchPrefetcher:
         self.stream.synchronize()
         self.next_batch = None
         self.source_iter = None
+
+
+class ThreadedBatchPrefetcher:
+    """DataLoader からの batch 取り出し (CPU 側の document packing) を別スレッドへ逃がす。
+
+    num_workers=0 (正確 resume のための単一プロセス) だと packing が学習ループと
+    直列になり、実測で step あたり ~235ms (=4%強) GPU を遊ばせていた。worker
+    thread が最大 ``depth`` 個先読みして深さ付き queue に積む。
+
+    正確 resume の要件: checkpoint には「loader の state_dict」と「読み出し済みで
+    未消費の batch 列」が同一瞬間のペアで入らなければならない (ずれると batch の
+    重複/欠落が起きる)。そのため worker の next() と state_dict() を同じ lock で
+    排他する。未消費分は ``state_dict()`` が返す pending として checkpoint に保存し、
+    resume 時は ``initial_batches`` で先に replay する。
+    """
+
+    def __init__(self, loader, depth: int = 3, initial_batches: list[dict] | None = None):
+        self.loader = loader
+        self.depth = max(1, int(depth))
+        self._source = iter(loader)
+        self._replay = deque(initial_batches or [])
+        self._buf: deque = deque()
+        self._cond = threading.Condition()
+        self._stop = False
+        self._exhausted = False
+        self._exc: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="cpu-batch-prefetch"
+        )
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            with self._cond:
+                while len(self._buf) >= self.depth and not self._stop:
+                    self._cond.wait()
+                if self._stop:
+                    return
+                try:
+                    batch = next(self._source)
+                except StopIteration:
+                    self._exhausted = True
+                    self._cond.notify_all()
+                    return
+                except BaseException as exc:  # noqa: BLE001 - 消費側で再送出
+                    self._exc = exc
+                    self._cond.notify_all()
+                    return
+                self._buf.append(batch)
+                self._cond.notify_all()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> dict:
+        if self._replay:
+            return self._replay.popleft()
+        with self._cond:
+            while not self._buf and not self._exhausted and self._exc is None:
+                self._cond.wait()
+            # 先読み済みの正常 batch を先に消費し、例外は発生位置で送出する
+            if self._buf:
+                batch = self._buf.popleft()
+                self._cond.notify_all()
+                return batch
+            if self._exc is not None:
+                raise self._exc
+            raise StopIteration
+
+    def state_dict(self) -> tuple[dict | None, list[dict]]:
+        """(loader state, 未消費 batch 列) を同一瞬間のペアで返す。"""
+        with self._cond:
+            state = self.loader.state_dict() if hasattr(self.loader, "state_dict") else None
+            pending = list(self._replay) + list(self._buf)
+            return state, pending
+
+    def close(self) -> None:
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+        # HF streaming が network 待ちで固まっている場合に永久 join しない。
+        # daemon thread なので取り残してもプロセス終了は阻害しない。
+        self._thread.join(timeout=10.0)
 
 
 # ---------------------------------------------------------- グローバル最適化
@@ -660,9 +746,18 @@ def main() -> int:
         global_step = meta.global_step
         best_loss = meta.best_loss
         pending_prefetch_batch = None
+        pending_cpu_batches = None
         if dl_state is not None:
             if isinstance(dl_state, dict):
                 pending_prefetch_batch = dl_state.pop("_cuda_prefetch_next_batch", None)
+                pending_cpu_batches = dl_state.pop("_cpu_prefetch_pending", None)
+                if pending_prefetch_batch is not None or pending_cpu_batches:
+                    print(
+                        "[train] resume in-flight batches: cuda_staged={} cpu_pending={}".format(
+                            int(pending_prefetch_batch is not None),
+                            len(pending_cpu_batches or []),
+                        )
+                    )
             if not should_restore_dataloader_state(saved_data_cfg, data_cfg):
                 print(
                     "[train] WARNING: checkpoint の data 設定が現在の config と不一致のため "
@@ -670,11 +765,13 @@ def main() -> int:
                     "新しいデータ混合は先頭から開始する。"
                 )
                 pending_prefetch_batch = None
+                pending_cpu_batches = None
             else:
                 train_loader.load_state_dict(dl_state)
         print(f"[train] resumed from step={global_step}, best_loss={best_loss:.4f}")
     else:
         pending_prefetch_batch = None
+        pending_cpu_batches = None
 
     # ---- 学習ループ ----
     stop = StopFlag()
@@ -689,6 +786,10 @@ def main() -> int:
     grad_accum = cfg["speed"].get("grad_accum_steps", 1)
     sync_each_step = bool(cfg["speed"].get("sync_each_step", False))
     cuda_prefetch = bool(cfg["speed"].get("cuda_prefetch", False)) and device.type == "cuda"
+    # CPU 側 packing の先読み深さ。num_workers>0 なら DataLoader が既に並列なので無効。
+    cpu_prefetch_depth = int(cfg["speed"].get("cpu_prefetch_depth", 3))
+    if int(data_cfg.get("num_workers", 0)) != 0:
+        cpu_prefetch_depth = 0
     log_every = cfg["logging"].get("log_every_steps", 20)
     byte_kind_metrics = bool(cfg["logging"].get("byte_kind_metrics", False))
     total_steps = cfg["optim"]["total_steps"]
@@ -880,10 +981,26 @@ def main() -> int:
             records.clear()
         return values
 
+    cpu_prefetcher: ThreadedBatchPrefetcher | None = None
+
     def make_data_iter():
-        nonlocal pending_prefetch_batch
+        nonlocal pending_prefetch_batch, pending_cpu_batches, cpu_prefetcher
         timing_mark("make_data_iter_start", device)
-        source_iter = iter(train_loader)
+        if cpu_prefetcher is not None:
+            cpu_prefetcher.close()
+            cpu_prefetcher = None
+        if cpu_prefetch_depth > 0:
+            cpu_prefetcher = ThreadedBatchPrefetcher(
+                train_loader, depth=cpu_prefetch_depth, initial_batches=pending_cpu_batches
+            )
+            source_iter = cpu_prefetcher
+        elif pending_cpu_batches:
+            # checkpoint に未消費 batch が残っている状態で cpu_prefetch を無効化して
+            # resume した場合もデータを落とさない
+            source_iter = itertools.chain(iter(pending_cpu_batches), iter(train_loader))
+        else:
+            source_iter = iter(train_loader)
+        pending_cpu_batches = None
         timing_mark("train_loader_iter_created", device)
         if not cuda_prefetch:
             return source_iter
@@ -895,6 +1012,8 @@ def main() -> int:
 
     if cuda_prefetch:
         print("[train] cuda_prefetch=ON")
+    if cpu_prefetch_depth > 0:
+        print(f"[train] cpu_prefetch=ON depth={cpu_prefetch_depth}")
     if sync_each_step:
         print("[train] sync_each_step=ON")
 
@@ -1272,7 +1391,13 @@ def main() -> int:
                         "validation": validation_results,
                     },
                 )
-                dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None
+                if cpu_prefetcher is not None:
+                    # loader state と未消費 batch を同一瞬間のペアで取る (排他は内部 lock)
+                    dl_state, pending_cpu = cpu_prefetcher.state_dict()
+                    if dl_state is not None and pending_cpu:
+                        dl_state["_cpu_prefetch_pending"] = pending_cpu
+                else:
+                    dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None
                 if (
                     dl_state is not None
                     and cuda_prefetch
@@ -1311,6 +1436,8 @@ def main() -> int:
 
     if isinstance(data_iter, CudaBatchPrefetcher):
         data_iter.close()
+    if cpu_prefetcher is not None:
+        cpu_prefetcher.close()
     data_iter = None
     if hasattr(train_loader, "shutdown_workers"):
         train_loader.shutdown_workers()
