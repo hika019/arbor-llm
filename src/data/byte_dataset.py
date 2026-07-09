@@ -314,7 +314,15 @@ class ByteStreamDataset(IterableDataset):
             col = s.get("text_column", self.text_column)
             if col != "text":
                 ds = ds.rename_column(col, "text")
-            ds = ds.select_columns(["text"])
+            keep = ["text"]
+            # min_score 指定の source は数値スコア列を残し next_doc_bytes で足切りする
+            # (例: fineweb-2-edu-japanese は edu score でノイズ web を落として初めて
+            #  「教育フィルタ版」として機能する。無指定なら従来どおり text のみ)。
+            if s.get("min_score") is not None:
+                sc_col = s.get("score_column", "score")
+                if sc_col != "text":
+                    keep.append(sc_col)
+            ds = ds.select_columns(keep)
             skip_samples = int(s.get("skip_samples", self.skip_samples))
             if skip_samples:
                 ds = ds.skip(skip_samples)
@@ -504,6 +512,11 @@ class ByteStreamDataset(IterableDataset):
                         return None
                     source_iters[source_idx] = iter(streams[source_idx])
                     continue
+                min_score = specs[source_idx].get("min_score")
+                if min_score is not None:
+                    sc = row.get(specs[source_idx].get("score_column", "score"))
+                    if sc is None or float(sc) < float(min_score):
+                        continue
                 text = row.get("text")
                 if not text:
                     continue
