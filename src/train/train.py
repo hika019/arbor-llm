@@ -630,7 +630,14 @@ def main() -> int:
         for domain_name, domain_cfg in domains.items():
             val_data_cfg = dict(domain_cfg)
             val_data_cfg.setdefault("context_length", data_cfg["context_length"])
-            val_data_cfg.setdefault("packing", data_cfg.get("packing", "concat"))
+            # validation domain は素のテキストコーパス (忘却監視用)。学習側が
+            # packing: sft でも、それを継承すると _iter_hf_sft が conversations 列の
+            # 無い行から SFT サンプルを作れず有効サンプルを探して無限ストリームする。
+            # よって sft は必ず text packing に落とす (domain_cfg で明示指定は尊重)。
+            base_packing = data_cfg.get("packing", "concat")
+            if base_packing == "sft":
+                base_packing = "document"
+            val_data_cfg.setdefault("packing", base_packing)
             val_data_cfg.setdefault("byte_offset", data_cfg.get("byte_offset", 4))
             val_data_cfg.setdefault("eos_token_id", data_cfg.get("eos_token_id", 2))
             val_data_cfg.setdefault("pad_token_id", data_cfg.get("pad_token_id", 3))

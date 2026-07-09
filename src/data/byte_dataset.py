@@ -48,7 +48,9 @@ class ByteStreamDataset(IterableDataset):
                  seed: int = 42,
                  skip_samples: int = 0,
                  name: str | None = None,
-                 revision: str | None = None) -> None:
+                 revision: str | None = None,
+                 sft_loss_on: str = "completion",
+                 sft_add_eos: bool = True) -> None:
         """byte_offset: バイト値 b を token id (b + offset) に写す.
 
         BLT は 0..3 を BOE/BOS/EOS/BPE の特殊 ID として使い, 生バイトは
@@ -83,6 +85,8 @@ class ByteStreamDataset(IterableDataset):
         self.pad_token_id = pad_token_id
         self.seed = seed
         self.skip_samples = skip_samples
+        self.sft_loss_on = sft_loss_on          # completion | all
+        self.sft_add_eos = sft_add_eos
         self._state = _ResumeState()
 
     # --- state_dict: 学習ループから保存/復元される -----------------------
@@ -101,9 +105,135 @@ class ByteStreamDataset(IterableDataset):
         if self.packing == "document":
             yield from self._iter_hf_document_packed()
             return
+        if self.packing == "sft":
+            yield from self._iter_hf_sft()
+            return
         if self.packing != "concat":
             raise ValueError(f"unknown data.packing: {self.packing}")
         yield from self._iter_hf_stream()
+
+    # --- SFT: 会話 1 件 = 1 サンプル, 応答部分のみ loss --------------------
+    _ROLE_MARKERS = {
+        "user": "user", "human": "user", "prompter": "user",
+        "assistant": "assistant", "gpt": "assistant", "bot": "assistant",
+        "system": "system",
+    }
+
+    def _messages_from_row(self, row: dict, fmt: str) -> list[tuple[str, str]] | None:
+        """データ行を (role, content) のターン列へ正規化する."""
+        if fmt == "instruction":
+            instr = (row.get("instruction") or "").strip()
+            inp = (row.get("input") or "").strip()
+            out = (row.get("output") or "").strip()
+            if not instr or not out:
+                return None
+            user = f"{instr}\n\n{inp}" if inp else instr
+            return [("user", user), ("assistant", out)]
+        if fmt == "messages":
+            conv = row.get("conversations") or row.get("messages") or []
+            msgs: list[tuple[str, str]] = []
+            for turn in conv:
+                role = self._ROLE_MARKERS.get(str(turn.get("role", "")).lower())
+                content = (turn.get("content") or turn.get("value") or "").strip()
+                if role is None or not content:
+                    continue
+                msgs.append((role, content))
+            # 末尾が assistant で終わる (loss 対象がある) ことを保証
+            while msgs and msgs[-1][0] != "assistant":
+                msgs.pop()
+            return msgs if any(r == "assistant" for r, _ in msgs) else None
+        raise ValueError(f"unknown sft_format: {fmt}")
+
+    def _render_sft_sample(self, messages: list[tuple[str, str]]) -> dict[str, torch.Tensor] | None:
+        """(role, content) 列を token 列 + 応答のみ loss の labels に変換する.
+
+        chat template: 各ターンを ``<|role|>\n{content}`` として連結。
+        user/system は改行区切り、assistant は末尾に EOS を付け、
+        assistant の content(+EOS)だけ loss 対象 (それ以外は -100)。
+        """
+        off = self.byte_offset
+        loss_all = self.sft_loss_on == "all"
+        tokens: list[int] = []
+        is_target: list[bool] = []
+        for role, content in messages:
+            for b in f"<|{role}|>\n".encode("utf-8"):
+                tokens.append(b + off); is_target.append(False)
+            tgt = loss_all or (role == "assistant")
+            for b in content.encode("utf-8"):
+                tokens.append(b + off); is_target.append(tgt)
+            if role == "assistant":
+                if self.sft_add_eos:
+                    tokens.append(self.eos_token_id); is_target.append(True)
+            else:
+                tokens.append(ord("\n") + off); is_target.append(False)
+
+        block = self.context_length + 1
+        tokens = tokens[:block]
+        is_target = is_target[:block]
+        if len(tokens) < 2 or not any(is_target[1:]):
+            return None  # loss 対象が残っていない (全マスク) サンプルは捨てる
+
+        input_ids = tokens[:-1]
+        labels = [
+            tok if is_target[i + 1] else -100
+            for i, tok in enumerate(tokens[1:])
+        ]
+        # context_length へ pad (labels は -100 で埋める)
+        pad_n = self.context_length - len(input_ids)
+        if pad_n > 0:
+            input_ids = input_ids + [self.pad_token_id] * pad_n
+            labels = labels + [-100] * pad_n
+        fill = sum(1 for t in tokens if t != self.pad_token_id)
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "fill_ratio": torch.tensor(fill / max(self.context_length, 1), dtype=torch.float32),
+        }
+
+    def _iter_hf_sft(self) -> Iterator[dict[str, torch.Tensor]]:
+        from datasets import load_dataset
+
+        specs = self.sources or [{
+            "path": self.source, "name": self.name, "revision": self.revision,
+            "split": self.split, "weight_bytes": 1.0,
+            "sft_format": "messages",
+        }]
+        streams = []
+        for s in specs:
+            kwargs = {"split": s.get("split", self.split), "streaming": True}
+            if s.get("revision"):
+                kwargs["revision"] = s["revision"]
+            ds = load_dataset(s["path"], name=s.get("name"), **kwargs)
+            if self.shuffle_buffer > 0:
+                ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
+            streams.append(ds)
+        iters = [iter(ds) for ds in streams]
+        fmts = [s.get("sft_format", "messages") for s in specs]
+        weights = [float(s.get("weight_bytes", s.get("weight", 1.0))) for s in specs]
+        active = [True] * len(streams)
+        rng = random.Random(self.seed + self._state.samples_emitted)
+        # coarse resume: 既に emit 済みの分を読み飛ばす
+        skip = int(self._state.samples_emitted)
+
+        while any(active):
+            live = [i for i in range(len(streams)) if active[i]]
+            idx = rng.choices(live, weights=[weights[i] for i in live], k=1)[0]
+            try:
+                row = next(iters[idx])
+            except StopIteration:
+                active[idx] = False
+                continue
+            messages = self._messages_from_row(row, fmts[idx])
+            if not messages:
+                continue
+            sample = self._render_sft_sample(messages)
+            if sample is None:
+                continue
+            if skip > 0:
+                skip -= 1
+                continue
+            self._state.samples_emitted += 1
+            yield sample
 
     def _build_hf_stream(self):
         """単一/複数ソースを HF streaming の行イテレータに組み立てる.
@@ -536,6 +666,8 @@ def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
         pad_token_id=cfg.get("pad_token_id", 3),
         seed=cfg.get("seed", 42),
         skip_samples=cfg.get("skip_samples", 0),
+        sft_loss_on=cfg.get("sft_loss_on", "completion"),
+        sft_add_eos=cfg.get("sft_add_eos", True),
     )
     num_workers = cfg.get("num_workers", 4)
     if num_workers > 1 and not cfg.get("allow_multi_worker_iterable", False):

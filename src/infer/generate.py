@@ -204,11 +204,17 @@ def generate_byte_stream(
     use_cache: bool = False,
     decode_errors: str | None = None,
     utf8_mask: bool = True,
+    stop_on_eos: bool = False,
+    eos_token_id: int = 2,
 ) -> Iterator[int]:
     """1 バイトずつ生成し、生バイト値 (0..255) を逐次 yield する.
 
     既定はフルフォワード方式。use_cache=True の場合だけ ArborModel で
     2 階層 KV cache (ArborByteGenerator) を使う。
+
+    stop_on_eos=True で EOS トークン (SFT 済みモデルが応答末尾に出す) を許可し、
+    サンプルされたら生成を打ち切る (chat で応答後に停止するため)。既定 (base の
+    素の続き生成) では EOS を含む特殊 ID をマスクして無限に続ける。
     """
     del decode_errors  # generate_stream と同じ kwargs を受けられるようにする
     from src.model.arbor import ArborByteGenerator, ArborModel
@@ -248,6 +254,7 @@ def generate_byte_stream(
             )
             with ctx:
                 logits = model(x).logits[0, -1].float()
+        eos_logit = float(logits[eos_token_id]) if stop_on_eos else None
         logits[:BYTE_OFFSET] = float("-inf")  # 特殊 ID は出さない
         logits = logits[:VOCAB_SIZE]
         if utf8_mask:
@@ -255,8 +262,14 @@ def generate_byte_stream(
                 remaining_budget=max_new_bytes - step_idx,
             ).to(logits.device)
             logits = logits.masked_fill(~mask, float("-inf"))
+        # EOS は utf8 が文字境界にあるときだけ許可 (多バイト文字の途中で切らない)
+        at_boundary = (not utf8_mask) or utf8_state.remaining == 0
+        if stop_on_eos and at_boundary:
+            logits[eos_token_id] = eos_logit
         # multinomial を CPU generator で引くため logits を CPU に移す
         next_id = _sample_next(logits.cpu(), temperature, top_k, top_p, generator)
+        if stop_on_eos and next_id == eos_token_id:
+            return  # 応答終端。EOS 自体は yield しない
         ids.append(next_id)
         if gen is not None:
             last_logits = gen.push(next_id)
@@ -282,6 +295,8 @@ def generate_stream(
     use_cache: bool = False,
     decode_errors: str = "ignore",
     utf8_mask: bool = True,
+    stop_on_eos: bool = False,
+    eos_token_id: int = 2,
 ) -> Iterator[str]:
     """1 バイトずつ生成し、UTF-8 として確定した文字列片を逐次 yield する."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors=decode_errors)
@@ -298,6 +313,8 @@ def generate_stream(
         seed=seed,
         use_cache=use_cache,
         utf8_mask=utf8_mask,
+        stop_on_eos=stop_on_eos,
+        eos_token_id=eos_token_id,
     ):
         piece = decoder.decode(bytes([byte]))
         if piece:

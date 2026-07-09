@@ -1,0 +1,140 @@
+# Arbor v2 1B 指示チューニング (SFT) — 日本語チャット
+#
+# 事前学習済み base (checkpoints/arbor2_1b_8k_filter) からの SFT。
+# データパスは byte_dataset.py の packing: sft を使用 (会話1件=1サンプル、
+# chat template <|role|>\n{content} で整形し、assistant 応答+EOS のみ loss)。
+#
+# 起動:
+#   python -m src.train.train --config configs/arbor_1b_8k_sft.yaml \
+#     --init-from checkpoints/arbor2_1b_8k_filter/latest
+#   (--init-from は重みのみロード。optimizer/scheduler/step は 0 から)
+
+run_name: arbor2_1b_8k_sft
+seed: 42
+
+# ---- モデル: base と完全同一形状 (--init-from の strict ロード条件) ----
+model:
+  vocab_size: 260
+  patching_mode: static
+  patch_size: 8
+  max_bytes: 8192               # モデル定義は base と同じ。SFTの系列は下の context_length
+  hidden_size: 2048
+  num_heads: 16
+  num_kv_heads: 4
+  intermediate_size: 5632
+  num_hidden_layers: 20
+  local_hidden_size: 768
+  local_num_heads: 12
+  local_num_kv_heads: 12
+  local_intermediate_size: 2048
+  num_local_encoder_layers: 2
+  num_local_decoder_layers: 4
+  rope_theta: 500000.0
+  norm_eps: 1.0e-5
+  bitnet: true
+  gradient_checkpointing: false
+
+# ---- データ (SFT): 日本語 instruction + 会話 ----
+data:
+  sources:
+    - id: dolly_ja
+      path: "kunishou/databricks-dolly-15k-ja"   # instruction/input/output
+      revision: main
+      license_policy: "CC BY-SA 3.0 (Dolly由来)"
+      weight_bytes: 0.5
+      sft_format: instruction
+    - id: oasst2_ja
+      path: "llm-jp/oasst2-33k-ja"               # conversations [{role,content}]
+      revision: main
+      license_policy: "Apache-2.0 tag"
+      weight_bytes: 0.5
+      sft_format: messages
+  streaming: true
+  packing: sft
+  eos_token_id: 2
+  pad_token_id: 3
+  shuffle_buffer: 2000
+  context_length: 4096          # 会話は短いので 8192→4096 で padding 無駄を半減
+  num_workers: 0
+  prefetch_factor: 4
+  pin_memory: true
+  sft_loss_on: completion       # completion (応答のみ) | all
+  sft_add_eos: true             # 応答末尾に EOS を付け loss をかける (停止を学習)
+
+# ---- 最適化: SFT は低 LR・短 step ----
+optim:
+  optimizer: bnb_adamw_8bit
+  lr: 2.0e-5                    # base ピーク 2e-4 の 10%。既習を壊さない標準域
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  min_lr_ratio: 0.0
+  decay_end_ratio: 1.0
+  warmup_steps: 100
+  total_steps: 6000             # 実効16 seq/step × 6000 ≈ 2 epoch (会話~48k件)
+
+# ---- スループット ----
+speed:
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: true
+  torch_compile: true
+  compile_mode: default
+  cuda_prefetch: true
+  cpu_prefetch_depth: 3
+  bitnet_weight_cache: auto
+  bitnet_weight_cache_gib: 1.25
+  bitnet_weight_cache_min_numel: 65536
+  sync_each_step: false
+  micro_batch_size: 2
+  grad_accum_steps: 8           # 実効 16 seq/update
+
+validation:
+  enabled: true
+  max_batches: 32
+  micro_batch_size: 2
+  # SFT中も事前学習ドメインの bpb を監視し忘却を検知 (大きく悪化したらLR/step過剰)
+  # NOTE: SFT は fineweb を学習に使わないので holdout 用の大 skip は不要。
+  # skip_samples を大きくすると初回 validation が数万件の読み飛ばしで
+  # 数十GB ストリーム=数十分ハングするため、小さく固定する (先頭評価で漏れ無し)。
+  domains:
+    ja_web:
+      source: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      revision: main
+      split: train
+      skip_samples: 500
+    english:
+      source: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      split: train
+      skip_samples: 500
+
+checkpoint:
+  dir: ./checkpoints/arbor2_1b_8k_sft   # 実体は /home/hi/checkpoints へのsymlink
+  save_every_steps: 1000
+  keep_last_k: 3
+  keep_every_n_steps: 2000
+  async_save: true
+
+# ---- checkpoint 時のサンプル生成: chat template でプロンプト ----
+sampling:
+  enabled: true
+  prompts:
+    - "<|user|>\n日本の四季について教えて\n<|assistant|>\n"
+    - "<|user|>\nおすすめの日本料理は？\n<|assistant|>\n"
+    - "<|user|>\nこんにちは！\n<|assistant|>\n"
+  max_new_bytes: 200
+  temperature: 0.7
+  top_p: 0.95
+  seed: 42
+  use_cache: true
+
+logging:
+  wandb_project: arbor-llm
+  log_every_steps: 20
+  throughput_window: 50
+  byte_kind_metrics: true
+  best_ema_decay: 0.98
