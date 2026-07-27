@@ -597,6 +597,19 @@ def main() -> int:
             f"qkv_groups={bitnet_cache_info['qkv_groups']} "
             f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
         )
+        # ---- FP8 GEMM (sm89+): 射影融合の後に設定する (Group にも反映するため) ----
+        fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
+        if fp8_raw in (None, False):
+            fp8_raw = "off"  # YAML 1.1 は素の off を False に解釈する
+        fp8_mode = str(fp8_raw).lower()
+        if fp8_mode != "off":
+            from src.model.bitlinear import set_bitlinear_fp8_mode
+
+            fp8_info = set_bitlinear_fp8_mode(base_model, fp8_mode)
+            print(
+                f"[train] bitlinear_fp8={fp8_info['mode']} "
+                f"layers={fp8_info['layers']} (torch._scaled_mm e4m3)"
+            )
 
     model = apply_compile_settings(model, cfg["speed"])
     timing_mark("compile_wrapper_created", device)
