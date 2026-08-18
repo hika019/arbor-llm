@@ -6,11 +6,11 @@
   自己完結の Arbor v2 (静的 patching 階層 Transformer × BitNet b1.58 公式レシピ) に移行。
   旧 checkpoint (step 4492) も削除済み (ユーザー指示で互換性破棄)。
 - **1B 本走 (952.8M params) を fresh start 済み** (`logs/run_arbor2_1b.log`)。
-  config は `configs/arbor_1b.yaml`。synthetic 実測 51.2k tok/s / VRAM 16.1GiB (B=8)。
+  config は `configs/arbor.yaml`。synthetic 実測 51.2k tok/s / VRAM 16.1GiB (B=8)。
 - 再開:
   ```bash
   source scripts/env.sh
-  python -u -m src.train.train --config configs/arbor_1b.yaml --resume latest \
+  python -u -m src.train.train --config configs/arbor.yaml --resume latest \
       > logs/run_arbor2_1b.log 2>&1 &
   ```
 

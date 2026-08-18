@@ -3,7 +3,7 @@
 #   python -m src.train.train --config configs/entropy_lm.yaml
 #   -> checkpoints/entropy_lm/latest を arbor 側の model.entropy_model_ckpt に指定
 #
-# データ混合は本走 (arbor_1b_8k.yaml) ベース + 日英の文体多様化 (下記)。
+# データ混合は本走 (arbor.yaml) ベース + 日英の文体多様化 (下記)。
 # max_bytes は本体の max_bytes 以上にすること (next_byte_entropy は本体の
 # 入力列を一発で通すため、RoPE バッファが本体の context をカバーする必要がある)。
 # 32768 にしてあるので 32k 拡張 run でもそのまま使える。ただし学習 context は
@@ -27,7 +27,7 @@ model:
   bitnet: false             # 境界判定用なので FP の通常 Transformer
   gradient_checkpointing: false
 
-# 本走 (arbor_1b_8k.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
+# 本走 (arbor.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
 # 本体学習開始後は差し替え不可なので、文体カバレッジは広めに取る。
 # 日本語は最低 60% を維持し、その中に日本語チャット/崩れ文も入れる。
 # 残りで英語・多言語 UTF-8・会話/typo/絵文字・
@@ -107,7 +107,8 @@ data:
   micro_batch_size: 4
 
 optim:
-  optimizer: adamw_fused
+  optimizer: adamw
+  state_precision: fp32     # choices: fp32 | int8。全parameterのmoment stateへ一様適用
   lr: 3.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -120,6 +121,7 @@ optim:
   total_steps: 500000
 
 speed:
+  device: auto              # choices: auto | cuda | mps | cpu
   precision: bf16
   tf32_matmul: true
   cudnn_benchmark: false

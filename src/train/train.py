@@ -1,8 +1,8 @@
 """学習エントリポイント.
 
 実行:
-    python -m src.train.train --config configs/arbor_1b.yaml
-    python -m src.train.train --config configs/arbor_1b.yaml --resume latest
+    python -m src.train.train --config configs/arbor.yaml
+    python -m src.train.train --config configs/arbor.yaml --resume latest
 
 設計方針:
 - データはストリーミング (HF datasets `streaming=True` 等)。全件メモリ展開しない。
@@ -94,6 +94,56 @@ def parse_args() -> argparse.Namespace:
 def load_config(path: Path) -> dict:
     with path.open() as f:
         return yaml.safe_load(f)
+
+
+def resolve_entropy_lm_reference(cfg: dict, arbor_config_path: Path) -> dict:
+    """entropy mode の ByteLM 構成を entropy_lm.yaml から一元的に取り込む。
+
+    Arbor 側に同じ model 定義を複製しない。inline ``model.entropy_model`` と参照を
+    同時指定した場合は、どちらを採用するか曖昧なのでエラーにする。
+    """
+    resolved = copy.deepcopy(cfg)
+    model_cfg = resolved.get("model", {})
+    if model_cfg.get("arch", "arbor") != "arbor":
+        return resolved
+    if model_cfg.get("patching_mode", "static") != "entropy":
+        return resolved
+
+    reference = resolved.get("entropy_lm_config")
+    if not reference:
+        raise ValueError(
+            "model.patching_mode=entropy には top-level entropy_lm_config が必要です"
+        )
+    if model_cfg.get("entropy_model") is not None:
+        raise ValueError(
+            "entropy_lm_config と model.entropy_model の二重管理は禁止です。"
+            "entropy_lm_config だけを指定してください"
+        )
+
+    reference_path = Path(reference)
+    if not reference_path.is_absolute():
+        reference_path = arbor_config_path.resolve().parent / reference_path
+    entropy_cfg = load_config(reference_path)
+    entropy_model_cfg = copy.deepcopy(entropy_cfg.get("model", {}))
+    if entropy_model_cfg.get("arch") != "byte_lm":
+        raise ValueError(
+            f"entropy_lm_config の model.arch は byte_lm 必須: {reference_path}"
+        )
+    entropy_model_cfg.pop("arch")
+    model_cfg["entropy_model"] = entropy_model_cfg
+
+    if not model_cfg.get("entropy_model_ckpt"):
+        checkpoint_dir = entropy_cfg.get("checkpoint", {}).get("dir")
+        if not checkpoint_dir:
+            raise ValueError(
+                f"entropy_lm_config に checkpoint.dir がありません: {reference_path}"
+            )
+        model_cfg["entropy_model_ckpt"] = str(Path(checkpoint_dir) / "latest")
+    print(
+        "[train] entropy model config loaded from "
+        f"{reference_path} ckpt={model_cfg['entropy_model_ckpt']}"
+    )
+    return resolved
 
 
 def config_hash(cfg: dict) -> str:
@@ -589,6 +639,7 @@ def main() -> int:
     args = parse_args()
     timing_mark("parse_args")
     cfg = load_config(args.config)
+    cfg = resolve_entropy_lm_reference(cfg, args.config)
     timing_mark("load_config")
     git_info = git_metadata(_ROOT)
     timing_mark("git_metadata")

@@ -1,15 +1,16 @@
 # arbor-llm
 
 バイトレベル階層 Transformer × **BitNet b1.58** の LLM (約 0.95B params) を
-RTX 4090 単機で学習するプロジェクト。自己完結実装 (モデルの依存は torch のみ)。
+CUDA GPU / Apple Silicon MPS で学習するプロジェクト。自己完結実装
+(モデルの依存は torch のみ)。
 
 ## アーキテクチャ (Arbor v2)
 
 ```
-bytes (T=2048)                          token = byte + 4, vocab 260, tokenizer 不要
+bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer 不要
   └ byte embedding (FP)
   └ Local Encoder ×2      … patch 内 attention (BitLinear)
-  └ 静的 patching          … 4 bytes/patch → 512 patches
+  └ 静的 patching          … 8 bytes/patch → 1024 patches
   └ Global Transformer ×20 … d=2048, GQA, causal (BitLinear)   ← パラメータの 95%
   └ Local Decoder ×4      … patch 内 causal (BitLinear)
   └ byte logits (FP head)
@@ -23,19 +24,19 @@ bytes (T=2048)                          token = byte + 4, vocab 260, tokenizer �
     (q/k/v ← input_norm, o ← attn_sub_norm, gate/up ← ffn_norm, down ← ffn_sub_norm)
   - FFN は ReLU² gated、Linear は全て bias 無し
   - Embedding / patch 射影 / 出力 head / RMSNorm は FP (これも仕様どおり)
-- **patching は 3 モード** (`model.patching_mode`):
-  - `static` (既定・本走用): 固定 4 bytes/patch (MegaByte 方式)。形状固定で
+- **patching は 4 モード** (`model.patching_mode`):
+  - `static` (既定・本走用): 固定 8 bytes/patch (MegaByte 方式)。形状固定で
     torch.compile が常時効き最速。
+  - `utf8`: UTF-8文字の先頭byteを境界候補にする。
   - `space`: 空白・改行の直後で区切る (BLT の space patching)。
   - `entropy`: 小型バイト LM の次バイト予測エントロピーが閾値を超えた所で区切る
     (BLT 本命方式)。区切り用 LM は `configs/entropy_lm.yaml` (`arch: byte_lm`) で
     先に学習し、`model.entropy_model_ckpt` で渡す。凍結サブモジュールとして
     本体 checkpoint / HF エクスポートに同梱される。
-  - 動的 2 モードも patch 数を固定長 pad + block 対角マスクで処理するため
+  - 動的モードも patch 数を固定長 pad + block 対角マスクで処理するため
     tensor 形状は固定。境界候補から patch start への変換は CUDA extension で
-    GPU 上に閉じる (CPU はテスト用 torch 実装)。動作確認用の小規模設定が
-    `configs/trial_space.yaml` / `configs/trial_entropy.yaml`。
-  - 因果性 (未来バイト→過去 logits の漏れ無し) は 3 モードともテストで検証済み。
+    GPU 上に閉じる (CPU/MPS は torch 実装)。
+  - 因果性 (未来バイト→過去 logits の漏れ無し) は全モードでテスト済み。
 - 学習は BF16 シャドウ重みの QAT。推論は BitLinear の dequant キャッシュで
   毎回の重み再量子化を省く。packed ternary Triton 経路は速度診断用の明示 opt-in。
 
@@ -62,33 +63,38 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128   # CUDA 12
 pip install -r requirements.txt
 ```
 
+Apple SiliconではPyTorchの通常wheelを使用する:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip wheel setuptools
+pip install torch
+pip install -r requirements.txt
+```
+
 別環境で `.venv` を作り直した場合は、学習前に最低限これを確認する:
 
 ```bash
 python - <<'PY'
 import torch, datasets
-print("torch", torch.__version__, "cuda", torch.cuda.is_available())
+print("torch", torch.__version__, "cuda", torch.cuda.is_available(),
+      "mps", torch.backends.mps.is_available())
 print("datasets", datasets.__version__)
-try:
-    import bitsandbytes as bnb
-    print("bitsandbytes", bnb.__version__)
-except Exception as e:
-    print("bitsandbytes unavailable:", type(e).__name__, e)
 PY
 ```
 
 - `RuntimeError: \`datasets\` が必要 (pip install datasets)` /
   `ModuleNotFoundError: No module named 'datasets'`:
   `pip install -r requirements.txt` が入っていない。HF streaming データセットを読む
-  本走 config (`configs/arbor_1b.yaml` など) では `datasets` が必須。
-- `[optim] bitsandbytes 未導入: AdamW(fused) にフォールバック`:
-  学習自体は続くが、`optim.optimizer: bnb_adamw_8bit` の VRAM 節約が効かない。
-  本走では `pip install -r requirements.txt` で `bitsandbytes` も入れる。
-  CUDA/PyTorch との ABI 不一致で import できない場合は、いったん
-  `optim.optimizer: adamw_fused` に落として起動確認する。
+  本走 config (`configs/arbor.yaml`) では `datasets` が必須。
+- optimizer state精度は `optim.state_precision: fp32 | int8` で選ぶ。
+  小さい層を含む全parameterへ一様に適用し、別精度への暗黙フォールバックはしない。
+  BitNet本体は引き続きW1.58/A8 + floating shadow weightのQATであり、
+  integer Parameterへ置換しない。
 
 HF Hub から本走データを streaming する環境では、未認証アクセスだと rate limit /
-timeout で止まりやすい。`configs/arbor_1b.yaml` は fineweb-2 / wikipedia /
+timeout で止まりやすい。`configs/arbor.yaml` は fineweb-2 / wikipedia /
 fineweb-edu / finemath / code など複数 dataset の parquet を起動直後に解決するため、
 RunPod 等の別環境では先に token と timeout を設定する:
 
@@ -113,12 +119,10 @@ free -h
 
 `oom_kill` が増えている場合は、VRAM が足りていてもホストRAMが足りない。1B 本走は
 32GB級GPUに加えて十分な CPU RAM と安定した外向きネットワークが必要。小さな環境では
-先に `configs/smoke.yaml` で依存関係とデータ読み込みを確認し、本走は
-`speed.micro_batch_size: 1` / `speed.grad_accum_steps: 64`、または source 数を減らした
-試験 config で切り分ける。
+`--dry-run` で1 stepだけ実行し、必要なら `speed.micro_batch_size` を下げる。
 
-検証済み環境: Python 3.12 / torch 2.5.1+cu121 / transformers 4.57+ / datasets 4.8 /
-bitsandbytes 0.49 (RTX 4090, WSL2)。`source scripts/env.sh` で venv +
+検証済み環境: Python 3.12 / torch 2.5.1+cu121 / transformers 4.57+ / datasets 4.8
+(RTX 4090, WSL2)。`source scripts/env.sh` で venv +
 CUDA アロケータ設定 (expandable_segments) + inductor 設定が入る。
 
 動的 patching の CUDA extension は初回実行時に `.torch_extensions/` へ JIT build
@@ -135,18 +139,27 @@ compile が落ちる場合だけ、`TORCHINDUCTOR_COMPILE_THREADS=4 source scrip
 ```bash
 source scripts/env.sh
 
-# smoke 確認 (小モデル・ローカルデータ・50 step, CPU でも可)
-python -m src.train.train --config configs/smoke.yaml
+# 1B / 8K 本走。CUDA/MPSで同じconfigを使う
+python -m src.train.train --config configs/arbor.yaml
 
-# 1B 本走 (初回は torch.compile に ~2 分)
-python -m src.train.train --config configs/arbor_1b.yaml
+# 1 stepだけ確認
+python -m src.train.train --config configs/arbor.yaml --dry-run
 
 # 最新 checkpoint から再開
-python -m src.train.train --config configs/arbor_1b.yaml --resume latest
+python -m src.train.train --config configs/arbor.yaml --resume latest
 
 # checkpoint の optimizer state は維持し、LR の基準値だけ現在の config に変える
-python -m src.train.train --config configs/arbor_1b.yaml --resume latest --rebase-lr-on-resume
+python -m src.train.train --config configs/arbor.yaml --resume latest --rebase-lr-on-resume
 ```
+
+設定ファイルは意図的に2本だけにしている:
+
+- `configs/arbor.yaml`: Arbor本体。既定は `arbor2_1b_8k_filter`。
+- `configs/entropy_lm.yaml`: entropy patching境界判定用ByteLM。
+
+`speed.device: auto` はCUDA→MPS→CPUの順に選ぶ。MPSではモデル形状・データ混合・
+optimizer state精度を変えず、gradient checkpointingを有効化し、
+micro-batchを1にしてgrad accumulationを増やすことで実効batchを維持する。
 
 - `Ctrl+C` (SIGINT) / `kill -TERM` で次 step 境界に安全保存して終了。二度押しで強制終了。
 - checkpoint は 1000 step ごとに `./checkpoints/step_XXXXXXXXXX/` へアトミック保存
@@ -183,28 +196,19 @@ entropy モードは「次バイトの予測しにくさ」を測る小型バイ
 # 1. 区切り用 ByteLM を学習 (データ混合は本走と同じにすること)
 python -m src.train.train --config configs/entropy_lm.yaml
 
-# 2. 本体 config で entropy モードを指定して学習
-#    model.patching_mode: entropy
-#    model.entropy_model: (ByteLM の構成: entropy_lm.yaml の model 節と一致させる)
-#    model.entropy_model_ckpt: ./checkpoints/entropy_lm/latest
-python -m src.train.train --config configs/trial_entropy.yaml   # 小規模な実例
-
-# 1B / 8k 本走用
-python -m src.train.train --config configs/arbor_1b_8k_entropy.yaml
+# 2. configs/arbor.yaml の model.patching_mode を entropy に変更
+# entropy_lm_config: entropy_lm.yaml からByteLM構成とcheckpointを自動解決するため、
+# Arbor側へ同じByteLM model定義を複製しない。
+python -m src.train.train --config configs/arbor.yaml
 ```
 
-軽量な区切り用LMを使う場合は `configs/entropy_lm_compact.yaml` を学習し、
-本体は `configs/arbor_1b_8k_entropy_compact.yaml` を使う。この構成は
-ByteLM を 384 hidden / 4 layers / attention window 512 に落とすため速いが、
-scorer が変わるので本体学習前に threshold を校正する。
+thresholdを校正する場合:
 
 ```bash
-python -m src.train.train --config configs/entropy_lm_compact.yaml
 python scripts/calibrate_entropy_threshold.py \
-  --config configs/arbor_1b_8k_entropy_compact.yaml \
-  --checkpoint checkpoints/entropy_lm_compact/final \
+  --config configs/arbor.yaml \
+  --checkpoint checkpoints/entropy_lm/latest \
   --target-bytes-per-patch 5.0 --write
-python -m src.train.train --config configs/arbor_1b_8k_entropy_compact.yaml
 ```
 
 学習後の ByteLM は本体の checkpoint / HF エクスポートに同梱されるので、

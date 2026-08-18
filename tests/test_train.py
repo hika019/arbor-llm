@@ -5,6 +5,7 @@ import torch
 
 from src.train.train import resolve_precision
 from src.train.train import resolve_autocast
+from src.train.train import resolve_entropy_lm_reference
 from src.train.train import adapt_config_for_device
 from src.train.train import pick_device
 from src.train.train import byte_kind_loss_stats
@@ -69,6 +70,51 @@ def test_cuda_adaptation_does_not_change_config():
         "speed": {"micro_batch_size": 2, "grad_accum_steps": 32},
     }
     assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+
+
+def test_entropy_model_config_is_loaded_from_single_reference(tmp_path):
+    entropy_path = tmp_path / "entropy_lm.yaml"
+    entropy_path.write_text(
+        """
+model:
+  arch: byte_lm
+  vocab_size: 260
+  hidden_size: 128
+checkpoint:
+  dir: ./checkpoints/entropy_lm
+"""
+    )
+    arbor_path = tmp_path / "arbor.yaml"
+    arbor_path.write_text("")
+    cfg = {
+        "entropy_lm_config": "entropy_lm.yaml",
+        "model": {"patching_mode": "entropy", "bitnet": True},
+    }
+
+    resolved = resolve_entropy_lm_reference(cfg, arbor_path)
+
+    assert resolved["model"]["bitnet"] is True
+    assert resolved["model"]["entropy_model"] == {
+        "vocab_size": 260,
+        "hidden_size": 128,
+    }
+    assert (
+        resolved["model"]["entropy_model_ckpt"]
+        == "checkpoints/entropy_lm/latest"
+    )
+    assert "entropy_model" not in cfg["model"]
+
+
+def test_entropy_inline_model_and_reference_cannot_be_double_managed(tmp_path):
+    cfg = {
+        "entropy_lm_config": "entropy_lm.yaml",
+        "model": {
+            "patching_mode": "entropy",
+            "entropy_model": {"hidden_size": 128},
+        },
+    }
+    with pytest.raises(ValueError, match="二重管理は禁止"):
+        resolve_entropy_lm_reference(cfg, tmp_path / "arbor.yaml")
 
 
 def test_pick_device_does_not_fallback_from_explicit_mps(monkeypatch):

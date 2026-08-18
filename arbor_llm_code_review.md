@@ -125,7 +125,7 @@ GPU前提ならよいですが、CPU fallbackのコードを書いているの�
 
 `requirements.txt` は `transformers>=4.44`、`datasets>=2.20` など下限指定中心で、PyTorchも「assumed but intentionally not pinned」です。
 
-研究コードとしては普通にありますが、`torch.compile`、`bitsandbytes`、FlashAttention、HF streamingあたりはバージョン差で壊れやすいので、1B学習を謳うならlock fileか検証済み環境が欲しいです。
+研究コードとしては普通にありますが、`torch.compile`、SDPA、MPS、HF streamingあたりはバージョン差で壊れやすいので、1B学習を謳うならlock fileか検証済み環境が欲しいです。
 
 ---
 
@@ -217,5 +217,5 @@ def generate(model, prompt: str, max_new_bytes: int = 128, temperature: float = 
 - `src/data/byte_dataset.py`: <https://github.com/hika019/arbor-llm/blob/main/src/data/byte_dataset.py>
 - `src/eval/run_eval.py`: <https://github.com/hika019/arbor-llm/blob/main/src/eval/run_eval.py>
 - `src/eval/perplexity.py`: <https://github.com/hika019/arbor-llm/blob/main/src/eval/perplexity.py>
-- `configs/arbor_1b.yaml`: <https://github.com/hika019/arbor-llm/blob/main/configs/arbor_1b.yaml>
+- `configs/arbor.yaml`: 統合済み本体config
 - `requirements.txt`: <https://github.com/hika019/arbor-llm/blob/main/requirements.txt>

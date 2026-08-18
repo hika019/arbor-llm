@@ -1,6 +1,6 @@
 # Text Filter Samples: fineweb2_ja
 
-- config: `configs/arbor_1b_8k_utf8.yaml`
+- config: `configs/arbor.yaml`
 - scanned: 10
 - accepted_samples: 5
 - rejected_samples: 5

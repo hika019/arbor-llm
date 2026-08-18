@@ -547,8 +547,8 @@ TXT
 作る config:
 
 ```text
-configs/tiny_ja_overfit_fp.yaml     bitnet: false
-configs/tiny_ja_overfit_bitnet.yaml bitnet: true
+configs/arbor.yaml     bitnet: false
+configs/arbor.yaml bitnet: true
 ```
 
 判定:
@@ -647,8 +647,8 @@ src/train/train.py
 src/model/arbor.py
   ARBOR_DEBUG_CONTEXT=1 で byte/global/decoder RMS を 1 回だけ表示
 
-configs/tiny_ja_overfit_fp.yaml
-configs/tiny_ja_overfit_bitnet.yaml
+configs/arbor.yaml
+configs/arbor.yaml
 data/probes/tiny_ja.txt
   tiny overfit 切り分け用
 ```
@@ -663,9 +663,9 @@ data/probes/tiny_ja.txt
 .venv/bin/python -m pytest tests/test_generate.py -q
 # 11 passed
 
-source scripts/env.sh && .venv/bin/python -m src.train.train --config configs/smoke.yaml --dry-run
-source scripts/env.sh && .venv/bin/python -m src.train.train --config configs/tiny_ja_overfit_fp.yaml --dry-run
-source scripts/env.sh && .venv/bin/python -m src.train.train --config configs/tiny_ja_overfit_bitnet.yaml --dry-run
+source scripts/env.sh && .venv/bin/python -m src.train.train --config configs/arbor.yaml --dry-run
+source scripts/env.sh && .venv/bin/python -m src.train.train --config configs/arbor.yaml --dry-run
+source scripts/env.sh && .venv/bin/python -m src.train.train --config configs/arbor.yaml --dry-run
 ```
 
 ### frozen / no-freeze BitLinear 比較
@@ -821,15 +821,15 @@ src/train/train.py
   logging.byte_kind_metrics=true で ascii / utf8_lead / utf8_cont / other の bpb を metrics.jsonl に出す
   GPU 同期を避けるため interval 内は tensor のまま集計し、ログ時だけ CPU 化
 
-configs/arbor_1b_8k_utf8.yaml
+configs/arbor.yaml
   data mix は static 版と同じ、patching だけ utf8
 
-configs/arbor_1b_8k_utf8_mix.yaml
+configs/arbor.yaml
   utf8 patching + 日本語自然文寄せ mix
   fineweb2_ja=0.599, wikipedia_ja=0.05, aozora=0.05, law=0.001,
   fineweb_edu_en=0.11, fineweb_en=0.04, math=0.06, github_code=0.07, opc_code=0.02
 
-configs/tiny_ja_overfit_utf8_bitnet.yaml
+configs/arbor.yaml
   tiny overfit の utf8 patching 比較用
 ```
 

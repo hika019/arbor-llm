@@ -1,7 +1,7 @@
 """学習済みチェックポイントから perplexity を測る評価エントリポイント.
 
 実行:
-    python -m src.eval.run_eval --config configs/smoke.yaml --ckpt latest --max-batches 20
+    python -m src.eval.run_eval --config configs/arbor.yaml --ckpt latest --max-batches 20
 """
 from __future__ import annotations
 
