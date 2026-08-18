@@ -4,7 +4,6 @@ optimizer は `optim.optimizer` (adamw | lion) と `optim.state_precision`
 (fp32 | int8) で選ぶ。state_precision は adamw の optimizer state dtype を表し、
 全 parameter に一様に適用される (小さい層も除外しない)。指定した実装/精度が
 使えない場合に別 optimizer や別精度へ暗黙フォールバックしてはいけない。
-旧名 (adamw_fused / adamw_8bit / bnb_adamw_8bit) は明示的な別名として残す。
 """
 from __future__ import annotations
 
@@ -15,10 +14,6 @@ import torch
 
 
 _INT8_STATE_BLOCK_SIZE = 2048
-
-
-def _parameter_device_types(params: list[torch.nn.Parameter]) -> set[str]:
-    return {p.device.type for p in params}
 
 
 def _quantize_int8_state(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -318,16 +313,6 @@ def _build_adamw(
     return AdamWFP32(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
 
 
-# 旧 optimizer 名 -> (algorithm, 強制 state_precision or None)。
-# config の後方互換のための明示的な別名。暗黙のパラメータ変換ではない。
-_LEGACY_OPTIMIZER_ALIASES = {
-    "adamw": ("adamw", None),
-    "adamw_fused": ("adamw", "fp32"),
-    "adamw_8bit": ("adamw", "int8"),
-    "bnb_adamw_8bit": ("bnb_adamw", "int8"),
-}
-
-
 def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.optim.Optimizer:
     params = list(params)
     if not params:
@@ -348,44 +333,12 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
         state_dtype = getattr(torch, state_dtype_name) if state_dtype_name else None
         return Lion(params, lr=lr, betas=betas, weight_decay=wd, state_dtype=state_dtype)
 
-    if name not in _LEGACY_OPTIMIZER_ALIASES:
+    if name != "adamw":
         raise ValueError(f"unknown optimizer: {name}")
-    algo, forced_precision = _LEGACY_OPTIMIZER_ALIASES[name]
-
-    # 明示 state_precision と旧名が食い違う場合は黙って上書きせずエラーにする。
-    if forced_precision is not None and cfg_precision is not None:
-        if resolve_state_precision(cfg_precision) != forced_precision:
-            raise ValueError(
-                f"optim.optimizer={name} は state_precision={forced_precision} 固定です。"
-                f"矛盾する optim.state_precision={cfg_precision} は指定できません "
-                "(optimizer=adamw + state_precision=... で選択してください)"
-            )
-    state_precision = forced_precision or resolve_state_precision(cfg_precision)
-
-    if algo == "bnb_adamw":
-        # CUDA 専用の高速 INT8 AdamW。別実装への暗黙フォールバックはしない。
-        device_types = _parameter_device_types(params)
-        if device_types != {"cuda"}:
-            raise RuntimeError(
-                "optim.optimizer=bnb_adamw_8bit はこのプロジェクトでは CUDA 専用です。"
-                f"parameter devices={sorted(device_types)}。"
-                "device 非依存にするには optimizer=adamw + state_precision=int8 を使ってください"
-            )
-        try:
-            import bitsandbytes as bnb
-        except Exception as exc:  # noqa: BLE001 - import 失敗理由を問わず明示エラー
-            raise RuntimeError(
-                "optim.optimizer=bnb_adamw_8bit を指定したが bitsandbytes を import "
-                "できません。別 optimizer への暗黙フォールバックは行いません"
-            ) from exc
-        # min_8bit_size=1: 小さい層も含め全 parameter の state を INT8 に統一する。
-        return bnb.optim.AdamW8bit(
-            params, lr=lr, betas=betas, eps=eps, weight_decay=wd, min_8bit_size=1
-        )
 
     return _build_adamw(
         params,
-        state_precision=state_precision,
+        state_precision=resolve_state_precision(cfg_precision),
         lr=lr,
         betas=betas,
         eps=eps,

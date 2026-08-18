@@ -140,9 +140,9 @@ def test_adamw_8bit_checkpoint_restore_preserves_state_dtypes():
     opt2.step()
 
 
-def test_bnb_adamw_8bit_does_not_fallback_on_cpu():
+def test_legacy_optimizer_name_is_not_implicitly_converted():
     model = torch.nn.Linear(2, 1)
-    with pytest.raises(RuntimeError, match="CUDA 専用"):
+    with pytest.raises(ValueError, match="unknown optimizer"):
         build_optimizer(
             model.parameters(),
             {
@@ -155,14 +155,13 @@ def test_bnb_adamw_8bit_does_not_fallback_on_cpu():
         )
 
 
-def test_conflicting_legacy_optimizer_alias_and_precision_is_error():
+def test_precision_must_be_selected_by_state_precision():
     model = torch.nn.Linear(2, 1)
-    with pytest.raises(ValueError, match="矛盾"):
+    with pytest.raises(ValueError, match="unknown optimizer"):
         build_optimizer(
             model.parameters(),
             {
                 "optimizer": "adamw_8bit",
-                "state_precision": "fp32",
                 "lr": 1e-3,
                 "betas": (0.9, 0.95),
                 "eps": 1e-8,
