@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.train.optim import Lion, build_optimizer, build_scheduler
+from src.train.optim import (
+    AdamW8bit,
+    Lion,
+    build_optimizer,
+    build_scheduler,
+    resolve_state_precision,
+)
 
 
 def test_lion_optimizer_step_updates_parameter():
@@ -30,6 +36,146 @@ def test_build_optimizer_accepts_lion():
     )
 
     assert isinstance(opt, Lion)
+
+
+def test_adamw_8bit_keeps_moments_as_int8():
+    p = torch.nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
+    opt = AdamW8bit([p], lr=1e-2, betas=(0.9, 0.95), weight_decay=0.1)
+
+    p.grad = torch.tensor([0.25, -0.5, 1.0])
+    opt.step()
+
+    state = opt.state[p]
+    assert state["exp_avg"].dtype == torch.int8
+    assert state["exp_avg_sq"].dtype == torch.int8
+    assert state["exp_avg_scale"].dtype == torch.float32
+    assert state["exp_avg_sq_scale"].dtype == torch.float32
+    assert state["step"] == 1
+    assert not torch.equal(p.detach(), torch.tensor([1.0, -2.0, 3.0]))
+
+
+def test_build_optimizer_accepts_int8_state_precision():
+    model = torch.nn.Linear(2, 1)
+    opt = build_optimizer(
+        model.parameters(),
+        {
+            "optimizer": "adamw",
+            "state_precision": "int8",
+            "lr": 1e-3,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8,
+            "weight_decay": 0.1,
+        },
+    )
+
+    assert isinstance(opt, AdamW8bit)
+
+
+def test_adamw_fp32_state_precision_applies_to_every_parameter():
+    parameters = [
+        torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.ones(4097, dtype=torch.bfloat16)),
+    ]
+    opt = build_optimizer(
+        parameters,
+        {
+            "optimizer": "adamw",
+            "state_precision": "fp32",
+            "lr": 1e-3,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8,
+            "weight_decay": 0.1,
+        },
+    )
+    for p in parameters:
+        p.grad = torch.ones_like(p)
+    opt.step()
+
+    for p in parameters:
+        assert opt.state[p]["exp_avg"].dtype == torch.float32
+        assert opt.state[p]["exp_avg_sq"].dtype == torch.float32
+
+
+def test_adamw_int8_state_precision_applies_to_every_parameter():
+    parameters = [
+        torch.nn.Parameter(torch.ones(1)),
+        torch.nn.Parameter(torch.ones(4097)),
+    ]
+    opt = build_optimizer(
+        parameters,
+        {
+            "optimizer": "adamw",
+            "state_precision": "int8",
+            "lr": 1e-3,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8,
+            "weight_decay": 0.1,
+        },
+    )
+    for p in parameters:
+        p.grad = torch.ones_like(p)
+    opt.step()
+
+    for p in parameters:
+        assert opt.state[p]["exp_avg"].dtype == torch.int8
+        assert opt.state[p]["exp_avg_sq"].dtype == torch.int8
+
+
+def test_adamw_8bit_checkpoint_restore_preserves_state_dtypes():
+    p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    opt = AdamW8bit([p], lr=1e-2)
+    p.grad = torch.ones_like(p)
+    opt.step()
+
+    p2 = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    opt2 = AdamW8bit([p2], lr=1e-2)
+    opt2.load_state_dict(opt.state_dict())
+    state = opt2.state[p2]
+
+    assert state["exp_avg"].dtype == torch.int8
+    assert state["exp_avg_sq"].dtype == torch.int8
+    assert state["exp_avg_scale"].dtype == torch.float32
+    assert state["exp_avg_sq_scale"].dtype == torch.float32
+    p2.grad = torch.ones_like(p2)
+    opt2.step()
+
+
+def test_bnb_adamw_8bit_does_not_fallback_on_cpu():
+    model = torch.nn.Linear(2, 1)
+    with pytest.raises(RuntimeError, match="CUDA 専用"):
+        build_optimizer(
+            model.parameters(),
+            {
+                "optimizer": "bnb_adamw_8bit",
+                "lr": 1e-3,
+                "betas": (0.9, 0.95),
+                "eps": 1e-8,
+                "weight_decay": 0.1,
+            },
+        )
+
+
+def test_conflicting_legacy_optimizer_alias_and_precision_is_error():
+    model = torch.nn.Linear(2, 1)
+    with pytest.raises(ValueError, match="矛盾"):
+        build_optimizer(
+            model.parameters(),
+            {
+                "optimizer": "adamw_8bit",
+                "state_precision": "fp32",
+                "lr": 1e-3,
+                "betas": (0.9, 0.95),
+                "eps": 1e-8,
+                "weight_decay": 0.1,
+            },
+        )
+
+
+def test_resolve_state_precision_rejects_unknown_value():
+    assert resolve_state_precision("fp32") == "fp32"
+    assert resolve_state_precision("int8") == "int8"
+    with pytest.raises(ValueError, match="state_precision"):
+        resolve_state_precision("bf16")
 
 
 def _lr_at(sched_cfg: dict, steps: int) -> float:
