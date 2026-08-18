@@ -23,7 +23,12 @@ def test_resolve_precision_accepts_supported_modes():
 
 def test_resolve_precision_rejects_unknown_mode():
     with pytest.raises(ValueError, match="speed.precision"):
-        resolve_precision("int8")
+        resolve_precision("int4")
+
+
+def test_resolve_precision_bf8_is_explicit_error_not_silent():
+    with pytest.raises(ValueError, match="bf8"):
+        resolve_precision("bf8")
 
 
 def test_resolve_autocast_requires_real_bool():

@@ -1,9 +1,10 @@
 """Optimizer / LR scheduler ファクトリ。
 
 optimizer は `optim.optimizer` (adamw | lion) と `optim.state_precision`
-(fp32 | int8) で選ぶ。state_precision は adamw の optimizer state dtype を表し、
+(fp32 | int8 | bf8) で選ぶ。state_precision は adamw の optimizer state dtype を表し、
 全 parameter に一様に適用される (小さい層も除外しない)。指定した実装/精度が
 使えない場合に別 optimizer や別精度へ暗黙フォールバックしてはいけない。
+bf8 は 8bit 浮動小数 (torch.float8_e5m2)。moment を bf8 で保持し、演算は FP32。
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import torch
 
 
 _INT8_STATE_BLOCK_SIZE = 2048
+_BF8_DTYPE = torch.float8_e5m2  # E5M2: bf16 と同じ指数幅で range 重視の 8bit float
 
 
 def _quantize_int8_state(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -218,6 +220,89 @@ class AdamWFP32(torch.optim.Optimizer):
         return loss
 
 
+class AdamWBF8(torch.optim.Optimizer):
+    """全 parameter の AdamW moment state を bf8 (float8_e5m2) で保持する実装。
+
+    float8 は指数を持つので int8 のような per-block scale は要らない。moment を
+    bf8 で保存し (1 byte/要素)、更新のたびに FP32 へ dequantize して計算する。
+    float8 には elementwise 演算カーネルが無いため、演算は必ず FP32 で行う。
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+    ) -> None:
+        if lr <= 0:
+            raise ValueError(f"lr must be positive: {lr}")
+        if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
+            raise ValueError(f"betas must be in [0, 1): {betas}")
+        if eps <= 0:
+            raise ValueError(f"eps must be positive: {eps}")
+        if weight_decay < 0:
+            raise ValueError(f"weight_decay must be non-negative: {weight_decay}")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """checkpoint の parameter-dtype cast 後に bf8 state を復元する。"""
+        super().load_state_dict(state_dict)
+        for p, state in self.state.items():
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key in state:
+                    state[key] = state[key].to(device=p.device, dtype=_BF8_DTYPE)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError("AdamWBF8 does not support sparse gradients")
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, dtype=_BF8_DTYPE)
+                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=_BF8_DTYPE)
+
+                state["step"] += 1
+                step = state["step"]
+                exp_avg = state["exp_avg"].float()
+                exp_avg_sq = state["exp_avg_sq"].float()
+                grad32 = grad.float()
+
+                exp_avg.mul_(beta1).add_(grad32, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad32, grad32, value=1.0 - beta2)
+
+                if wd:
+                    p.mul_(1.0 - lr * wd)
+                bias_correction1 = 1.0 - beta1**step
+                bias_correction2 = 1.0 - beta2**step
+                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+                update = exp_avg.div(denom).mul_(lr / bias_correction1)
+                p.add_(update.to(dtype=p.dtype), alpha=-1.0)
+
+                state["exp_avg"] = exp_avg.to(_BF8_DTYPE)
+                state["exp_avg_sq"] = exp_avg_sq.to(_BF8_DTYPE)
+
+        return loss
+
+
 class Lion(torch.optim.Optimizer):
     """Lion optimizer with decoupled weight decay.
 
@@ -275,11 +360,11 @@ class Lion(torch.optim.Optimizer):
         return loss
 
 
-_STATE_PRECISIONS = ("fp32", "int8")
+_STATE_PRECISIONS = ("fp32", "int8", "bf8")
 
 
 def resolve_state_precision(value: str | None) -> str:
-    """optim.state_precision を正規化する (fp32 | int8)。別値は暗黙変換せずエラー。"""
+    """optim.state_precision を正規化する (fp32 | int8 | bf8)。別値は暗黙変換せずエラー。"""
     if value is None:
         return "fp32"
     normalized = str(value).lower()
@@ -287,6 +372,8 @@ def resolve_state_precision(value: str | None) -> str:
         return "fp32"
     if normalized == "int8":
         return "int8"
+    if normalized == "bf8":
+        return "bf8"
     raise ValueError(
         f"unknown optim.state_precision: {value!r} (choices: {_STATE_PRECISIONS})"
     )
@@ -305,11 +392,14 @@ def _build_adamw(
 
     - fp32: 本モジュールの AdamWFP32 (全 parameter の moment を厳密に FP32)。
     - int8: 本モジュールの AdamW8bit (全 parameter の moment を blockwise INT8)。
+    - bf8:  本モジュールの AdamWBF8 (全 parameter の moment を float8_e5m2)。
     どちらも parameter を個別 dtype 例外なく一様に扱う (小さい層も除外しない)。
     別 device への暗黙フォールバックや別 optimizer への置換はしない。
     """
     if state_precision == "int8":
         return AdamW8bit(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+    if state_precision == "bf8":
+        return AdamWBF8(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
     return AdamWFP32(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
 
 

@@ -5,6 +5,7 @@ import torch
 
 from src.train.optim import (
     AdamW8bit,
+    AdamWBF8,
     Lion,
     build_optimizer,
     build_scheduler,
@@ -121,6 +122,61 @@ def test_adamw_int8_state_precision_applies_to_every_parameter():
         assert opt.state[p]["exp_avg_sq"].dtype == torch.int8
 
 
+def test_adamw_bf8_keeps_moments_as_float8():
+    p = torch.nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
+    opt = AdamWBF8([p], lr=1e-2, betas=(0.9, 0.95), weight_decay=0.1)
+
+    p.grad = torch.tensor([0.25, -0.5, 1.0])
+    opt.step()
+
+    state = opt.state[p]
+    assert state["exp_avg"].dtype == torch.float8_e5m2
+    assert state["exp_avg_sq"].dtype == torch.float8_e5m2
+    assert state["step"] == 1
+    assert not torch.equal(p.detach(), torch.tensor([1.0, -2.0, 3.0]))
+
+
+def test_build_optimizer_accepts_bf8_state_precision():
+    parameters = [
+        torch.nn.Parameter(torch.ones(1)),
+        torch.nn.Parameter(torch.ones(4097)),
+    ]
+    opt = build_optimizer(
+        parameters,
+        {
+            "optimizer": "adamw",
+            "state_precision": "bf8",
+            "lr": 1e-3,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8,
+            "weight_decay": 0.1,
+        },
+    )
+    assert isinstance(opt, AdamWBF8)
+    for p in parameters:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    for p in parameters:
+        assert opt.state[p]["exp_avg"].dtype == torch.float8_e5m2
+        assert opt.state[p]["exp_avg_sq"].dtype == torch.float8_e5m2
+
+
+def test_adamw_bf8_checkpoint_restore_preserves_state_dtypes():
+    p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    opt = AdamWBF8([p], lr=1e-2)
+    p.grad = torch.ones_like(p)
+    opt.step()
+
+    p2 = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    opt2 = AdamWBF8([p2], lr=1e-2)
+    opt2.load_state_dict(opt.state_dict())
+    state = opt2.state[p2]
+    assert state["exp_avg"].dtype == torch.float8_e5m2
+    assert state["exp_avg_sq"].dtype == torch.float8_e5m2
+    p2.grad = torch.ones_like(p2)
+    opt2.step()
+
+
 def test_adamw_8bit_checkpoint_restore_preserves_state_dtypes():
     p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
     opt = AdamW8bit([p], lr=1e-2)
@@ -173,8 +229,9 @@ def test_precision_must_be_selected_by_state_precision():
 def test_resolve_state_precision_rejects_unknown_value():
     assert resolve_state_precision("fp32") == "fp32"
     assert resolve_state_precision("int8") == "int8"
+    assert resolve_state_precision("bf8") == "bf8"
     with pytest.raises(ValueError, match="state_precision"):
-        resolve_state_precision("bf16")
+        resolve_state_precision("int4")
 
 
 def _lr_at(sched_cfg: dict, steps: int) -> float:

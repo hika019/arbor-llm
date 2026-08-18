@@ -546,7 +546,17 @@ def resolve_precision(name: str) -> tuple[torch.dtype, bool]:
         return torch.float16, True
     if normalized in ("fp32", "float32"):
         return torch.float32, False
-    raise ValueError(f"unknown speed.precision: {name}")
+    if normalized in ("bf8", "float8_e5m2"):
+        # bf8 は 8bit float だが、rms_norm / add / SDPA など forward の主要 op に
+        # float8 の eager カーネルが無いため、compute dtype には使えない。黙って
+        # 別精度に落とさず、8bit にしたい用途 (optimizer state) を明示案内する。
+        raise ValueError(
+            "speed.precision=bf8 は非対応です: PyTorch eager に float8 の "
+            "rms_norm/elementwise/SDPA カーネルが無く、BitNet forward を計算できません。"
+            "計算精度は bf16 | fp16 | fp32 から選び、8bit にしたい場合は "
+            "optim.state_precision: bf8 (optimizer state) を使ってください"
+        )
+    raise ValueError(f"unknown speed.precision: {name} (choices: bf16 | fp16 | fp32)")
 
 
 def resolve_autocast(speed: dict, default: bool) -> bool:

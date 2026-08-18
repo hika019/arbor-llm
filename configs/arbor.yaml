@@ -18,12 +18,17 @@ entropy_lm_config: entropy_lm.yaml
 
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
+  # patching_mode: 一定 byte で区切る (entropy 不使用) なら static のまま。
+  #   static  … patch_size byte 固定で区切る (これが「一定 byte 区切り」)
+  #   utf8    … UTF-8 文字境界で区切る (min/max_patch_len 有効)
+  #   space   … 空白/改行直後で区切る (min/max_patch_len 有効)
+  #   entropy … ByteLM の予測エントロピー閾値で区切る (entropy_lm_config 必須)
   patching_mode: static         # choices: static | utf8 | space | entropy
-  patch_size: 8                 # 1 patch = 8 bytes (静的)
-  min_patch_len: 3              # dynamic patching 用
-  max_patch_len: 16             # dynamic patching 用
-  entropy_threshold: 2.0        # entropy patching 用 (nats)
-  max_bytes: 8192               # 学習 context (bytes) = 1024 patches
+  patch_size: 8                 # static 専用: 1 patch = N byte。range: 1..max_bytes の約数
+  min_patch_len: 3              # utf8/space/entropy 専用。range: 1..max_patch_len
+  max_patch_len: 16             # utf8/space/entropy 専用。range: >=min_patch_len
+  entropy_threshold: 2.0        # entropy 専用: 次 byte H (nats)。range: >0 (小さいほど細切れ)
+  max_bytes: 8192               # 学習 context (bytes)。static では patch_size の倍数
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
   num_heads: 16
@@ -40,7 +45,7 @@ model:
   # ---- 共通 ----
   rope_theta: 500000.0
   norm_eps: 1.0e-5
-  bitnet: true
+  bitnet: true                  # choices: true (W1.58/A8 BitNet) | false (FP debug)
   gradient_checkpointing: false # OOM 時のみ true
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
@@ -119,13 +124,14 @@ data:
 # ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
 optim:
   optimizer: adamw              # choices: adamw | lion
-  state_precision: int8         # choices: fp32 | int8。全parameterのmoment stateへ一様適用
+  state_precision: bf8          # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
+                                # fp32=8B/要素, int8=blockwise 1B, bf8=float8_e5m2 1B
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
-  scheduler: cosine_warmup
+  scheduler: cosine_warmup      # choices: cosine_warmup
   min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
@@ -134,7 +140,8 @@ optim:
 # ---- スループット ----
 speed:
   device: auto                  # choices: auto | cuda | mps | cpu
-  precision: bf16               # choices: bf16 | fp16 | fp32
+  precision: bf16               # 計算dtype。choices: bf16 | fp16 | fp32
+                                # (bf8 は forward の float8 カーネルが無く非対応)
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
