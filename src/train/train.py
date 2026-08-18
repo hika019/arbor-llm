@@ -419,12 +419,73 @@ def apply_speed_settings(speed: dict) -> None:
     if speed.get("cudnn_benchmark", False):
         torch.backends.cudnn.benchmark = True
 
-def pick_device() -> torch.device:
+
+def pick_device(requested: str = "auto") -> torch.device:
+    """実行 device を選ぶ。明示指定時は利用不能でも別 device へ落とさない。"""
+    normalized = requested.lower()
+    if normalized == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "speed.device=cuda を指定したが CUDA は利用できません。"
+                "CPU/MPS への暗黙フォールバックは行いません"
+            )
+        return torch.device("cuda")
+    if normalized == "mps":
+        if not torch.backends.mps.is_available():
+            reason = (
+                "PyTorch が MPS 対応でビルドされていません"
+                if not torch.backends.mps.is_built()
+                else "この macOS / Apple Silicon 環境で MPS を初期化できません"
+            )
+            raise RuntimeError(
+                f"speed.device=mps を指定したが MPS は利用できません: {reason}。"
+                "CPU/CUDA への暗黙フォールバックは行いません"
+            )
+        return torch.device("mps")
+    if normalized == "cpu":
+        return torch.device("cpu")
+    if normalized != "auto":
+        raise ValueError(f"unknown speed.device: {requested}")
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
+    """単一 config を device の実行制約へ、意味を変えずに適合させる。
+
+    MPS では 1B/8K の activation memory を抑えるため checkpointing と
+    micro-batch=1 を使い、grad_accum を同率で増やして effective batch を保つ。
+    optimizer、state_precision、モデル形状、データ混合は変更しない。
+    """
+    resolved = copy.deepcopy(cfg)
+    if device.type != "mps":
+        return resolved
+
+    model_cfg = resolved.setdefault("model", {})
+    if not model_cfg.get("gradient_checkpointing", False):
+        model_cfg["gradient_checkpointing"] = True
+        print("[train] MPS: gradient_checkpointing=ON (model shape/precision unchanged)")
+
+    speed_cfg = resolved.setdefault("speed", {})
+    micro_batch = int(speed_cfg.get("micro_batch_size", 1))
+    grad_accum = int(speed_cfg.get("grad_accum_steps", 1))
+    if micro_batch > 1:
+        speed_cfg["micro_batch_size"] = 1
+        speed_cfg["grad_accum_steps"] = grad_accum * micro_batch
+        print(
+            "[train] MPS: micro_batch_size=1 grad_accum_steps={} "
+            "(effective batch preserved: {} sequences)".format(
+                speed_cfg["grad_accum_steps"], micro_batch * grad_accum
+            )
+        )
+
+    validation_cfg = resolved.get("validation")
+    if isinstance(validation_cfg, dict):
+        validation_cfg["micro_batch_size"] = 1
+    return resolved
 
 
 def resolve_precision(name: str) -> tuple[torch.dtype, bool]:
@@ -436,6 +497,16 @@ def resolve_precision(name: str) -> tuple[torch.dtype, bool]:
     if normalized in ("fp32", "float32"):
         return torch.float32, False
     raise ValueError(f"unknown speed.precision: {name}")
+
+
+def resolve_autocast(speed: dict, default: bool) -> bool:
+    """autocast の明示 override を検証する。文字列等を bool 化しない。"""
+    if "autocast" not in speed:
+        return default
+    value = speed["autocast"]
+    if not isinstance(value, bool):
+        raise TypeError(f"speed.autocast must be bool, got {type(value).__name__}")
+    return value
 
 
 def byte_kind_loss_stats(
@@ -478,11 +549,19 @@ def byte_kind_loss_stats(
     return out
 
 
-def apply_compile_settings(model: torch.nn.Module, speed: dict) -> torch.nn.Module:
+def apply_compile_settings(
+    model: torch.nn.Module, speed: dict, device: torch.device
+) -> torch.nn.Module:
     """Apply torch.compile according to speed config and return the trainable model."""
     # Arbor v2 は静的 patching で形状固定なので compile が素直に効く (既定 ON)
     if not speed.get("torch_compile", True):
         print("[train] torch_compile=OFF")
+        return model
+    # torch.compile は Inductor→(CUDA|CPU) 前提。MPS backend は codegen が不安定で
+    # 落ちる/遅い。compile は結果を変えない速度最適化なので、非 CUDA では
+    # semantic を変えずに OFF にする (別 optimizer/精度への置換とは異なる)。
+    if device.type != "cuda":
+        print(f"[train] torch_compile=OFF (device={device.type}: CUDA 以外は非対応)")
         return model
     mode = speed.get("compile_mode", "default")
 
@@ -514,11 +593,13 @@ def main() -> int:
     git_info = git_metadata(_ROOT)
     timing_mark("git_metadata")
 
+    requested_device = str(cfg.get("speed", {}).get("device", "auto"))
+    device = pick_device(requested_device)
+    cfg = adapt_config_for_device(cfg, device)
     torch.manual_seed(cfg.get("seed", 42))
     apply_speed_settings(cfg.get("speed", {}))
     timing_mark("seed_and_speed_settings")
 
-    device = pick_device()
     print(f"[train] device={device} torch={torch.__version__}")
     if device.type == "cuda":
         free, total = torch.cuda.mem_get_info()
@@ -533,7 +614,15 @@ def main() -> int:
         from src.model.arbor import build_arbor as build_model
     else:
         raise ValueError(f"unknown model.arch: {arch}")
-    compute_dtype, use_autocast = resolve_precision(cfg.get("speed", {}).get("precision", "bf16"))
+    compute_dtype, precision_autocast = resolve_precision(
+        cfg.get("speed", {}).get("precision", "bf16")
+    )
+    # autocast は結果に影響する compute 設定だが、MPS では autocast を挟むと
+    # 実測で遅くなるため、既定は CUDA のみ ON。明示 speed.autocast で上書き可能。
+    default_autocast = precision_autocast and device.type == "cuda"
+    use_autocast = resolve_autocast(cfg.get("speed", {}), default_autocast)
+    if use_autocast and compute_dtype == torch.float32:
+        raise ValueError("speed.autocast=true と speed.precision=fp32 は併用できません")
     print(f"[train] arch={arch} precision={compute_dtype} autocast={use_autocast}")
     print("[train] building model...")
     timing_mark("before_model_build", device)
@@ -598,7 +687,7 @@ def main() -> int:
             f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
         )
 
-    model = apply_compile_settings(model, cfg["speed"])
+    model = apply_compile_settings(model, cfg["speed"], device)
     timing_mark("compile_wrapper_created", device)
 
     # ---- データ (streaming, メモリに全部載せない) ----
@@ -616,6 +705,11 @@ def main() -> int:
     else:
         data_cfg.setdefault("micro_batch_size", 4)
     data_cfg.setdefault("seed", cfg.get("seed", 42))
+    # pinned host memory は CUDA の H2D 転送専用の最適化。非 CUDA では効果が無く
+    # DataLoader が警告を出すだけなので、結果を変えない範囲で OFF にする。
+    if device.type != "cuda" and data_cfg.get("pin_memory", False):
+        print(f"[train] pin_memory=OFF (device={device.type}: CUDA 以外は無効)")
+        data_cfg["pin_memory"] = False
     train_loader = build_byte_dataloader(data_cfg, split="train")
     timing_mark("dataloader_object_created", device)
 

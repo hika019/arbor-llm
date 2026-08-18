@@ -4,6 +4,9 @@ import pytest
 import torch
 
 from src.train.train import resolve_precision
+from src.train.train import resolve_autocast
+from src.train.train import adapt_config_for_device
+from src.train.train import pick_device
 from src.train.train import byte_kind_loss_stats
 from src.train.train import CudaBatchPrefetcher
 from src.train.train import ThreadedBatchPrefetcher
@@ -20,6 +23,60 @@ def test_resolve_precision_accepts_supported_modes():
 def test_resolve_precision_rejects_unknown_mode():
     with pytest.raises(ValueError, match="speed.precision"):
         resolve_precision("int8")
+
+
+def test_resolve_autocast_requires_real_bool():
+    assert resolve_autocast({}, True) is True
+    assert resolve_autocast({"autocast": False}, True) is False
+    with pytest.raises(TypeError, match="speed.autocast"):
+        resolve_autocast({"autocast": "false"}, True)
+
+
+def test_mps_adaptation_preserves_model_optimizer_and_effective_batch():
+    cfg = {
+        "model": {
+            "bitnet": True,
+            "patching_mode": "static",
+            "hidden_size": 2048,
+            "gradient_checkpointing": False,
+        },
+        "optim": {
+            "optimizer": "adamw",
+            "state_precision": "int8",
+            "lr": 1e-3,
+        },
+        "speed": {"micro_batch_size": 2, "grad_accum_steps": 32},
+        "validation": {"micro_batch_size": 2},
+    }
+
+    resolved = adapt_config_for_device(cfg, torch.device("mps"))
+
+    assert resolved["model"]["bitnet"] is True
+    assert resolved["model"]["patching_mode"] == "static"
+    assert resolved["model"]["hidden_size"] == 2048
+    assert resolved["model"]["gradient_checkpointing"] is True
+    assert resolved["optim"] == cfg["optim"]
+    assert resolved["speed"]["micro_batch_size"] == 1
+    assert resolved["speed"]["grad_accum_steps"] == 64
+    assert resolved["validation"]["micro_batch_size"] == 1
+    assert cfg["model"]["gradient_checkpointing"] is False
+
+
+def test_cuda_adaptation_does_not_change_config():
+    cfg = {
+        "model": {"gradient_checkpointing": False},
+        "optim": {"optimizer": "adamw", "state_precision": "fp32"},
+        "speed": {"micro_batch_size": 2, "grad_accum_steps": 32},
+    }
+    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+
+
+def test_pick_device_does_not_fallback_from_explicit_mps(monkeypatch):
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+
+    with pytest.raises(RuntimeError, match="暗黙フォールバック"):
+        pick_device("mps")
 
 
 def test_should_restore_dataloader_state_when_data_config_matches():
