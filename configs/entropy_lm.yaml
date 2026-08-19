@@ -94,11 +94,9 @@ data:
     - path: "HuggingFaceTB/finemath"    # 数学
       name: "finemath-4plus"
       weight: 0.03
-    - path: "loubnabnl/github-code-more-filtering"  # 多言語 GitHub コード (32 言語, parquet 非 gated)
-      text_column: "code"
-      weight: 0.05
+    # 旧 loubnabnl/github-code-more-filtering は datasets 4.x 非対応 (スクリプト型) のため統合。
     - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.02
+      weight: 0.07
   streaming: true
   shuffle_buffer: 2000
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)

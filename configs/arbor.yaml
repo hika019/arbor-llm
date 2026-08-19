@@ -103,17 +103,13 @@ data:
       weight_bytes: 0.06
       text_filter:
         preset: en_web_quality_v1
-    - id: github_code_filtered
-      path: "loubnabnl/github-code-more-filtering"  # license/generated/vendor/secret/dup filter 前提
-      text_column: "code"
-      revision: main
-      license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
-      weight_bytes: 0.08
     - id: opc_code_web
       path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
       revision: main
       license_policy: "dataset card terms; code/web mixture"
-      weight_bytes: 0.01
+      # 旧 github_code_filtered (loubnabnl/github-code-more-filtering) は datasets 4.x が
+      # 廃止したスクリプト型データセットで読めないため、その比率をここへ統合した。
+      weight_bytes: 0.09
       text_filter:
         preset: en_web_quality_v1
   streaming: true
@@ -191,8 +187,7 @@ validation:
       split: train
       skip_samples: 20000
     code:
-      source: "loubnabnl/github-code-more-filtering"
-      text_column: "code"
+      source: "OpenCoder-LLM/opc-fineweb-code-corpus"
       revision: main
       split: train
       skip_samples: 20000
