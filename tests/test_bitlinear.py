@@ -9,6 +9,8 @@ from src.model.bitlinear import (
     BitLinear,
     BitLinearGroup,
     activation_quant,
+    check_activation_precision,
+    quantize_activation,
     configure_bitlinear_training_cache,
     weight_quant,
 )
@@ -20,6 +22,43 @@ def test_weight_quant_is_ternary():
     scale = w.abs().mean()
     levels = torch.unique((w_q / scale).round())
     assert set(levels.tolist()) <= {-1.0, 0.0, 1.0}
+
+
+def test_bitlinear_default_activation_precision_is_int8():
+    layer = BitLinear(16, 8)
+    assert layer.activation_precision == "int8"
+
+
+def test_bitlinear_bf8_activation_weight_stays_ternary():
+    torch.manual_seed(0)
+    layer = BitLinear(16, 8, activation_precision="bf8")
+    x = torch.randn(4, 16)
+    y = layer(x)
+    assert y.shape == (4, 8)
+    # 重みは activation 精度に関係なく W1.58 ternary のまま
+    scale = layer.weight.abs().mean()
+    levels = torch.unique((weight_quant(layer.weight) / scale).round())
+    assert set(levels.tolist()) <= {-1.0, 0.0, 1.0}
+
+
+def test_bf8_activation_rounds_to_float8_grid():
+    x = torch.randn(4, 32)
+    q = quantize_activation(x, "bf8")
+    assert q.dtype == x.dtype
+    # bf8 fake-quant は float8_e5m2 グリッドに一致する
+    torch.testing.assert_close(q, x.to(torch.float8_e5m2).to(x.dtype))
+
+
+def test_bf16_activation_is_identity():
+    x = torch.randn(4, 32)
+    torch.testing.assert_close(quantize_activation(x, "bf16"), x)
+
+
+def test_unknown_activation_precision_is_error():
+    with pytest.raises(ValueError, match="activation_precision"):
+        check_activation_precision("int4")
+    with pytest.raises(ValueError, match="activation_precision"):
+        BitLinear(8, 8, activation_precision="fp8")
 
 
 def test_activation_quant_per_token_grid():

@@ -18,7 +18,8 @@ bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer �
 
 - **BitNet b1.58 公式レシピ準拠** (Microsoft "The Era of 1-bit LLMs" / 2B4T):
   - 重み: per-tensor absmean で ternary {-1,0,+1} (W1.58)
-  - 活性: per-token absmax で int8 (A8)
+  - 活性: `model.activation_precision` で選択 (int8=公式A8 | bf8=float8_e5m2 | bf16=非量子化)。
+    重みは常に W1.58 ternary。
   - STE は detach トリック (勾配は量子化後の値で計算)
   - SubLN: 全 BitLinear の入力は直前に RMSNorm を通る
     (q/k/v ← input_norm, o ← attn_sub_norm, gate/up ← ffn_norm, down ← ffn_sub_norm)

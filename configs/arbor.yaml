@@ -46,6 +46,11 @@ model:
   rope_theta: 500000.0
   norm_eps: 1.0e-5
   bitnet: true                  # choices: true (W1.58/A8 BitNet) | false (FP debug)
+  # BitLinear の活性量子化 (重みは常に W1.58 ternary)。
+  #   int8 … BitNet 公式 A8 (per-token absmax int8)
+  #   bf8  … 8bit float (float8_e5m2) fake-quant
+  #   bf16 … 量子化しない (活性は計算 dtype のまま)
+  activation_precision: bf8     # choices: int8 | bf8 | bf16
   gradient_checkpointing: false # OOM 時のみ true
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----

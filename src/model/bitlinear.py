@@ -55,6 +55,43 @@ def activation_quant_ste(x: torch.Tensor) -> torch.Tensor:
     return x + (activation_quant(x) - x).detach()
 
 
+# BitLinear の活性量子化。重みは常に W1.58 ternary (BitNet コア) で固定。
+#   int8 … BitNet b1.58 公式 A8 (per-token absmax int8)。既定。
+#   bf8  … 8bit float (float8_e5m2) fake-quant。指数を持つので per-token scale 不要。
+#   bf16 … 量子化しない (活性は計算 dtype のまま = A8 を無効化)。
+ACTIVATION_PRECISIONS = ("int8", "bf8", "bf16")
+_BF8_ACT_DTYPE = torch.float8_e5m2
+
+
+def check_activation_precision(precision: str) -> str:
+    if precision not in ACTIVATION_PRECISIONS:
+        raise ValueError(
+            f"unknown activation_precision: {precision!r} (choices: {ACTIVATION_PRECISIONS})"
+        )
+    return precision
+
+
+def quantize_activation(x: torch.Tensor, precision: str, eps: float = 1e-5) -> torch.Tensor:
+    """activation を指定精度へ fake-quant して dequantize 値 (同 dtype) を返す."""
+    if precision == "int8":
+        return activation_quant(x, eps)
+    if precision == "bf8":
+        # float8 の丸めは cast で行い、演算は元 dtype に戻してから。
+        return x.to(_BF8_ACT_DTYPE).to(x.dtype)
+    if precision == "bf16":
+        return x
+    raise ValueError(
+        f"unknown activation_precision: {precision!r} (choices: {ACTIVATION_PRECISIONS})"
+    )
+
+
+def quantize_activation_ste(x: torch.Tensor, precision: str = "int8") -> torch.Tensor:
+    """quantize_activation の detach-STE 版 (bf16 は恒等)."""
+    if precision == "bf16":
+        return x
+    return x + (quantize_activation(x, precision) - x).detach()
+
+
 def weight_quant(w: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """per-tensor absmean ternary 量子化 (値は dequantize して返す)."""
     scale = w.abs().mean().clamp_min(eps)
@@ -224,14 +261,24 @@ class _CachedBitLinearGroupSTE(torch.autograd.Function):
 
 
 class BitLinear(nn.Module):
-    """nn.Linear (bias 無し) の drop-in 置換. W1.58 / A8 + STE."""
+    """nn.Linear (bias 無し) の drop-in 置換. W1.58 ternary weight + STE.
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    活性量子化は activation_precision (int8=A8 公式 | bf8 | bf16) で選ぶ。
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        activation_precision: str = "int8",
+    ):
         super().__init__()
         if bias:
             raise ValueError("BitLinear is bias-free (BitNet b1.58 spec).")
         self.in_features = in_features
         self.out_features = out_features
+        self.activation_precision = check_activation_precision(activation_precision)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         # 出力側 (wo / down) は builder 側で 1/sqrt(2*n_layers) に再スケールする
         nn.init.trunc_normal_(self.weight, std=0.02, a=-0.06, b=0.06)
@@ -329,20 +376,23 @@ class BitLinear(nn.Module):
     def frozen(self) -> bool:
         return self._w_scale is not None
 
-    @staticmethod
-    def _quantize_act(x2: torch.Tensor) -> torch.Tensor:
-        """per-row absmax int8 量子化 (dequantize 値, 入力と同 dtype).
+    def _quantize_act(self, x2: torch.Tensor) -> torch.Tensor:
+        """activation を activation_precision に従って fake-quant する (同 dtype).
 
         注意: torch.fake_quantize_per_channel_affine は 1 カーネルに見えて
         実測 ~335us (素の F.linear の 8 倍) かかるため使わない。
         """
-        s = 127.0 / x2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
-        return ((x2 * s).round().clamp(-128, 127)) / s
+        return quantize_activation(x2, self.activation_precision)
 
     def _forward_inference(self, x: torch.Tensor) -> torch.Tensor:
         x2 = x.reshape(-1, self.in_features)
         m = x2.size(0)
-        if self._w_packed is not None and m > self._SMALL_M:
+        # packed ternary カーネルは int8 活性専用。bf8/bf16 では通常経路を使う。
+        if (
+            self._w_packed is not None
+            and m > self._SMALL_M
+            and self.activation_precision == "int8"
+        ):
             scale = 127.0 / x2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5).float()
             x_q = (x2.float() * scale).round().clamp(-128, 127).to(torch.int8)
             y = _packed_linear(
@@ -356,13 +406,15 @@ class BitLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.frozen and not self.training:
             return self._forward_inference(x)
-        return self.forward_prequantized(activation_quant_ste(x))
+        return self.forward_prequantized(
+            quantize_activation_ste(x, self.activation_precision)
+        )
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias=False, train_cache={self.training_weight_cache_enabled}, "
-            f"frozen={self.frozen}"
+            f"bias=False, act={self.activation_precision}, "
+            f"train_cache={self.training_weight_cache_enabled}, frozen={self.frozen}"
         )
 
 
@@ -378,6 +430,10 @@ class BitLinearGroup(nn.Module):
         in_features = members[0].in_features
         if any(member.in_features != in_features for member in members):
             raise ValueError("all BitLinearGroup members must share in_features")
+        activation_precision = members[0].activation_precision
+        if any(member.activation_precision != activation_precision for member in members):
+            raise ValueError("all BitLinearGroup members must share activation_precision")
+        self.activation_precision = activation_precision
         self.in_features = in_features
         self.out_splits = tuple(member.out_features for member in members)
         self.out_features = sum(self.out_splits)
@@ -447,7 +503,7 @@ class BitLinearGroup(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         members = self.members()
-        x_q = activation_quant_ste(x)
+        x_q = quantize_activation_ste(x, self.activation_precision)
         if self.training and self.training_weight_cache_enabled:
             weights = tuple(member.weight for member in members)
             return _CachedBitLinearGroupSTE.apply(x_q, self._train_qweight, *weights)

@@ -49,7 +49,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -130,6 +130,7 @@ class ArborConfig:
     rope_theta: float = 500000.0
     norm_eps: float = 1e-5
     bitnet: bool = True            # False で全 Linear を nn.Linear に (debug 用)
+    activation_precision: str = "int8"  # BitLinear の活性量子化: int8 | bf8 | bf16
     gradient_checkpointing: bool = False
 
     @classmethod
@@ -191,20 +192,28 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     return out.flatten(-2)
 
 
-def _make_linear(in_f: int, out_f: int, bitnet: bool) -> nn.Module:
+def _make_linear(in_f: int, out_f: int, bitnet: bool, activation_precision: str = "int8") -> nn.Module:
     if bitnet:
         from src.model.bitlinear import BitLinear
 
-        return BitLinear(in_f, out_f)
+        return BitLinear(in_f, out_f, activation_precision=activation_precision)
     lin = nn.Linear(in_f, out_f, bias=False)
     nn.init.trunc_normal_(lin.weight, std=0.02, a=-0.06, b=0.06)
     return lin
 
 
+def _activation_desc(precision: str) -> str:
+    return {
+        "int8": "A8(absmax per-token int8)",
+        "bf8": "bf8(float8_e5m2)",
+        "bf16": "bf16(no activation quant)",
+    }.get(precision, precision)
+
+
 class Attention(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, rope: RotaryEmbedding,
-        bitnet: bool, norm_eps: float, causal: bool,
+        bitnet: bool, norm_eps: float, causal: bool, activation_precision: str = "int8",
     ):
         super().__init__()
         if dim % n_heads != 0 or n_heads % n_kv_heads != 0:
@@ -214,10 +223,10 @@ class Attention(nn.Module):
         self.head_dim = dim // n_heads
         self.causal = causal
         self.rope = rope
-        self.wq = _make_linear(dim, n_heads * self.head_dim, bitnet)
-        self.wk = _make_linear(dim, n_kv_heads * self.head_dim, bitnet)
-        self.wv = _make_linear(dim, n_kv_heads * self.head_dim, bitnet)
-        self.wo = _make_linear(n_heads * self.head_dim, dim, bitnet)
+        self.wq = _make_linear(dim, n_heads * self.head_dim, bitnet, activation_precision)
+        self.wk = _make_linear(dim, n_kv_heads * self.head_dim, bitnet, activation_precision)
+        self.wv = _make_linear(dim, n_kv_heads * self.head_dim, bitnet, activation_precision)
+        self.wo = _make_linear(n_heads * self.head_dim, dim, bitnet, activation_precision)
         # SubLN: 出力射影の前に正規化 (BitNet 2B4T の attn_sub_norm)
         self.attn_sub_norm = RMSNorm(n_heads * self.head_dim, norm_eps)
 
@@ -281,11 +290,12 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     """ReLU² gated FFN (BitNet 2B4T): down(subln(relu(gate(x))^2 * up(x)))"""
 
-    def __init__(self, dim: int, hidden: int, bitnet: bool, norm_eps: float):
+    def __init__(self, dim: int, hidden: int, bitnet: bool, norm_eps: float,
+                 activation_precision: str = "int8"):
         super().__init__()
-        self.gate = _make_linear(dim, hidden, bitnet)
-        self.up = _make_linear(dim, hidden, bitnet)
-        self.down = _make_linear(hidden, dim, bitnet)
+        self.gate = _make_linear(dim, hidden, bitnet, activation_precision)
+        self.up = _make_linear(dim, hidden, bitnet, activation_precision)
+        self.down = _make_linear(hidden, dim, bitnet, activation_precision)
         self.ffn_sub_norm = RMSNorm(hidden, norm_eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -302,12 +312,14 @@ class Block(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, ffn_hidden: int,
         rope: RotaryEmbedding, bitnet: bool, norm_eps: float, causal: bool,
+        activation_precision: str = "int8",
     ):
         super().__init__()
         self.attn_norm = RMSNorm(dim, norm_eps)
-        self.attn = Attention(dim, n_heads, n_kv_heads, rope, bitnet, norm_eps, causal)
+        self.attn = Attention(dim, n_heads, n_kv_heads, rope, bitnet, norm_eps, causal,
+                              activation_precision)
         self.ffn_norm = RMSNorm(dim, norm_eps)
-        self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps)
+        self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps, activation_precision)
 
     def forward(
         self,
@@ -349,6 +361,7 @@ class ByteLM(nn.Module):
         max_bytes = cfg.get("max_bytes", 2048)
         bitnet = cfg.get("bitnet", False)
         norm_eps = cfg.get("norm_eps", 1e-5)
+        activation_precision = cfg.get("activation_precision", "int8")
         attention_window = cfg.get("attention_window")
         self.attention_window = None if attention_window is None else int(attention_window)
         if self.attention_window is not None and self.attention_window <= 0:
@@ -358,7 +371,8 @@ class ByteLM(nn.Module):
         self.embed = nn.Embedding(self.vocab_size, h)
         nn.init.trunc_normal_(self.embed.weight, std=0.02, a=-0.06, b=0.06)
         self.layers = nn.ModuleList(
-            Block(h, n_heads, n_kv, ffn, rope, bitnet, norm_eps, causal=True)
+            Block(h, n_heads, n_kv, ffn, rope, bitnet, norm_eps, causal=True,
+                  activation_precision=activation_precision)
             for _ in range(n_layers)
         )
         self.norm = RMSNorm(h, norm_eps)
@@ -525,6 +539,9 @@ class ArborModel(nn.Module):
         super().__init__()
         if cfg.patching_mode not in ("static", "utf8", "space", "entropy"):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
+        from src.model.bitlinear import check_activation_precision
+
+        check_activation_precision(cfg.activation_precision)
         self.cfg = cfg
         self.dynamic = cfg.patching_mode != "static"
         self.profile_sections = False
@@ -555,7 +572,7 @@ class ArborModel(nn.Module):
         self.encoder_layers = nn.ModuleList(
             Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
                   cfg.local_intermediate_size, local_rope, cfg.bitnet, cfg.norm_eps,
-                  causal=False)
+                  causal=False, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_encoder_layers)
         )
         # patch 表現: static は concat 射影、動的は max-pool 後に射影 (FP)
@@ -568,7 +585,8 @@ class ArborModel(nn.Module):
 
         self.global_layers = nn.ModuleList(
             Block(dg, cfg.num_heads, cfg.num_kv_heads, cfg.intermediate_size,
-                  global_rope, cfg.bitnet, cfg.norm_eps, causal=True)
+                  global_rope, cfg.bitnet, cfg.norm_eps, causal=True,
+                  activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_hidden_layers)
         )
         self.global_norm = RMSNorm(dg, cfg.norm_eps)
@@ -578,7 +596,7 @@ class ArborModel(nn.Module):
         self.decoder_layers = nn.ModuleList(
             Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
                   cfg.local_intermediate_size, local_rope, cfg.bitnet, cfg.norm_eps,
-                  causal=True)
+                  causal=True, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_decoder_layers)
         )
         self.head_norm = RMSNorm(dl, cfg.norm_eps)
@@ -1035,7 +1053,8 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
         f"entropy_lm={counts['entropy_model'] / 1e6:.1f}M) "
         f"patching={cfg.patching_mode} bitnet={'ON' if cfg.bitnet else 'OFF'} "
         f"bitlinear_layers={n_bit} "
-        "weights=W1.58(absmean ternary) activations=A8(absmax per-token) "
+        "weights=W1.58(absmean ternary) "
+        f"activations={_activation_desc(cfg.activation_precision)} "
         "subln=ON backward=STE(detach)"
     )
     return model
