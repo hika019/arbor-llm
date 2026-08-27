@@ -90,13 +90,10 @@ data:
     # ---- 会話 / typo / 絵文字 0.06 ----
     - path: "OpenAssistant/oasst1"      # 多言語チャット。崩れた文・顔文字・絵文字も含む
       weight: 0.06
-    # ---- code / markdown / math 0.10 ----
+    # ---- markdown / math 0.03 (code は学習データ非公開化のため除外) ----
     - path: "HuggingFaceTB/finemath"    # 数学
       name: "finemath-4plus"
       weight: 0.03
-    # 旧 loubnabnl/github-code-more-filtering は datasets 4.x 非対応 (スクリプト型) のため統合。
-    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.07
   streaming: true
   shuffle_buffer: 2000
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)

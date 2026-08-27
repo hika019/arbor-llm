@@ -51,6 +51,7 @@ model:
   #   bf8  … 8bit float (float8_e5m2) fake-quant
   #   bf16 … 量子化しない (活性は計算 dtype のまま)
   activation_precision: bf8     # choices: int8 | bf8 | bf16
+                                # MPS は float8 非対応。bf8 指定時は自動で bf16 に落ちる
   gradient_checkpointing: false # OOM 時のみ true
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
@@ -103,15 +104,9 @@ data:
       weight_bytes: 0.06
       text_filter:
         preset: en_web_quality_v1
-    - id: opc_code_web
-      path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      revision: main
-      license_policy: "dataset card terms; code/web mixture"
-      # 旧 github_code_filtered (loubnabnl/github-code-more-filtering) は datasets 4.x が
-      # 廃止したスクリプト型データセットで読めないため、その比率をここへ統合した。
-      weight_bytes: 0.09
-      text_filter:
-        preset: en_web_quality_v1
+    # NOTE: コード系データ (旧 opc_code_web / OpenCoder-LLM/opc-fineweb-code-corpus) は
+    # 提供元が非公開化したため除外した。weight_bytes は正規化されるため、残りソースの
+    # 相対比はそのまま保たれる (除外分 0.09 は他ソースへ比例配分される)。
   streaming: true
   packing: document
   eos_token_id: 2
@@ -127,6 +122,7 @@ optim:
   optimizer: adamw              # choices: adamw | lion
   state_precision: bf8          # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
                                 # fp32=8B/要素, int8=blockwise 1B, bf8=float8_e5m2 1B
+                                # MPS は float8 非対応。bf8 指定時は自動で int8 に落ちる
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -186,11 +182,7 @@ validation:
       revision: main
       split: train
       skip_samples: 20000
-    code:
-      source: "OpenCoder-LLM/opc-fineweb-code-corpus"
-      revision: main
-      split: train
-      skip_samples: 20000
+    # code ドメインは学習データ非公開化に伴い除外
 
 checkpoint:
   dir: ./checkpoints/arbor2_1b_8k_filter
