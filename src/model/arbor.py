@@ -132,6 +132,9 @@ class ArborConfig:
     bitnet: bool = True            # False で全 Linear を nn.Linear に (debug 用)
     activation_precision: str = "int8"  # BitLinear の活性量子化: int8 | bf8 | bf16
     gradient_checkpointing: bool = False
+    # packing='document' の EOS 区切り。global attention を文書内に閉じる
+    # (block-diagonal) ためのバイト ID。data.eos_token_id と一致させること。
+    eos_token_id: int = 2
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArborConfig":
@@ -626,6 +629,41 @@ class ArborModel(nn.Module):
             return self._forward_dynamic(input_ids)
         return self._forward_static(input_ids)
 
+    # ------------------------------------------------ document boundary mask
+    def _byte_doc_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """各バイトが属する文書番号 (B, T) を返す.
+
+        packing='document' は文書を EOS 区切りで連結する。EOS の「次」の
+        バイトから文書番号が 1 増える (EOS 自身は直前の文書に属す)。判定は
+        過去バイトのみに依存するので causal (未来を見ない)。生バイトは +4
+        offset されており EOS/PAD と衝突しないため == 判定で一意に取れる。
+        """
+        prev_is_eos = F.pad(
+            input_ids == self.cfg.eos_token_id, (1, 0), value=False
+        )[:, :-1]
+        return prev_is_eos.to(torch.long).cumsum(dim=1)
+
+    def _global_doc_mask(self, patch_doc: torch.Tensor) -> torch.Tensor:
+        """global (patch 階層) 用の block-diagonal + causal マスク (B,1,K,K).
+
+        global は 1 patch 右シフト後の causal。出力位置 j (= patch j の文脈) が
+        key 位置 j' に attend できるのは:
+          - j'=0 (先頭の学習可能 BOS。文書非依存で常に許可。全マスク行を防ぐ)
+          - それ以外は key s[j'] = patch j'-1 が patch j と同一文書のときだけ。
+        これにより文書 B の patch が無関係な文書 A の patch へ attend しない。
+        新しい文書の先頭 patch は BOS のみを文脈に持つ (文脈リセット)。
+        """
+        b, k = patch_doc.shape
+        device = patch_doc.device
+        causal = torch.tril(torch.ones(k, k, dtype=torch.bool, device=device))
+        # key 側 doc: s[0]=BOS(=-1 番兵), s[j']=patch j'-1 の doc
+        key_doc = F.pad(patch_doc[:, :-1], (1, 0), value=-1)
+        same_doc = patch_doc.unsqueeze(2) == key_doc.unsqueeze(1)  # (B,K,K)
+        bos_col = torch.zeros(k, dtype=torch.bool, device=device)
+        bos_col[0] = True
+        allow = causal.unsqueeze(0) & (same_doc | bos_col.view(1, 1, k))
+        return allow.unsqueeze(1)  # (B,1,K,K)
+
     @torch.compiler.disable
     def _debug_context_contribution(
         self,
@@ -666,7 +704,9 @@ class ArborModel(nn.Module):
             h = self._maybe_ckpt(layer, h)
         patches = self.patch_proj(h.view(b, k, -1))        # (B, K, dg)
 
-        g = self._run_global(patches)                      # (B, K, dl)
+        # patch の doc 番号 = patch 先頭バイトの doc。global を文書内に閉じる。
+        patch_doc = self._byte_doc_ids(input_ids)[:, ::p]  # (B, K)
+        g = self._run_global(patches, self._global_doc_mask(patch_doc))  # (B, K, dl)
 
         # Local Decoder: byte_emb[i] + h_patch(i) を patch 内 causal で
         d = x.view(b, k, p, -1) + g.unsqueeze(2)
@@ -768,9 +808,15 @@ class ArborModel(nn.Module):
             pooled = torch.where(torch.isinf(pooled), torch.zeros_like(pooled), pooled)
             patches = self.patch_proj(pooled)              # (B, K, dg)
 
-            # global は plain causal でよい: 右シフト後、位置 j は patch j-1 を保持し、
-            # 使われる query t (有効 patch) に対して pad patch は必ず j > t 側に落ちる
-            g = self._run_global(patches)                  # (B, K, dl)
+            # patch の doc 番号 = patch 内バイトの最小 doc (= 先頭バイトの doc)。
+            # pad patch (バイト無し) は番兵の大きな値のまま残り、どの実文書とも
+            # 一致しないので key/query として実文書へ漏れない。
+            byte_doc = self._byte_doc_ids(input_ids)       # (B, T)
+            patch_doc = torch.full((b, k), 1 << 30, dtype=torch.long, device=x.device)
+            patch_doc.scatter_reduce_(1, patch_id, byte_doc, reduce="amin", include_self=True)
+            # global を文書内に閉じる (block-diagonal + causal)。右シフト後、位置 j は
+            # patch j-1 を保持し、pad patch は必ず j > t 側に落ちる
+            g = self._run_global(patches, self._global_doc_mask(patch_doc))  # (B, K, dl)
             h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
 
             # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
@@ -835,14 +881,20 @@ class ArborModel(nn.Module):
         section_ms["patch_id_max"] = float(patch_id.max().cpu() + 1)
         return section_ms
 
-    def _run_global(self, patches: torch.Tensor) -> torch.Tensor:
-        """1 patch 右シフト + causal global を回し、local 次元へ射影して返す."""
+    def _run_global(
+        self, patches: torch.Tensor, attn_mask: "torch.Tensor | None" = None
+    ) -> torch.Tensor:
+        """1 patch 右シフト + causal global を回し、local 次元へ射影して返す.
+
+        attn_mask を渡すと causal に加えて文書境界 (block-diagonal) を課す。
+        None のときは従来どおり plain causal (native GQA fast-path)。
+        """
         b = patches.size(0)
         g = torch.cat(
             (self.global_bos.to(patches.dtype).expand(b, 1, -1), patches[:, :-1]), dim=1
         )
         for layer in self.global_layers:
-            g = self._maybe_ckpt(layer, g)
+            g = self._maybe_ckpt(layer, g, attn_mask)
         return self.global_to_local(self.global_norm(g))
 
     def _maybe_ckpt(

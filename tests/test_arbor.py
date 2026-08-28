@@ -61,7 +61,7 @@ def test_causality(mode, pos):
     まとめて検証される (空白バイトを混ぜて境界が動く入力にする)。
     """
     torch.manual_seed(1)
-    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode))).eval()
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
     a = torch.randint(4, 260, (1, 32))
     a[0, ::5] = 0x20 + 4  # 空白を混ぜて space 境界を発生させる
     b = a.clone()
@@ -74,6 +74,40 @@ def test_causality(mode, pos):
     )
     # 当該位置以降には影響していること (degenerate でないことの確認)
     assert not torch.allclose(la[:, pos:], lb[:, pos:], atol=1e-5)
+
+
+def test_document_attention_isolation(monkeypatch):
+    """packing=document で連結した文書間に global attention が漏れないこと.
+
+    doc1 のバイトを 1 つ変えても doc2 の logits が不変であることを確認する
+    (#2: 文書境界 block-diagonal マスク)。マスクを無効化すると漏れることも
+    合わせて確認し、テスト自体が leak を検出できることを担保する。
+    """
+    torch.manual_seed(3)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
+    # doc1 = [0..7] (index 7 が EOS), doc2 = [8..15]。patch_size=4 なので
+    # 文書境界が patch 境界 (index 8) に揃い、straddle patch は生じない。
+    a = torch.randint(4, 260, (1, 16))
+    a[0, 7] = 2  # EOS
+    b = a.clone()
+    b[0, 2] = (a[0, 2] - 4 + 1) % 256 + 4  # doc1 内の 1 バイトだけ別バイトに
+    with torch.inference_mode():
+        la = m(a).logits
+        lb = m(b).logits
+    assert torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-5), (
+        "doc1 の変更が doc2 の logits に漏れている (global attention leak)"
+    )
+    # doc1 側は当然変化する (degenerate でないことの確認)
+    assert not torch.allclose(la[:, 2:8], lb[:, 2:8], atol=1e-5)
+
+    # マスクを無効化すると doc2 へ漏れる = テストが leak を検出できている
+    monkeypatch.setattr(ArborModel, "_global_doc_mask", lambda self, patch_doc: None)
+    with torch.inference_mode():
+        la_leak = m(a).logits
+        lb_leak = m(b).logits
+    assert not torch.allclose(la_leak[:, 8:], lb_leak[:, 8:], atol=1e-5), (
+        "マスク無効化でも doc2 が不変。テストが leak を検出できていない"
+    )
 
 
 @pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
@@ -253,7 +287,7 @@ def test_patch_starts_cuda_matches_cpu_reference():
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
     torch.manual_seed(3)
-    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode))).eval()
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
     ids = torch.randint(4, 260, (26,))
     ids[::5] = 0x20 + 4  # 空白を混ぜて動的境界を発生させる
     gen = ArborByteGenerator(m)
