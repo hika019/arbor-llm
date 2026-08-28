@@ -3,6 +3,9 @@
 venv/
 env/
 
+# secrets (HF_TOKEN 等)。コミット禁止
+.env
+
 # Python
 __pycache__/
 *.py[cod]

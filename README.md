@@ -44,8 +44,10 @@ bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer �
 実測 (RTX 4090 / WSL2, synthetic, `micro_batch=8` `T=2048` compile 込み):
 **51.2k bytes/s, VRAM 16.1 GiB** (旧 BLT 版の本走実測 ~13k bytes/s から大幅改善)。
 
-データは日本語 60% (fineweb-2 ja) + 英語 news 15% (cc_news) + 英語 edu 25%
-(fineweb-edu) の streaming 行レベル混合。
+データは日本語 (fineweb-2 ja / wikipedia ja / 青空文庫 / 法令) + 英語
+(fineweb-edu / fineweb) + 数学 (finemath) の streaming 行レベル混合。既定 config
+では正規化後で日本語 ~75% / 英語 ~19% / 数学 ~7%。コード系データセット
+(OpenCoder-LLM/opc-fineweb-code-corpus) は提供元が非公開化したため除外済み。
 
 ## セットアップ
 
@@ -96,7 +98,7 @@ PY
 
 HF Hub から本走データを streaming する環境では、未認証アクセスだと rate limit /
 timeout で止まりやすい。`configs/arbor.yaml` は fineweb-2 / wikipedia /
-fineweb-edu / finemath / code など複数 dataset の parquet を起動直後に解決するため、
+fineweb-edu / fineweb / finemath など複数 dataset の parquet を起動直後に解決するため、
 RunPod 等の別環境では先に token と timeout を設定する:
 
 ```bash
