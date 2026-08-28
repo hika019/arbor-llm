@@ -128,6 +128,12 @@ class ArborConfig:
     num_hidden_layers: int = 16
     # ---- 共通 ----
     rope_theta: float = 500000.0
+    # RoPE theta を階層別に上書きする (None なら rope_theta を使う)。
+    #   global は max_patches (static 8k/patch8 = 1024) 位置しか見ないため、
+    #   128k 長文脈向けの大きな theta は位置分解能を潰す (#1)。系列長相応に下げる。
+    #   local は patch 内 (static) / flat バイト列 (dynamic) を見る。
+    rope_theta_global: float | None = None
+    rope_theta_local: float | None = None
     norm_eps: float = 1e-5
     bitnet: bool = True            # False で全 Linear を nn.Linear に (debug 用)
     activation_precision: str = "int8"  # BitLinear の活性量子化: int8 | bf8 | bf16
@@ -564,12 +570,14 @@ class ArborModel(nn.Module):
         nn.init.trunc_normal_(self.byte_emb.weight, std=0.02, a=-0.06, b=0.06)
 
         # 動的モードの local 層は flat (B,T) で動くので RoPE は絶対バイト位置
+        theta_global = cfg.rope_theta_global if cfg.rope_theta_global is not None else cfg.rope_theta
+        theta_local = cfg.rope_theta_local if cfg.rope_theta_local is not None else cfg.rope_theta
         local_rope = RotaryEmbedding(
             dl // cfg.local_num_heads,
             cfg.max_bytes if self.dynamic else p,
-            cfg.rope_theta,
+            theta_local,
         )
-        global_rope = RotaryEmbedding(dg // cfg.num_heads, self.max_patches, cfg.rope_theta)
+        global_rope = RotaryEmbedding(dg // cfg.num_heads, self.max_patches, theta_global)
 
         # Local Encoder: patch 内 bidirectional (patch 表現は次 patch 以降でしか使わない)
         self.encoder_layers = nn.ModuleList(

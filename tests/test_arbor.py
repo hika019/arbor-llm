@@ -368,3 +368,18 @@ def test_param_count_reporting(model):
     counts = model.num_parameters()
     assert counts["total"] == sum(p.numel() for p in model.parameters())
     assert counts["global"] > 0 and counts["local_decoder"] > 0
+
+
+def test_rope_theta_per_level_and_fallback():
+    """rope_theta_global/local が階層別に効き、未指定なら rope_theta に落ちること (#1)."""
+    # 階層別指定: global と local で theta が分かれる
+    cfg = dict(TINY, rope_theta=500000.0, rope_theta_global=10000.0, rope_theta_local=123456.0)
+    m = ArborModel(ArborConfig.from_dict(cfg))
+    assert m.global_layers[0].attn.rope.theta == 10000.0
+    assert m.encoder_layers[0].attn.rope.theta == 123456.0
+    assert m.decoder_layers[0].attn.rope.theta == 123456.0
+
+    # 後方互換: global/local 未指定なら両方 rope_theta を使う
+    m2 = ArborModel(ArborConfig.from_dict(dict(TINY, rope_theta=777.0)))
+    assert m2.global_layers[0].attn.rope.theta == 777.0
+    assert m2.encoder_layers[0].attn.rope.theta == 777.0

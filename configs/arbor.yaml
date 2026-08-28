@@ -43,7 +43,14 @@ model:
   num_local_encoder_layers: 2
   num_local_decoder_layers: 4
   # ---- 共通 ----
-  rope_theta: 500000.0
+  # RoPE。global は max_patches (static 8k/patch8 = 1024) 位置しか見ないため、
+  # 128k 長文脈向けの theta=500000 は大半の次元の波長が文脈長を桁で超え、位置
+  # 分解能を潰す (#1: 長距離一貫性が育たない疑い)。系列長相応の値へ下げる。
+  #   A/B: 旧挙動へ戻すなら rope_theta_global を 500000.0 にする。
+  # local は patch 内 (static) / flat バイト列 (dynamic) を見るので従来値を維持。
+  rope_theta: 500000.0          # 個別未指定の層のfallback (= local に適用)
+  rope_theta_global: 10000.0    # #1: 1024 patch 位置に見合う theta
+  rope_theta_local: 500000.0    # local は従来どおり
   norm_eps: 1.0e-5
   bitnet: true                  # choices: true (W1.58/A8 BitNet) | false (FP debug)
   # BitLinear の活性量子化 (重みは常に W1.58 ternary)。
