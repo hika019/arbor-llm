@@ -133,9 +133,14 @@ optim:
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  weight_decay: 0.1
+  weight_decay: 0.1             # stage1 の weight decay (two_stage では stage2 で切替)
   grad_clip: 1.0
-  scheduler: cosine_warmup      # choices: cosine_warmup
+  # BitNet 公式レシピ (2B4T) の 2 段構成: 前半 高LR+WD / 後半 低LR cooldown+WD=0。
+  #   A/B: 旧挙動へ戻すなら scheduler: cosine_warmup にする (下記 stage2_* は無視される)。
+  scheduler: two_stage          # choices: cosine_warmup | two_stage
+  stage2_start_ratio: 0.5       # two_stage: この比率で stage1->stage2 (cooldown) へ
+  stage2_peak_lr_ratio: 0.5     # two_stage: stage2 開始時の lr (ピーク比)。ここから min へ
+  weight_decay_stage2: 0.0      # two_stage: stage2 の weight decay (公式は 0)
   min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000

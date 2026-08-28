@@ -278,3 +278,97 @@ def test_scheduler_min_lr_ratio_validation():
     opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
     with pytest.raises(ValueError):
         build_scheduler(opt, {"total_steps": 100, "min_lr_ratio": 1.0})
+
+
+def _two_stage_cfg(**over):
+    cfg = {
+        "optimizer": "adamw",
+        "state_precision": "fp32",
+        "lr": 1.0,  # base lr=1 なので get_last_lr がそのまま lr_lambda 比率になる
+        "betas": (0.9, 0.95),
+        "weight_decay": 0.1,
+        "weight_decay_stage2": 0.0,
+        "scheduler": "two_stage",
+        "warmup_steps": 10,
+        "total_steps": 100,
+        "stage2_start_ratio": 0.5,
+        "stage2_peak_lr_ratio": 0.5,
+        "decay_end_ratio": 0.8,
+        "min_lr_ratio": 0.02,
+    }
+    cfg.update(over)
+    return cfg
+
+
+def _step_to(scheduler, target_last_epoch):
+    while scheduler.last_epoch < target_last_epoch:
+        scheduler.step()
+
+
+def test_two_stage_scheduler_lr_curve_and_weight_decay():
+    cfg = _two_stage_cfg()
+    p = torch.nn.Parameter(torch.zeros(4))
+    opt = build_optimizer([p], cfg)
+    sched = build_scheduler(opt, cfg)
+
+    # warmup 終了 (step=10): ピーク (=1.0) かつ WD は stage1 (0.1)
+    _step_to(sched, 10)
+    assert sched.get_last_lr()[0] == pytest.approx(1.0, abs=1e-6)
+    assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.1)
+
+    # stage2 開始 (step=50): 連続で stage2_peak (=0.5)、WD が 0 へ切替
+    _step_to(sched, 50)
+    assert sched.get_last_lr()[0] == pytest.approx(0.5, abs=1e-6)
+    assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.0)
+
+    # cooldown 終了 (step=80): min_lr_ratio (=0.02) に到達
+    _step_to(sched, 80)
+    assert sched.get_last_lr()[0] == pytest.approx(0.02, abs=1e-6)
+    # 以降は下限で一定
+    _step_to(sched, 95)
+    assert sched.get_last_lr()[0] == pytest.approx(0.02, abs=1e-6)
+
+
+def test_two_stage_weight_decay_switches_exactly_at_stage2():
+    cfg = _two_stage_cfg()
+    p = torch.nn.Parameter(torch.zeros(4))
+    opt = build_optimizer([p], cfg)
+    sched = build_scheduler(opt, cfg)
+    _step_to(sched, 49)
+    assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.1)
+    _step_to(sched, 50)
+    assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.0)
+
+
+def test_two_stage_scheduler_state_dict_roundtrip_restores_wd():
+    cfg = _two_stage_cfg()
+    p = torch.nn.Parameter(torch.zeros(4))
+    opt = build_optimizer([p], cfg)
+    sched = build_scheduler(opt, cfg)
+    _step_to(sched, 60)  # stage2 (WD=0)
+    state = sched.state_dict()
+
+    p2 = torch.nn.Parameter(torch.zeros(4))
+    opt2 = build_optimizer([p2], cfg)
+    sched2 = build_scheduler(opt2, cfg)
+    sched2.load_state_dict(state)
+    assert sched2.last_epoch == 60
+    # 復元後に両者を 1 step 進め、LR/WD が一致すること (WD は last_epoch から再計算)
+    sched.step()
+    sched2.step()
+    assert opt2.param_groups[0]["weight_decay"] == pytest.approx(0.0)
+    assert sched2.get_last_lr()[0] == pytest.approx(sched.get_last_lr()[0], abs=1e-6)
+
+
+def test_two_stage_scheduler_validation():
+    p = torch.nn.Parameter(torch.zeros(2))
+    opt = build_optimizer([p], {"optimizer": "adamw", "state_precision": "fp32",
+                                "lr": 1e-3, "weight_decay": 0.1})
+    # decay_end_ratio <= stage2_start_ratio は不正
+    with pytest.raises(ValueError):
+        build_scheduler(opt, _two_stage_cfg(stage2_start_ratio=0.8, decay_end_ratio=0.8))
+    # stage2_peak_lr_ratio が (min_lr_ratio, 1] の外は不正
+    with pytest.raises(ValueError):
+        build_scheduler(opt, _two_stage_cfg(stage2_peak_lr_ratio=1.5))
+    with pytest.raises(ValueError):
+        build_scheduler(opt, _two_stage_cfg(stage2_peak_lr_ratio=0.0, min_lr_ratio=0.02))

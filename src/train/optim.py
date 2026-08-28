@@ -436,12 +436,58 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
     )
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
-    name = cfg.get("scheduler", "cosine_warmup")
+class TwoStageCooldownLR(torch.optim.lr_scheduler.LambdaLR):
+    """LR を cosine 2 段に、weight decay を 2 段に切り替える scheduler.
+
+    BitNet b1.58 公式レシピ (2B4T) の 2 段構成に寄せたもの:
+      - Stage 1 [warmup, stage2_start]: cosine で 1.0 -> stage2_peak_lr_ratio。
+        前半は比較的高い LR を保つ (WD は stage1 値)。
+      - Stage 2 [stage2_start, decay_end]: cosine で stage2_peak_lr_ratio ->
+        min_lr_ratio まで cooldown。WD は stage2 値 (公式は 0)。
+      - [decay_end, total]: min_lr_ratio で一定。
+    LambdaLR を継承するので base_lrs / lr_lambdas / state_dict / get_last_lr /
+    rebase_scheduler_lr との互換をそのまま保つ。WD は last_epoch (= step) から
+    毎 step 再計算して optimizer.param_groups へ書き戻す (state を増やさない)。
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        lr_lambda,
+        *,
+        wd_stage1: float,
+        wd_stage2: float,
+        stage2_start_step: int,
+    ) -> None:
+        self._wd_stage1 = float(wd_stage1)
+        self._wd_stage2 = float(wd_stage2)
+        self._stage2_start_step = int(stage2_start_step)
+        super().__init__(optimizer, lr_lambda)
+        self._apply_weight_decay()
+
+    def _current_weight_decay(self) -> float:
+        return (
+            self._wd_stage2
+            if self.last_epoch >= self._stage2_start_step
+            else self._wd_stage1
+        )
+
+    def _apply_weight_decay(self) -> None:
+        wd = self._current_weight_decay()
+        for group in self.optimizer.param_groups:
+            group["weight_decay"] = wd
+
+    def step(self, epoch=None):  # type: ignore[override]
+        super().step(epoch)
+        self._apply_weight_decay()
+
+
+def _scheduler_common(cfg: dict) -> tuple[int, int, float, float]:
+    """warmup / total / min_lr_ratio / decay_end_ratio を検証して返す."""
     warmup = cfg.get("warmup_steps", 0)
     total = cfg["total_steps"]
     # 最終 step での lr 下限 (ピーク lr に対する比率)。0 で従来どおり 0 まで減衰。
-    # 下限を残しておくと total_steps を増やした resume での追加学習が素直に効く。
+    # 下限を残すと total_steps を増やした resume での加学習が素直に効く。
     min_ratio = float(cfg.get("min_lr_ratio", 0.0))
     if not 0.0 <= min_ratio < 1.0:
         raise ValueError(f"min_lr_ratio は [0, 1) で指定: {min_ratio}")
@@ -450,15 +496,63 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
     decay_end_ratio = float(cfg.get("decay_end_ratio", 1.0))
     if not 0.0 < decay_end_ratio <= 1.0:
         raise ValueError(f"decay_end_ratio は (0, 1] で指定: {decay_end_ratio}")
-    decay_end = max(warmup + 1, round(total * decay_end_ratio))
-    if name != "cosine_warmup":
-        raise ValueError(f"unknown scheduler: {name}")
+    return warmup, total, min_ratio, decay_end_ratio
 
-    def lr_lambda(step: int) -> float:
-        if step < warmup:
-            return step / max(1, warmup)
-        progress = (step - warmup) / max(1, decay_end - warmup)
-        cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-        return min_ratio + (1.0 - min_ratio) * cos
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
+    name = cfg.get("scheduler", "cosine_warmup")
+    warmup, total, min_ratio, decay_end_ratio = _scheduler_common(cfg)
+
+    if name == "cosine_warmup":
+        decay_end = max(warmup + 1, round(total * decay_end_ratio))
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup:
+                return step / max(1, warmup)
+            progress = (step - warmup) / max(1, decay_end - warmup)
+            cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+            return min_ratio + (1.0 - min_ratio) * cos
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    if name == "two_stage":
+        # BitNet 公式 2 段レシピ。stage2_start_ratio で stage を切り替え、stage1 は
+        # cosine で stage2_peak_lr_ratio まで、stage2 はそこから min_lr_ratio まで
+        # cooldown する。weight decay も stage1/stage2 で切り替える (公式は stage2=0)。
+        stage2_start_ratio = float(cfg.get("stage2_start_ratio", 0.5))
+        if not 0.0 < stage2_start_ratio < 1.0:
+            raise ValueError(f"stage2_start_ratio は (0, 1) で指定: {stage2_start_ratio}")
+        if decay_end_ratio <= stage2_start_ratio:
+            raise ValueError(
+                "decay_end_ratio は stage2_start_ratio より大きくすること "
+                f"(decay_end_ratio={decay_end_ratio}, stage2_start_ratio={stage2_start_ratio})"
+            )
+        stage2_peak = float(cfg.get("stage2_peak_lr_ratio", 0.5))
+        if not min_ratio < stage2_peak <= 1.0:
+            raise ValueError(
+                f"stage2_peak_lr_ratio は (min_lr_ratio, 1] で指定: {stage2_peak}"
+            )
+        wd_stage1 = float(cfg.get("weight_decay", 0.0))
+        wd_stage2 = float(cfg.get("weight_decay_stage2", 0.0))
+        if wd_stage2 < 0:
+            raise ValueError(f"weight_decay_stage2 は非負で指定: {wd_stage2}")
+        s2 = max(warmup + 1, round(total * stage2_start_ratio))
+        decay_end = max(s2 + 1, round(total * decay_end_ratio))
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup:
+                return step / max(1, warmup)
+            if step < s2:
+                progress = (step - warmup) / max(1, s2 - warmup)
+                cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+                return stage2_peak + (1.0 - stage2_peak) * cos
+            progress = (step - s2) / max(1, decay_end - s2)
+            cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+            return min_ratio + (stage2_peak - min_ratio) * cos
+
+        return TwoStageCooldownLR(
+            optimizer, lr_lambda,
+            wd_stage1=wd_stage1, wd_stage2=wd_stage2, stage2_start_step=s2,
+        )
+
+    raise ValueError(f"unknown scheduler: {name}")
