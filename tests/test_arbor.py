@@ -383,3 +383,29 @@ def test_rope_theta_per_level_and_fallback():
     m2 = ArborModel(ArborConfig.from_dict(dict(TINY, rope_theta=777.0)))
     assert m2.global_layers[0].attn.rope.theta == 777.0
     assert m2.encoder_layers[0].attn.rope.theta == 777.0
+
+
+def test_global_attn_flex_matches_sdpa():
+    """global_attn_impl=flex が sdpa と同一 logits を返すこと (#CUDA speed path).
+
+    flex_attention (BlockMask + native GQA) は密マスク SDPA と同じ文書境界規則を
+    表す。torch に flex_attention が無い環境では skip。
+    """
+    pytest.importorskip("torch.nn.attention.flex_attention")
+    import warnings
+
+    torch.manual_seed(0)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
+    x = torch.randint(4, 260, (2, 32))
+    x[0, 15] = 2  # EOS -> 複数文書
+    x[1, 7] = 2
+    x[1, 20] = 2
+    with torch.inference_mode(), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m.cfg.global_attn_impl = "sdpa"
+        la = m(x).logits
+        m.cfg.global_attn_impl = "flex"
+        lb = m(x).logits
+    assert torch.allclose(la, lb, atol=1e-4), (
+        f"flex と sdpa の logits 不一致 (max diff={(la - lb).abs().max().item():.2e})"
+    )

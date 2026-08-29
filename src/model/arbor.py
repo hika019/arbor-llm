@@ -62,6 +62,11 @@ BYTE_OFFSET = 4  # 生バイト b は token id (b + 4)
 _WINDOW_CHUNK = 128
 
 
+def _is_block_mask(m: object) -> bool:
+    """flex_attention の BlockMask かどうか (torch 未対応環境でも壊れないよう名前で判定)."""
+    return type(m).__name__ == "BlockMask"
+
+
 @dataclass
 class WindowMask:
     """patch 内 attention 用の窓マスク (chunk × (chunk+2w) のみ実体化).
@@ -141,6 +146,11 @@ class ArborConfig:
     # packing='document' の EOS 区切り。global attention を文書内に閉じる
     # (block-diagonal) ためのバイト ID。data.eos_token_id と一致させること。
     eos_token_id: int = 2
+    # global (patch 階層) attention の実装。
+    #   sdpa … 既定。文書マスク時は密 (B,1,K,K) マスク + SDPA (flash 非対応経路)。
+    #   flex … CUDA 向け。文書境界を BlockMask にして flex_attention で fuse し、
+    #          GQA も native (KV repeat_interleave 不要)。torch>=2.5 / 主に CUDA 用。
+    global_attn_impl: str = "sdpa"  # choices: sdpa | flex
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArborConfig":
@@ -277,10 +287,17 @@ class Attention(nn.Module):
         else:
             n_rep = 1
         native_gqa = n_rep > 1 and attn_mask is None and not is_incremental
-        if n_rep > 1 and not native_gqa:
+        use_flex = _is_block_mask(attn_mask)
+        if n_rep > 1 and not native_gqa and not use_flex:
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
-        if isinstance(attn_mask, WindowMask):
+        if use_flex:
+            # CUDA 向け fused 経路。文書境界 BlockMask で causal+doc を課し、GQA も
+            # native (KV は複製しない)。torch.compile 併用で fused kernel になる。
+            from torch.nn.attention.flex_attention import flex_attention
+
+            out = flex_attention(q, k, v, block_mask=attn_mask, enable_gqa=n_rep > 1)
+        elif isinstance(attn_mask, WindowMask):
             # 動的 patching 用 (窓経路): T×T を実体化しない
             out = _windowed_sdpa(q, k, v, attn_mask)
         elif attn_mask is not None:
@@ -672,6 +689,42 @@ class ArborModel(nn.Module):
         allow = causal.unsqueeze(0) & (same_doc | bos_col.view(1, 1, k))
         return allow.unsqueeze(1)  # (B,1,K,K)
 
+    def _global_mask(self, patch_doc: torch.Tensor):
+        """cfg.global_attn_impl に応じて global 用マスクを返す (sdpa=密, flex=BlockMask).
+
+        auto は tensor が CUDA 上なら flex、それ以外 (MPS/CPU) は sdpa を選ぶ
+        (flex は CUDA 前提。非 CUDA では eager で密スコアを実体化し遅いため)。
+        """
+        impl = self.cfg.global_attn_impl
+        if impl == "auto":
+            impl = "flex" if patch_doc.is_cuda else "sdpa"
+        if impl == "flex":
+            return self._global_flex_block_mask(patch_doc)
+        return self._global_doc_mask(patch_doc)
+
+    def _global_flex_block_mask(self, patch_doc: torch.Tensor):
+        """_global_doc_mask と同じ許可規則を flex_attention の BlockMask で表す.
+
+        密 (B,1,K,K) マスクを実体化せず、CUDA では fused kernel になる。
+        許可規則: causal (kv<=q) かつ (kv==0 の BOS or 同一文書)。key 位置 kv は
+        右シフト後の global 入力位置なので、その doc は patch_doc[kv-1] (kv>=1)。
+        """
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        pd = patch_doc
+        k = pd.shape[1]
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            causal = kv_idx <= q_idx
+            is_bos = kv_idx == 0
+            key_doc = pd[b, torch.clamp(kv_idx - 1, min=0)]
+            same = pd[b, q_idx] == key_doc
+            return causal & (is_bos | same)
+
+        return create_block_mask(
+            mask_mod, B=pd.shape[0], H=None, Q_LEN=k, KV_LEN=k, device=pd.device
+        )
+
     @torch.compiler.disable
     def _debug_context_contribution(
         self,
@@ -714,7 +767,7 @@ class ArborModel(nn.Module):
 
         # patch の doc 番号 = patch 先頭バイトの doc。global を文書内に閉じる。
         patch_doc = self._byte_doc_ids(input_ids)[:, ::p]  # (B, K)
-        g = self._run_global(patches, self._global_doc_mask(patch_doc))  # (B, K, dl)
+        g = self._run_global(patches, self._global_mask(patch_doc))  # (B, K, dl)
 
         # Local Decoder: byte_emb[i] + h_patch(i) を patch 内 causal で
         d = x.view(b, k, p, -1) + g.unsqueeze(2)
@@ -824,7 +877,7 @@ class ArborModel(nn.Module):
             patch_doc.scatter_reduce_(1, patch_id, byte_doc, reduce="amin", include_self=True)
             # global を文書内に閉じる (block-diagonal + causal)。右シフト後、位置 j は
             # patch j-1 を保持し、pad patch は必ず j > t 側に落ちる
-            g = self._run_global(patches, self._global_doc_mask(patch_doc))  # (B, K, dl)
+            g = self._run_global(patches, self._global_mask(patch_doc))  # (B, K, dl)
             h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
 
             # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)

@@ -60,6 +60,11 @@ model:
   activation_precision: bf8     # choices: int8 | bf8 | bf16
                                 # MPS は float8 非対応。bf8 指定時は自動で bf16 に落ちる
   gradient_checkpointing: false # OOM 時のみ true
+  # global(patch階層) attention 実装。文書 packing のマスクを SDPA 密マスクで課すと
+  # flash 経路を外れて遅い。CUDA では flex にすると BlockMask で fuse + native GQA。
+  #   sdpa … 既定 (全 device で検証済み)。 flex … CUDA 用。 auto … CUDAなら flex/他は sdpa。
+  # 注: flex+torch.compile の CUDA 実機ベンチは未実施。まず auto/flex で計測して採用可否を判断。
+  global_attn_impl: sdpa        # choices: sdpa | flex | auto
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
 # weight_bytes は行選択確率ではなく、document packing 後の実測 byte 比率に近づくよう
