@@ -77,22 +77,40 @@ def test_cuda_adaptation_does_not_change_config():
     assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
 
 
-def test_attention_auto_uses_sdpa_when_compile_is_disabled():
-    cfg = {
-        "model": {"global_attn_impl": "auto"},
-        "speed": {"torch_compile": False},
-    }
-    resolved = adapt_config_for_device(cfg, torch.device("cuda"))
-    assert resolved["model"]["global_attn_impl"] == "sdpa"
-    assert cfg["model"]["global_attn_impl"] == "auto"
-
-
-def test_attention_auto_stays_auto_for_cuda_compile():
+def test_attention_auto_is_rejected_instead_of_falling_back():
     cfg = {
         "model": {"global_attn_impl": "auto"},
         "speed": {"torch_compile": True},
     }
-    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+    with pytest.raises(ValueError, match="auto/fallback"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+def test_flex_without_compile_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "flex"},
+        "speed": {"torch_compile": False},
+    }
+    with pytest.raises(ValueError, match="torch_compile=true"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+def test_flex_on_non_cuda_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "flex"},
+        "speed": {"torch_compile": True},
+    }
+    with pytest.raises(ValueError, match="CUDA専用"):
+        adapt_config_for_device(cfg, torch.device("cpu"))
+
+
+def test_fp8_on_non_cuda_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_fp8": "bwd"},
+    }
+    with pytest.raises(ValueError, match="CUDA専用"):
+        adapt_config_for_device(cfg, torch.device("cpu"))
 
 
 def test_entropy_model_config_is_loaded_from_single_reference(tmp_path):

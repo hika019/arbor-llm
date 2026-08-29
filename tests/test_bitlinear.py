@@ -168,11 +168,10 @@ def test_configure_training_cache_installs_projection_groups():
     assert info["gate_up_groups"] > 0
 
 
-def test_fp8_auto_falls_back_to_off_for_cpu_model():
+def test_fp8_auto_is_rejected_instead_of_falling_back():
     model = torch.nn.Sequential(BitLinear(32, 16), BitLinear(16, 16))
-    info = set_bitlinear_fp8_mode(model, "auto")
-    assert info == {"requested": "auto", "mode": "off", "layers": 2}
-    assert all(layer._fp8_mode == "off" for layer in model)
+    with pytest.raises(ValueError, match="bitlinear fp8 mode"):
+        set_bitlinear_fp8_mode(model, "auto")
 
 
 def test_unknown_fp8_mode_is_error():
@@ -209,6 +208,17 @@ def test_fp8_bwd_preserves_forward_and_produces_finite_gradients_cuda():
     assert torch.nn.functional.cosine_similarity(
         fp8.weight.grad.float().flatten(), ref.weight.grad.float().flatten(), dim=0
     ) > 0.98
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_fp8_unaligned_shape_is_error_instead_of_bf16_fallback_cuda():
+    layer = BitLinear(32, 32, activation_precision="bf16").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    set_bitlinear_fp8_mode(layer, "bwd")
+    x = torch.randn(15, 32, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="暗黙フォールバックは禁止"):
+        layer(x)
 
 
 def test_bias_is_rejected():

@@ -25,7 +25,6 @@ e4m3 で誤差ゼロ表現できるため重み側は無損失。
             勾配 g と保存活性 x_q の e4m3 丸めが新規ノイズ。
   - "full": forward も FP8。x_q の e4m3 再丸め (tensorwise) が forward に乗る。
             丸めは STE 扱い。validation/eval は常に既定 (BF16) パス。
-  - "auto": CUDA sm89+ では bwd、それ以外では off。
 
 推論パス (任意): `freeze_for_inference()` を呼ぶと dequantize 済み ternary 重みを
 キャッシュし、以後の eval forward で毎回の重み再量子化を省く。実験的な
@@ -271,7 +270,7 @@ class _CachedBitLinearGroupSTE(torch.autograd.Function):
 # ---------------------------------------------------------------- FP8 GEMM
 _FP8_E4M3 = torch.float8_e4m3fn
 _FP8_MAX = 448.0  # e4m3fn の最大有限値
-_FP8_MODES = ("off", "bwd", "full", "auto")
+_FP8_MODES = ("off", "bwd", "full")
 
 
 def fp8_gemm_supported() -> bool:
@@ -376,8 +375,8 @@ def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]
 
     QKV/gate-up 融合後 (install_arbor_projection_fusions 後) に呼ぶこと。
     """
-    requested = str(mode).lower()
-    if requested not in _FP8_MODES:
+    normalized = str(mode).lower()
+    if normalized not in _FP8_MODES:
         raise ValueError(f"unknown bitlinear fp8 mode: {mode!r} (choices: {_FP8_MODES})")
     targets = [
         child for child in module.modules()
@@ -387,18 +386,14 @@ def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]
         (child.weight if isinstance(child, BitLinear) else child.members()[0].weight).is_cuda
         for child in targets
     )
-    supported = has_cuda_weights and fp8_gemm_supported()
-    normalized = "bwd" if requested == "auto" and supported else requested
-    if requested == "auto" and not supported:
-        normalized = "off"
-    if normalized != "off" and not supported:
+    if normalized != "off" and not (has_cuda_weights and fp8_gemm_supported()):
         raise RuntimeError(
             "bitlinear_fp8 には compute capability 8.9 以上の CUDA GPU が必要 "
-            "(torch._scaled_mm FP8)"
+            "(torch._scaled_mm FP8)。暗黙フォールバックは行いません"
         )
     for child in targets:
         child._fp8_mode = normalized
-    return {"requested": requested, "mode": normalized, "layers": len(targets)}
+    return {"mode": normalized, "layers": len(targets)}
 
 
 class BitLinear(nn.Module):
@@ -480,13 +475,22 @@ class BitLinear(nn.Module):
         self._train_qweight.copy_(weight_quant(self.weight.detach()))
 
     def _fp8_applicable(self, x_q: torch.Tensor) -> bool:
-        return (
-            self._fp8_mode != "off"
-            and x_q.is_cuda
-            and _fp8_dims_ok(
-                x_q.numel() // x_q.size(-1), self.in_features, self.out_features
+        if self._fp8_mode == "off":
+            return False
+        if not x_q.is_cuda:
+            raise RuntimeError(
+                f"bitlinear_fp8={self._fp8_mode} received non-CUDA input; "
+                "暗黙フォールバックは禁止"
             )
+        dims = (
+            x_q.numel() // x_q.size(-1), self.in_features, self.out_features
         )
+        if not _fp8_dims_ok(*dims):
+            raise RuntimeError(
+                f"bitlinear_fp8={self._fp8_mode} requires M/K/N multiples of 16, "
+                f"got {dims}; BF16への暗黙フォールバックは禁止"
+            )
+        return True
 
     def forward_prequantized(self, x_q: torch.Tensor) -> torch.Tensor:
         if self.training and self._fp8_applicable(x_q):
@@ -666,14 +670,23 @@ class BitLinearGroup(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         members = self.members()
         x_q = quantize_activation_ste(x, self.activation_precision)
-        if (
-            self.training
-            and self._fp8_mode != "off"
-            and x_q.is_cuda
-            and _fp8_dims_ok(
+        use_fp8 = False
+        if self.training and self._fp8_mode != "off":
+            if not x_q.is_cuda:
+                raise RuntimeError(
+                    f"bitlinear_fp8={self._fp8_mode} received non-CUDA input; "
+                    "暗黙フォールバックは禁止"
+                )
+            dims = (
                 x_q.numel() // x_q.size(-1), self.in_features, self.out_features
             )
-        ):
+            if not _fp8_dims_ok(*dims):
+                raise RuntimeError(
+                    f"bitlinear_fp8={self._fp8_mode} requires M/K/N multiples of 16, "
+                    f"got {dims}; BF16への暗黙フォールバックは禁止"
+                )
+            use_fp8 = True
+        if use_fp8:
             if self.training_weight_cache_enabled:
                 w_q = self._train_qweight
             else:

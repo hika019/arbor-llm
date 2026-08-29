@@ -513,17 +513,35 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     resolved = copy.deepcopy(cfg)
     model_cfg = resolved.setdefault("model", {})
     speed_cfg = resolved.setdefault("speed", {})
-    # flex_attention は compile 無しだと full score matrix を実体化する unfused 経路に
-    # なり、実測で大幅に遅い。auto は CUDA+compile の学習時だけ flex を使う。
-    if (
-        model_cfg.get("global_attn_impl", "sdpa") == "auto"
-        and not (device.type == "cuda" and speed_cfg.get("torch_compile", True))
-    ):
-        model_cfg["global_attn_impl"] = "sdpa"
-        print(
-            f"[train] global_attn_impl=sdpa "
-            f"(auto fallback: device={device.type}, torch_compile="
-            f"{bool(speed_cfg.get('torch_compile', True))})"
+    attn_impl = str(model_cfg.get("global_attn_impl", "sdpa")).lower()
+    if attn_impl not in {"sdpa", "flex"}:
+        raise ValueError(
+            f"unknown model.global_attn_impl: {attn_impl!r} "
+            "(choices: sdpa | flex; auto/fallbackは禁止)"
+        )
+    if attn_impl == "flex" and device.type != "cuda":
+        raise ValueError(
+            "model.global_attn_impl=flex はCUDA専用です。"
+            "暗黙フォールバックは行わないため、sdpaを明示してください"
+        )
+    if attn_impl == "flex" and not speed_cfg.get("torch_compile", True):
+        raise ValueError(
+            "model.global_attn_impl=flex には speed.torch_compile=true が必要です。"
+            "暗黙フォールバックは行いません"
+        )
+    fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
+    if fp8_raw in (None, False):
+        fp8_raw = "off"
+    fp8_mode = str(fp8_raw).lower()
+    if fp8_mode not in {"off", "bwd", "full"}:
+        raise ValueError(
+            f"unknown speed.bitlinear_fp8: {fp8_mode!r} "
+            "(choices: off | bwd | full; auto/fallbackは禁止)"
+        )
+    if fp8_mode != "off" and device.type != "cuda":
+        raise ValueError(
+            f"speed.bitlinear_fp8={fp8_mode} はCUDA専用です。"
+            "暗黙フォールバックは行わないため、offを明示してください"
         )
     if device.type != "mps":
         return resolved
@@ -769,7 +787,7 @@ def main() -> int:
         fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
         print(
             f"[train] bitlinear_fp8={fp8_info['mode']} "
-            f"(requested={fp8_info['requested']}) layers={fp8_info['layers']}"
+            f"layers={fp8_info['layers']}"
         )
 
     model = apply_compile_settings(model, cfg["speed"], device)

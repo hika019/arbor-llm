@@ -150,8 +150,7 @@ class ArborConfig:
     #   sdpa … 既定。文書マスク時は密 (B,1,K,K) マスク + SDPA (flash 非対応経路)。
     #   flex … CUDA 向け。文書境界を BlockMask にして flex_attention で fuse し、
     #          GQA も native (KV repeat_interleave 不要)。torch>=2.5 / 主に CUDA 用。
-    #   auto … CUDA training は flex、eval/他 device は sdpa。
-    global_attn_impl: str = "sdpa"  # choices: sdpa | flex | auto
+    global_attn_impl: str = "sdpa"  # choices: sdpa | flex
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArborConfig":
@@ -566,6 +565,11 @@ class ArborModel(nn.Module):
         super().__init__()
         if cfg.patching_mode not in ("static", "utf8", "space", "entropy"):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
+        if cfg.global_attn_impl not in ("sdpa", "flex"):
+            raise ValueError(
+                f"unknown global_attn_impl: {cfg.global_attn_impl!r} "
+                "(choices: sdpa | flex; 暗黙フォールバックは禁止)"
+            )
         from src.model.bitlinear import check_activation_precision
 
         check_activation_precision(cfg.activation_precision)
@@ -693,15 +697,14 @@ class ArborModel(nn.Module):
     def _global_mask(self, patch_doc: torch.Tensor):
         """cfg.global_attn_impl に応じて global 用マスクを返す (sdpa=密, flex=BlockMask).
 
-        auto は CUDA training なら flex、それ以外は sdpa を選ぶ。eval 時に未コンパイル
-        の base model を使うサンプル生成では、flex の unfused 経路を避ける。
+        実装はconfigの指定をそのまま使い、deviceに応じた暗黙フォールバックはしない。
         """
         impl = self.cfg.global_attn_impl
-        if impl == "auto":
-            impl = "flex" if patch_doc.is_cuda and self.training else "sdpa"
         if impl == "flex":
             return self._global_flex_block_mask(patch_doc)
-        return self._global_doc_mask(patch_doc)
+        if impl == "sdpa":
+            return self._global_doc_mask(patch_doc)
+        raise RuntimeError(f"unsupported global_attn_impl at runtime: {impl!r}")
 
     def _global_flex_block_mask(self, patch_doc: torch.Tensor):
         """_global_doc_mask と同じ許可規則を flex_attention の BlockMask で表す.

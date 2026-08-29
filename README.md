@@ -42,14 +42,19 @@ bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer �
   毎回の重み再量子化を省く。packed ternary Triton 経路は速度診断用の明示 opt-in。
 
 実測 (RTX 4090 / WSL2, torch 2.11+cu128, synthetic, `T=8192`,
-`micro_batch=2`, `grad_accum=32`, compile + weight cache):
+`micro_batch=2`, `grad_accum=32`, compile + weight cache + 本番AdamW8bit):
 
-- FP8無効: **46.1k bytes/s**, 11.36 sec/step, peak VRAM 15.9 GiB
-- `bitlinear_fp8=auto` (= sm89ではbackward FP8):
-  **54.1k bytes/s**, 9.69 sec/step, peak VRAM 13.9 GiB
+- FP8無効: **92.6k bytes/s**, 5.662 sec/step, peak VRAM 14.1 GiB
+- `bitlinear_fp8=bwd`:
+  **98.2k bytes/s**, 5.339 sec/step, peak VRAM 12.2 GiB
 
-同条件で **throughput +17.3% / step時間 -14.8% / peak VRAM -2.0 GiB**。
+同条件で **throughput +6.0% / step時間 -5.7% / peak VRAM -1.9 GiB**。
 forward は従来BF16のままなので、追加丸めはbackward勾配だけに限定される。
+
+数値安定性は本番モデル形状・本番AdamW8bit・8K context・micro-batch 2で
+**1000 optimizer step** のsoakを実施し、loss 5.7031 → 5.5477、
+全parameter finiteを100 stepごとに確認した。旧`state_precision=bf8`はFP8無効でも
+lossが発散し、FP8 bwd併用時は811 stepでNaNになったため既定から除外した。
 
 データは日本語 (fineweb-2 ja / wikipedia ja / 青空文庫 / 法令) + 英語
 (fineweb-edu / fineweb) + 数学 (finemath) の streaming 行レベル混合。既定 config
@@ -149,7 +154,7 @@ compile が落ちる場合だけ、`TORCHINDUCTOR_COMPILE_THREADS=4 source scrip
 ```bash
 source scripts/env.sh
 
-# 1B / 8K 本走。CUDA/MPSで同じconfigを使う
+# 1B / 8K CUDA本走 (sm89+)
 python -m src.train.train --config configs/arbor.yaml
 
 # 1 stepだけ確認
@@ -188,11 +193,13 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
 - `best` は **train loss の EMA** が最良だった checkpoint (validation best ではない)。
 - `speed.cuda_prefetch: true` で次 batch を別 CUDA stream で GPU へ先行転送する。
   prefetched batch は checkpoint state に同梱されるため、resume で 1 batch 欠落しない。
-- `speed.bitlinear_fp8: auto` は sm89+ CUDA で BitLinear の backward GEMM を
-  FP8化し、それ以外のdeviceでは自動的に無効化する。forwardまでFP8化する
-  `full` は追加丸めと速度低下があり得るため既定では使わない。
-- `model.global_attn_impl: auto` は CUDA + `torch.compile` の学習時だけ
-  FlexAttentionを使い、eval・非CUDA・compile無効時はSDPAへ戻す。
+- `speed.bitlinear_fp8: bwd` は sm89+ CUDA で BitLinear の backward GEMM を
+  FP8化する。非対応deviceではエラーになり、暗黙に無効化しない。forwardまで
+  FP8化する`full`は追加丸めと速度低下があり得るため既定では使わない。
+- `model.global_attn_impl: flex` は CUDA + `torch.compile` 必須。条件を満たさない
+  場合はエラーになり、SDPAへ暗黙フォールバックしない。
+- `optim.state_precision: int8` はblockwise scale付きmomentを使う。無スケール
+  `bf8` stateは1000-step soakで発散を確認しており、実験用途以外では使わない。
 - `speed.sync_each_step: false` が既定。毎 step の `torch.cuda.synchronize()` は行わず、
   ログ/保存など scalar 化が必要な箇所でのみ同期する。
 - ログの throughput は `bytes/s`。entropy/space patching では `patches/s`,
@@ -206,7 +213,8 @@ CUDA計算部分だけを合成データで比較する場合:
 ```bash
 python -m scripts.bench_cuda \
   --seq 8192 --micro-batch 2 --grad-accum 32 \
-  --compile --global-attn-impl auto --bitlinear-fp8 auto
+  --compile --global-attn-impl flex --bitlinear-fp8 bwd \
+  --weight-cache full --production-optimizer
 ```
 
 ### entropy patching を使う手順 (区切り用 LM の学習)

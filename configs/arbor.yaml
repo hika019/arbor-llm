@@ -6,8 +6,8 @@
 # 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (8 bytes/patch)
 # なので global は 1024 patches。実効バッチは 64 seq = 524k bytes/update。
 #
-# CUDA / MPS は同じ設定を使う。MPS では train.py がモデル形状・データ混合・
-# optimizer精度を変えず、gradient checkpointing と micro-batch だけを適合する。
+# このbranchの既定値はCUDA sm89+専用。非対応deviceへは暗黙フォールバックしない。
+# MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_fp8: off を明示する。
 
 run_name: arbor2_1b_8k_filter
 seed: 42
@@ -58,13 +58,12 @@ model:
   #   bf8  … 8bit float (float8_e5m2) fake-quant
   #   bf16 … 量子化しない (活性は計算 dtype のまま)
   activation_precision: bf8     # choices: int8 | bf8 | bf16
-                                # MPS は float8 非対応。bf8 指定時は自動で bf16 に落ちる
   gradient_checkpointing: false # OOM 時のみ true
   # global(patch階層) attention 実装。文書 packing のマスクを SDPA 密マスクで課すと
   # flash 経路を外れて遅い。CUDA では flex にすると BlockMask で fuse + native GQA。
-  #   sdpa … 全 device 対応。 flex … CUDA compile 用。
-  #   auto … CUDA+compileの学習時はflex、eval/他device/compile無効時はsdpa。
-  global_attn_impl: auto        # RTX 4090実測: sdpa比 +3.7% (FP8 bwd併用、8k context)
+  #   sdpa … 全 device 対応。 flex … CUDA + torch.compile 必須。
+  # 非対応環境での暗黙フォールバックは禁止。必要なら明示的にsdpaへ変更する。
+  global_attn_impl: flex        # RTX 4090実測: sdpa比 +3.7% (FP8 bwd併用、8k context)
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
 # weight_bytes は行選択確率ではなく、document packing 後の実測 byte 比率に近づくよう
@@ -132,9 +131,10 @@ data:
 # ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
 optim:
   optimizer: adamw              # choices: adamw | lion
-  state_precision: bf8          # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
+  state_precision: int8         # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
                                 # fp32=8B/要素, int8=blockwise 1B, bf8=float8_e5m2 1B
-                                # MPS は float8 非対応。bf8 指定時は自動で int8 に落ちる
+                                # bf8は無スケールmomentが小勾配でunderflowし、1000-step
+                                # soakで発散/NaNを確認したため既定にしない。
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -162,9 +162,9 @@ speed:
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
   cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
-  bitlinear_fp8: auto           # choices: off | bwd | full | auto。sm89+ CUDAではauto=bwd。
+  bitlinear_fp8: bwd            # choices: off | bwd | full。bwd/fullはsm89+ CUDA必須。
                                 # bwdはforwardを維持し、backward GEMMのみFP8化。
-                                # fullはforwardにも追加丸めが乗り、通常は非推奨。
+                                # 非対応環境ではエラー。fullは追加丸めが乗り通常は非推奨。
   bitnet_weight_cache: auto    # grad_accum内の量子化重み再計算を1回に削減 (bench実測+12.6%throughput)
   bitnet_weight_cache_gib: 1.25
   bitnet_weight_cache_min_numel: 65536

@@ -52,6 +52,12 @@ def test_forward_handles_partial_patch(model):
     assert out.logits.shape == (1, 10, 260)
 
 
+def test_unknown_global_attention_impl_is_error():
+    cfg = ArborConfig.from_dict(dict(TINY, global_attn_impl="auto"))
+    with pytest.raises(ValueError, match="暗黙フォールバックは禁止"):
+        ArborModel(cfg)
+
+
 @pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
 def test_causality(mode, pos):
