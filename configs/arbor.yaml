@@ -62,9 +62,9 @@ model:
   gradient_checkpointing: false # OOM 時のみ true
   # global(patch階層) attention 実装。文書 packing のマスクを SDPA 密マスクで課すと
   # flash 経路を外れて遅い。CUDA では flex にすると BlockMask で fuse + native GQA。
-  #   sdpa … 既定 (全 device で検証済み)。 flex … CUDA 用。 auto … CUDAなら flex/他は sdpa。
-  # 注: flex+torch.compile の CUDA 実機ベンチは未実施。まず auto/flex で計測して採用可否を判断。
-  global_attn_impl: sdpa        # choices: sdpa | flex | auto
+  #   sdpa … 全 device 対応。 flex … CUDA compile 用。
+  #   auto … CUDA+compileの学習時はflex、eval/他device/compile無効時はsdpa。
+  global_attn_impl: auto        # RTX 4090実測: sdpa比 +3.7% (FP8 bwd併用、8k context)
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
 # weight_bytes は行選択確率ではなく、document packing 後の実測 byte 比率に近づくよう
@@ -162,6 +162,9 @@ speed:
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
   cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
+  bitlinear_fp8: auto           # choices: off | bwd | full | auto。sm89+ CUDAではauto=bwd。
+                                # bwdはforwardを維持し、backward GEMMのみFP8化。
+                                # fullはforwardにも追加丸めが乗り、通常は非推奨。
   bitnet_weight_cache: auto    # grad_accum内の量子化重み再計算を1回に削減 (bench実測+12.6%throughput)
   bitnet_weight_cache_gib: 1.25
   bitnet_weight_cache_min_numel: 65536

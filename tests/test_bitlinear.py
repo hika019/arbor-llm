@@ -12,6 +12,8 @@ from src.model.bitlinear import (
     check_activation_precision,
     quantize_activation,
     configure_bitlinear_training_cache,
+    fp8_gemm_supported,
+    set_bitlinear_fp8_mode,
     weight_quant,
 )
 
@@ -164,6 +166,49 @@ def test_configure_training_cache_installs_projection_groups():
     assert info["enabled"]
     assert info["qkv_groups"] > 0
     assert info["gate_up_groups"] > 0
+
+
+def test_fp8_auto_falls_back_to_off_for_cpu_model():
+    model = torch.nn.Sequential(BitLinear(32, 16), BitLinear(16, 16))
+    info = set_bitlinear_fp8_mode(model, "auto")
+    assert info == {"requested": "auto", "mode": "off", "layers": 2}
+    assert all(layer._fp8_mode == "off" for layer in model)
+
+
+def test_unknown_fp8_mode_is_error():
+    with pytest.raises(ValueError, match="bitlinear fp8 mode"):
+        set_bitlinear_fp8_mode(BitLinear(16, 16), "fp4")
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_fp8_bwd_preserves_forward_and_produces_finite_gradients_cuda():
+    torch.manual_seed(0)
+    ref = BitLinear(32, 32, activation_precision="bf16").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    fp8 = BitLinear(32, 32, activation_precision="bf16").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    fp8.load_state_dict(ref.state_dict())
+    info = set_bitlinear_fp8_mode(fp8, "bwd")
+    assert info["mode"] == "bwd"
+
+    x_ref = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_fp8 = x_ref.detach().clone().requires_grad_(True)
+    y_ref = ref(x_ref)
+    y_fp8 = fp8(x_fp8)
+    assert torch.equal(y_fp8, y_ref)
+
+    y_ref.square().mean().backward()
+    y_fp8.square().mean().backward()
+    assert torch.isfinite(x_fp8.grad).all()
+    assert torch.isfinite(fp8.weight.grad).all()
+    assert torch.nn.functional.cosine_similarity(
+        x_fp8.grad.float().flatten(), x_ref.grad.float().flatten(), dim=0
+    ) > 0.98
+    assert torch.nn.functional.cosine_similarity(
+        fp8.weight.grad.float().flatten(), ref.weight.grad.float().flatten(), dim=0
+    ) > 0.98
 
 
 def test_bias_is_rejected():

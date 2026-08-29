@@ -511,15 +511,27 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     optimizer、state_precision、モデル形状、データ混合は変更しない。
     """
     resolved = copy.deepcopy(cfg)
+    model_cfg = resolved.setdefault("model", {})
+    speed_cfg = resolved.setdefault("speed", {})
+    # flex_attention は compile 無しだと full score matrix を実体化する unfused 経路に
+    # なり、実測で大幅に遅い。auto は CUDA+compile の学習時だけ flex を使う。
+    if (
+        model_cfg.get("global_attn_impl", "sdpa") == "auto"
+        and not (device.type == "cuda" and speed_cfg.get("torch_compile", True))
+    ):
+        model_cfg["global_attn_impl"] = "sdpa"
+        print(
+            f"[train] global_attn_impl=sdpa "
+            f"(auto fallback: device={device.type}, torch_compile="
+            f"{bool(speed_cfg.get('torch_compile', True))})"
+        )
     if device.type != "mps":
         return resolved
 
-    model_cfg = resolved.setdefault("model", {})
     if not model_cfg.get("gradient_checkpointing", False):
         model_cfg["gradient_checkpointing"] = True
         print("[train] MPS: gradient_checkpointing=ON (model shape/precision unchanged)")
 
-    speed_cfg = resolved.setdefault("speed", {})
     micro_batch = int(speed_cfg.get("micro_batch_size", 1))
     grad_accum = int(speed_cfg.get("grad_accum_steps", 1))
     if micro_batch > 1:
@@ -746,6 +758,18 @@ def main() -> int:
             f"cache={bitnet_cache_info['cache_gib']:.2f}GiB "
             f"qkv_groups={bitnet_cache_info['qkv_groups']} "
             f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
+        )
+        # FP8 GEMM は射影融合後に設定する (BitLinearGroup にも反映するため)。
+        # YAML 1.1 では裸の `off` が False になるので明示的に正規化する。
+        fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
+        if fp8_raw in (None, False):
+            fp8_raw = "off"
+        from src.model.bitlinear import set_bitlinear_fp8_mode
+
+        fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
+        print(
+            f"[train] bitlinear_fp8={fp8_info['mode']} "
+            f"(requested={fp8_info['requested']}) layers={fp8_info['layers']}"
         )
 
     model = apply_compile_settings(model, cfg["speed"], device)

@@ -45,6 +45,19 @@ def main() -> None:
     ap.add_argument("--compile", dest="compile", action="store_true", default=True)
     ap.add_argument("--no-compile", dest="compile", action="store_false")
     ap.add_argument("--compile-mode", default="default")
+    ap.add_argument(
+        "--bitlinear-fp8",
+        default=None,
+        choices=["off", "bwd", "full", "auto"],
+        help="既定は config speed.bitlinear_fp8",
+    )
+    ap.add_argument(
+        "--weight-cache",
+        default=None,
+        choices=["off", "fused", "full", "auto"],
+        help="既定は config speed.bitnet_weight_cache",
+    )
+    ap.add_argument("--weight-cache-gib", type=float, default=None)
     ap.add_argument("--fwd-only", action="store_true")
     args = ap.parse_args()
 
@@ -62,6 +75,11 @@ def main() -> None:
     mcfg = dict(cfg["model"])
     if args.global_attn_impl is not None:
         mcfg["global_attn_impl"] = args.global_attn_impl
+    if (
+        mcfg.get("global_attn_impl", "sdpa") == "auto"
+        and not (device.type == "cuda" and args.compile)
+    ):
+        mcfg["global_attn_impl"] = "sdpa"
     seq = args.seq or int(mcfg.get("max_bytes", 2048))
     mcfg["max_bytes"] = seq
     if device.type == "mps" and mcfg.get("activation_precision") == "bf8":
@@ -69,10 +87,44 @@ def main() -> None:
 
     model = build_arbor(mcfg).to(device=device, dtype=dtype)
     model.train()
+    speed_cfg = cfg.get("speed", {})
+    from src.model.bitlinear import (
+        configure_bitlinear_training_cache,
+        refresh_bitlinear_training_cache,
+        set_bitlinear_fp8_mode,
+    )
+
+    cache_mode = args.weight_cache
+    if cache_mode is None:
+        cache_mode = speed_cfg.get("bitnet_weight_cache", "auto")
+    cache_gib = (
+        args.weight_cache_gib
+        if args.weight_cache_gib is not None
+        else speed_cfg.get("bitnet_weight_cache_gib", 1.25)
+    )
+    cache_info = configure_bitlinear_training_cache(
+        model,
+        enabled=cache_mode,
+        grad_accum_steps=args.grad_accum,
+        max_cache_gib=cache_gib,
+        min_numel=int(speed_cfg.get("bitnet_weight_cache_min_numel", 65536)),
+    )
+    fp8_mode = args.bitlinear_fp8
+    if fp8_mode is None:
+        fp8_mode = speed_cfg.get("bitlinear_fp8", "off")
+    if fp8_mode in (None, False):
+        fp8_mode = "off"
+    fp8_info = set_bitlinear_fp8_mode(model, str(fp8_mode))
     print(f"[bench] device={device} dtype={args.dtype} seq={seq} "
           f"micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
           f"global_attn_impl={mcfg.get('global_attn_impl','sdpa')} "
           f"compile={args.compile}({args.compile_mode})")
+    print(
+        "[bench] "
+        f"weight_cache={cache_info['mode']} cached_layers={cache_info['cached_layers']} "
+        f"cache={cache_info['cache_gib']:.2f}GiB "
+        f"fp8={fp8_info['mode']} (requested={fp8_info['requested']})"
+    )
 
     resolved_impl = mcfg.get("global_attn_impl", "sdpa")
     if resolved_impl == "auto":
@@ -110,6 +162,7 @@ def main() -> None:
             total += float(loss.detach())
         if not args.fwd_only:
             opt.step()
+            refresh_bitlinear_training_cache(model)
         return total
 
     for _ in range(args.warmup):

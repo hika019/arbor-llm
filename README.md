@@ -41,8 +41,15 @@ bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer �
 - 学習は BF16 シャドウ重みの QAT。推論は BitLinear の dequant キャッシュで
   毎回の重み再量子化を省く。packed ternary Triton 経路は速度診断用の明示 opt-in。
 
-実測 (RTX 4090 / WSL2, synthetic, `micro_batch=8` `T=2048` compile 込み):
-**51.2k bytes/s, VRAM 16.1 GiB** (旧 BLT 版の本走実測 ~13k bytes/s から大幅改善)。
+実測 (RTX 4090 / WSL2, torch 2.11+cu128, synthetic, `T=8192`,
+`micro_batch=2`, `grad_accum=32`, compile + weight cache):
+
+- FP8無効: **46.1k bytes/s**, 11.36 sec/step, peak VRAM 15.9 GiB
+- `bitlinear_fp8=auto` (= sm89ではbackward FP8):
+  **54.1k bytes/s**, 9.69 sec/step, peak VRAM 13.9 GiB
+
+同条件で **throughput +17.3% / step時間 -14.8% / peak VRAM -2.0 GiB**。
+forward は従来BF16のままなので、追加丸めはbackward勾配だけに限定される。
 
 データは日本語 (fineweb-2 ja / wikipedia ja / 青空文庫 / 法令) + 英語
 (fineweb-edu / fineweb) + 数学 (finemath) の streaming 行レベル混合。既定 config
@@ -181,6 +188,11 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
 - `best` は **train loss の EMA** が最良だった checkpoint (validation best ではない)。
 - `speed.cuda_prefetch: true` で次 batch を別 CUDA stream で GPU へ先行転送する。
   prefetched batch は checkpoint state に同梱されるため、resume で 1 batch 欠落しない。
+- `speed.bitlinear_fp8: auto` は sm89+ CUDA で BitLinear の backward GEMM を
+  FP8化し、それ以外のdeviceでは自動的に無効化する。forwardまでFP8化する
+  `full` は追加丸めと速度低下があり得るため既定では使わない。
+- `model.global_attn_impl: auto` は CUDA + `torch.compile` の学習時だけ
+  FlexAttentionを使い、eval・非CUDA・compile無効時はSDPAへ戻す。
 - `speed.sync_each_step: false` が既定。毎 step の `torch.cuda.synchronize()` は行わず、
   ログ/保存など scalar 化が必要な箇所でのみ同期する。
 - ログの throughput は `bytes/s`。entropy/space patching では `patches/s`,
@@ -188,6 +200,14 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   `ByteLM_ms` / `patching_ms` / `Arbor_ms` は `profile_sections_every_steps` 間隔で
   `ByteLM_ms` / `patching_ms` を no-grad probe で同期計測し、`Arbor_ms` は
   compiled forward 時間からの概算として出す。
+
+CUDA計算部分だけを合成データで比較する場合:
+
+```bash
+python -m scripts.bench_cuda \
+  --seq 8192 --micro-batch 2 --grad-accum 32 \
+  --compile --global-attn-impl auto --bitlinear-fp8 auto
+```
 
 ### entropy patching を使う手順 (区切り用 LM の学習)
 

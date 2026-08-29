@@ -77,6 +77,24 @@ def test_cuda_adaptation_does_not_change_config():
     assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
 
 
+def test_attention_auto_uses_sdpa_when_compile_is_disabled():
+    cfg = {
+        "model": {"global_attn_impl": "auto"},
+        "speed": {"torch_compile": False},
+    }
+    resolved = adapt_config_for_device(cfg, torch.device("cuda"))
+    assert resolved["model"]["global_attn_impl"] == "sdpa"
+    assert cfg["model"]["global_attn_impl"] == "auto"
+
+
+def test_attention_auto_stays_auto_for_cuda_compile():
+    cfg = {
+        "model": {"global_attn_impl": "auto"},
+        "speed": {"torch_compile": True},
+    }
+    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+
+
 def test_entropy_model_config_is_loaded_from_single_reference(tmp_path):
     entropy_path = tmp_path / "entropy_lm.yaml"
     entropy_path.write_text(

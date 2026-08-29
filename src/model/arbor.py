@@ -150,7 +150,8 @@ class ArborConfig:
     #   sdpa … 既定。文書マスク時は密 (B,1,K,K) マスク + SDPA (flash 非対応経路)。
     #   flex … CUDA 向け。文書境界を BlockMask にして flex_attention で fuse し、
     #          GQA も native (KV repeat_interleave 不要)。torch>=2.5 / 主に CUDA 用。
-    global_attn_impl: str = "sdpa"  # choices: sdpa | flex
+    #   auto … CUDA training は flex、eval/他 device は sdpa。
+    global_attn_impl: str = "sdpa"  # choices: sdpa | flex | auto
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArborConfig":
@@ -692,12 +693,12 @@ class ArborModel(nn.Module):
     def _global_mask(self, patch_doc: torch.Tensor):
         """cfg.global_attn_impl に応じて global 用マスクを返す (sdpa=密, flex=BlockMask).
 
-        auto は tensor が CUDA 上なら flex、それ以外 (MPS/CPU) は sdpa を選ぶ
-        (flex は CUDA 前提。非 CUDA では eager で密スコアを実体化し遅いため)。
+        auto は CUDA training なら flex、それ以外は sdpa を選ぶ。eval 時に未コンパイル
+        の base model を使うサンプル生成では、flex の unfused 経路を避ける。
         """
         impl = self.cfg.global_attn_impl
         if impl == "auto":
-            impl = "flex" if patch_doc.is_cuda else "sdpa"
+            impl = "flex" if patch_doc.is_cuda and self.training else "sdpa"
         if impl == "flex":
             return self._global_flex_block_mask(patch_doc)
         return self._global_doc_mask(patch_doc)

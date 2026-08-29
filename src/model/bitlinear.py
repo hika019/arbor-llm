@@ -15,9 +15,17 @@
       q/k/v <- input_layernorm,  o <- attn_sub_norm,
       gate/up <- post_attention_layernorm,  down <- ffn_sub_norm
 
-学習パスはカスタム autograd や Triton カーネルを使わない。純 PyTorch なので
-torch.compile が全体を融合でき、CPU でもそのまま動く。学習は BF16 シャドウ重みが
-master。
+学習パスは既定では純 PyTorch (BF16 fake-quant) で、torch.compile が全体を融合
+でき、CPU でもそのまま動く。学習は BF16 シャドウ重みが master。
+
+FP8 GEMM (任意, sm89+): `set_bitlinear_fp8_mode(model, "bwd"|"full")` で学習 GEMM を
+torch._scaled_mm (e4m3, per-tensor dynamic scale) に置き換える。ternary 重みは
+e4m3 で誤差ゼロ表現できるため重み側は無損失。
+  - "bwd":  forward は BF16 のまま (数値は既定パスと同一)。dgrad/wgrad のみ FP8。
+            勾配 g と保存活性 x_q の e4m3 丸めが新規ノイズ。
+  - "full": forward も FP8。x_q の e4m3 再丸め (tensorwise) が forward に乗る。
+            丸めは STE 扱い。validation/eval は常に既定 (BF16) パス。
+  - "auto": CUDA sm89+ では bwd、それ以外では off。
 
 推論パス (任意): `freeze_for_inference()` を呼ぶと dequantize 済み ternary 重みを
 キャッシュし、以後の eval forward で毎回の重み再量子化を省く。実験的な
@@ -260,6 +268,139 @@ class _CachedBitLinearGroupSTE(torch.autograd.Function):
         return (grad_x, None, *grad_weights)
 
 
+# ---------------------------------------------------------------- FP8 GEMM
+_FP8_E4M3 = torch.float8_e4m3fn
+_FP8_MAX = 448.0  # e4m3fn の最大有限値
+_FP8_MODES = ("off", "bwd", "full", "auto")
+
+
+def fp8_gemm_supported() -> bool:
+    """torch._scaled_mm の FP8 経路が使えるか (Ada sm89 以上)."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() >= (8, 9)
+
+
+def _fp8_dims_ok(m: int, k: int, n: int) -> bool:
+    # cuBLASLt FP8 GEMM は 16 要素アラインメントを要求する。満たさない形状は
+    # 呼び出し側が BF16 パスへフォールバックする。
+    return m % 16 == 0 and k % 16 == 0 and n % 16 == 0
+
+
+def _cast_fp8_tensorwise(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """per-tensor dynamic scale で e4m3 化する。t ≈ 返値[0] × 返値[1]."""
+    scale = (t.abs().amax().float() / _FP8_MAX).clamp_min(1e-12)
+    t_f8 = (t / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_E4M3)
+    return t_f8, scale
+
+
+def _ternary_to_fp8(w_q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """dequantize 済み ternary を ({-1,0,+1} e4m3, 行ごと scale) に分解する."""
+    scale = w_q.abs().amax(dim=1).float()
+    w_f8 = (w_q / scale.clamp_min(1e-12).unsqueeze(1)).to(_FP8_E4M3)
+    return w_f8, scale
+
+
+class _Fp8BitLinearSTE(torch.autograd.Function):
+    """torch._scaled_mm (e4m3) で GEMM を実行する BitLinear/Group 共用 STE."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_q: torch.Tensor,
+        w_q: torch.Tensor,
+        fwd_fp8: bool,
+        out_sizes: tuple[int, ...],
+        *shadow_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        del shadow_weights
+        ctx.input_shape = tuple(x_q.shape)
+        ctx.out_sizes = out_sizes
+        x2 = x_q.reshape(-1, w_q.size(1))
+        x_f8, sx = _cast_fp8_tensorwise(x2)
+        w_f8, w_scale = _ternary_to_fp8(w_q)
+        ctx.save_for_backward(x_f8, sx, w_f8, w_scale)
+        if fwd_fp8:
+            y = torch._scaled_mm(
+                x_f8,
+                w_f8.t(),
+                scale_a=sx,
+                scale_b=sx.new_ones(()),
+                out_dtype=x_q.dtype,
+            )
+            y = y * w_scale.to(y.dtype)
+            return y.reshape(*ctx.input_shape[:-1], w_q.size(0))
+        return F.linear(x_q, w_q)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x_f8, sx, w_f8, w_scale = ctx.saved_tensors
+        n = w_f8.size(0)
+        one = sx.new_ones(())
+        g2 = grad_output.reshape(-1, n)
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            # dgrad: (g × w_scale) [m,n] @ ternary [n,k]。
+            gs_f8, sgs = _cast_fp8_tensorwise(g2 * w_scale.to(g2.dtype))
+            w_kn = w_f8.t().contiguous()
+            grad_x = torch._scaled_mm(
+                gs_f8,
+                w_kn.t(),
+                scale_a=sgs,
+                scale_b=one,
+                out_dtype=grad_output.dtype,
+            ).reshape(ctx.input_shape)
+
+        needs_w = ctx.needs_input_grad[4:]
+        if any(needs_w):
+            # wgrad: gᵀ [n,m] @ x_q [m,k]。shadow weight へ STE 勾配を返す。
+            g_f8, sg = _cast_fp8_tensorwise(g2)
+            gt_f8 = g_f8.t().contiguous()
+            x_km = x_f8.t().contiguous()
+            grad_w = torch._scaled_mm(
+                gt_f8,
+                x_km.t(),
+                scale_a=sg,
+                scale_b=sx,
+                out_dtype=grad_output.dtype,
+            )
+            raw = grad_w.split(ctx.out_sizes, dim=0)
+            grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
+        else:
+            grad_weights = tuple(None for _ in ctx.out_sizes)
+        return (grad_x, None, None, None, *grad_weights)
+
+
+def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]:
+    """module 以下の BitLinear / BitLinearGroup に FP8 モードを設定する.
+
+    QKV/gate-up 融合後 (install_arbor_projection_fusions 後) に呼ぶこと。
+    """
+    requested = str(mode).lower()
+    if requested not in _FP8_MODES:
+        raise ValueError(f"unknown bitlinear fp8 mode: {mode!r} (choices: {_FP8_MODES})")
+    targets = [
+        child for child in module.modules()
+        if isinstance(child, (BitLinear, BitLinearGroup))
+    ]
+    has_cuda_weights = any(
+        (child.weight if isinstance(child, BitLinear) else child.members()[0].weight).is_cuda
+        for child in targets
+    )
+    supported = has_cuda_weights and fp8_gemm_supported()
+    normalized = "bwd" if requested == "auto" and supported else requested
+    if requested == "auto" and not supported:
+        normalized = "off"
+    if normalized != "off" and not supported:
+        raise RuntimeError(
+            "bitlinear_fp8 には compute capability 8.9 以上の CUDA GPU が必要 "
+            "(torch._scaled_mm FP8)"
+        )
+    for child in targets:
+        child._fp8_mode = normalized
+    return {"requested": requested, "mode": normalized, "layers": len(targets)}
+
+
 class BitLinear(nn.Module):
     """nn.Linear (bias 無し) の drop-in 置換. W1.58 ternary weight + STE.
 
@@ -286,6 +427,7 @@ class BitLinear(nn.Module):
         # 訓練時の optimizer step 間だけ使う量子化重みキャッシュ。
         self.register_buffer("_train_qweight", None, persistent=False)
         self._train_cache_enabled = False
+        self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
         # 推論凍結用 (freeze_for_inference 後のみ非 None)
         self._w_packed: torch.Tensor | None = None
         self._w_scale: torch.Tensor | None = None
@@ -337,7 +479,26 @@ class BitLinear(nn.Module):
             )
         self._train_qweight.copy_(weight_quant(self.weight.detach()))
 
+    def _fp8_applicable(self, x_q: torch.Tensor) -> bool:
+        return (
+            self._fp8_mode != "off"
+            and x_q.is_cuda
+            and _fp8_dims_ok(
+                x_q.numel() // x_q.size(-1), self.in_features, self.out_features
+            )
+        )
+
     def forward_prequantized(self, x_q: torch.Tensor) -> torch.Tensor:
+        if self.training and self._fp8_applicable(x_q):
+            if self.training_weight_cache_enabled:
+                w_q = self._train_qweight
+            else:
+                # 既定パスの STE 合成と同じ演算順で BF16 丸めを揃える。
+                w = self.weight.detach()
+                w_q = w + (weight_quant(w) - w)
+            return _Fp8BitLinearSTE.apply(
+                x_q, w_q, self._fp8_mode == "full", (self.out_features,), self.weight
+            )
         if self.training and self.training_weight_cache_enabled:
             return _CachedBitLinearSTE.apply(x_q, self.weight, self._train_qweight)
         w = self.weight
@@ -441,6 +602,7 @@ class BitLinearGroup(nn.Module):
         object.__setattr__(self, "_members", tuple(members))
         self.register_buffer("_train_qweight", None, persistent=False)
         self._train_cache_enabled = False
+        self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
 
     def members(self) -> tuple[BitLinear, ...]:
         return self._members
@@ -504,6 +666,26 @@ class BitLinearGroup(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         members = self.members()
         x_q = quantize_activation_ste(x, self.activation_precision)
+        if (
+            self.training
+            and self._fp8_mode != "off"
+            and x_q.is_cuda
+            and _fp8_dims_ok(
+                x_q.numel() // x_q.size(-1), self.in_features, self.out_features
+            )
+        ):
+            if self.training_weight_cache_enabled:
+                w_q = self._train_qweight
+            else:
+                quantized = []
+                for member in members:
+                    w = member.weight.detach()
+                    quantized.append(w + (weight_quant(w) - w))
+                w_q = torch.cat(quantized, dim=0)
+            weights = tuple(member.weight for member in members)
+            return _Fp8BitLinearSTE.apply(
+                x_q, w_q, self._fp8_mode == "full", self.out_splits, *weights
+            )
         if self.training and self.training_weight_cache_enabled:
             weights = tuple(member.weight for member in members)
             return _CachedBitLinearGroupSTE.apply(x_q, self._train_qweight, *weights)
