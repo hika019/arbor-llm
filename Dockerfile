@@ -51,7 +51,6 @@ RUN ${VENV_PATH}/bin/python -m pip install \
     "numpy>=1.26" \
     "safetensors>=0.4.3" \
     "datasets>=2.18" \
-    "bitsandbytes>=0.43" \
     "transformers>=4.45" \
     "accelerate>=0.33" \
     "huggingface_hub>=0.23" \
@@ -60,10 +59,9 @@ RUN ${VENV_PATH}/bin/python -m pip install \
 
 # ビルド時の import 検証 (GPU 無しでも torch import と版だけ確認できる)
 RUN ${VENV_PATH}/bin/python - <<'PY'
-import torch, datasets, bitsandbytes, safetensors, transformers
+import torch, datasets, safetensors, transformers
 print("torch:", torch.__version__, torch.version.cuda)
 print("datasets:", datasets.__version__)
-print("bitsandbytes:", bitsandbytes.__version__)
 assert torch.version.cuda == "12.8"
 PY
 

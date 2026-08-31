@@ -4,6 +4,10 @@ import pytest
 import torch
 
 from src.train.train import resolve_precision
+from src.train.train import resolve_autocast
+from src.train.train import resolve_entropy_lm_reference
+from src.train.train import adapt_config_for_device
+from src.train.train import pick_device
 from src.train.train import byte_kind_loss_stats
 from src.train.train import CudaBatchPrefetcher
 from src.train.train import ThreadedBatchPrefetcher
@@ -19,7 +23,147 @@ def test_resolve_precision_accepts_supported_modes():
 
 def test_resolve_precision_rejects_unknown_mode():
     with pytest.raises(ValueError, match="speed.precision"):
-        resolve_precision("int8")
+        resolve_precision("int4")
+
+
+def test_resolve_precision_bf8_is_explicit_error_not_silent():
+    with pytest.raises(ValueError, match="bf8"):
+        resolve_precision("bf8")
+
+
+def test_resolve_autocast_requires_real_bool():
+    assert resolve_autocast({}, True) is True
+    assert resolve_autocast({"autocast": False}, True) is False
+    with pytest.raises(TypeError, match="speed.autocast"):
+        resolve_autocast({"autocast": "false"}, True)
+
+
+def test_mps_adaptation_preserves_model_optimizer_and_effective_batch():
+    cfg = {
+        "model": {
+            "bitnet": True,
+            "patching_mode": "static",
+            "hidden_size": 2048,
+            "gradient_checkpointing": False,
+        },
+        "optim": {
+            "optimizer": "adamw",
+            "state_precision": "int8",
+            "lr": 1e-3,
+        },
+        "speed": {"micro_batch_size": 2, "grad_accum_steps": 32},
+        "validation": {"micro_batch_size": 2},
+    }
+
+    resolved = adapt_config_for_device(cfg, torch.device("mps"))
+
+    assert resolved["model"]["bitnet"] is True
+    assert resolved["model"]["patching_mode"] == "static"
+    assert resolved["model"]["hidden_size"] == 2048
+    assert resolved["model"]["gradient_checkpointing"] is True
+    assert resolved["optim"] == cfg["optim"]
+    assert resolved["speed"]["micro_batch_size"] == 1
+    assert resolved["speed"]["grad_accum_steps"] == 64
+    assert resolved["validation"]["micro_batch_size"] == 1
+    assert cfg["model"]["gradient_checkpointing"] is False
+
+
+def test_cuda_adaptation_does_not_change_config():
+    cfg = {
+        "model": {"gradient_checkpointing": False},
+        "optim": {"optimizer": "adamw", "state_precision": "fp32"},
+        "speed": {"micro_batch_size": 2, "grad_accum_steps": 32},
+    }
+    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+
+
+def test_attention_auto_is_rejected_instead_of_falling_back():
+    cfg = {
+        "model": {"global_attn_impl": "auto"},
+        "speed": {"torch_compile": True},
+    }
+    with pytest.raises(ValueError, match="auto/fallback"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+def test_flex_without_compile_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "flex"},
+        "speed": {"torch_compile": False},
+    }
+    with pytest.raises(ValueError, match="torch_compile=true"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+def test_flex_on_non_cuda_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "flex"},
+        "speed": {"torch_compile": True},
+    }
+    with pytest.raises(ValueError, match="CUDA専用"):
+        adapt_config_for_device(cfg, torch.device("cpu"))
+
+
+def test_fp8_on_non_cuda_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_fp8": "bwd"},
+    }
+    with pytest.raises(ValueError, match="CUDA専用"):
+        adapt_config_for_device(cfg, torch.device("cpu"))
+
+
+def test_entropy_model_config_is_loaded_from_single_reference(tmp_path):
+    entropy_path = tmp_path / "entropy_lm.yaml"
+    entropy_path.write_text(
+        """
+model:
+  arch: byte_lm
+  vocab_size: 260
+  hidden_size: 128
+checkpoint:
+  dir: ./checkpoints/entropy_lm
+"""
+    )
+    arbor_path = tmp_path / "arbor.yaml"
+    arbor_path.write_text("")
+    cfg = {
+        "entropy_lm_config": "entropy_lm.yaml",
+        "model": {"patching_mode": "entropy", "bitnet": True},
+    }
+
+    resolved = resolve_entropy_lm_reference(cfg, arbor_path)
+
+    assert resolved["model"]["bitnet"] is True
+    assert resolved["model"]["entropy_model"] == {
+        "vocab_size": 260,
+        "hidden_size": 128,
+    }
+    assert (
+        resolved["model"]["entropy_model_ckpt"]
+        == "checkpoints/entropy_lm/latest"
+    )
+    assert "entropy_model" not in cfg["model"]
+
+
+def test_entropy_inline_model_and_reference_cannot_be_double_managed(tmp_path):
+    cfg = {
+        "entropy_lm_config": "entropy_lm.yaml",
+        "model": {
+            "patching_mode": "entropy",
+            "entropy_model": {"hidden_size": 128},
+        },
+    }
+    with pytest.raises(ValueError, match="二重管理は禁止"):
+        resolve_entropy_lm_reference(cfg, tmp_path / "arbor.yaml")
+
+
+def test_pick_device_does_not_fallback_from_explicit_mps(monkeypatch):
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+
+    with pytest.raises(RuntimeError, match="暗黙フォールバック"):
+        pick_device("mps")
 
 
 def test_should_restore_dataloader_state_when_data_config_matches():

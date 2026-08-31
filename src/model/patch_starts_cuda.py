@@ -19,15 +19,28 @@ def _load_extension():
     if Path("/usr/include/cuda_runtime.h").exists():
         include_paths.append("/usr/include")
     old_cc, old_cxx = os.environ.get("CC"), os.environ.get("CXX")
+    old_c_include = os.environ.get("C_INCLUDE_PATH")
+    old_cplus_include = os.environ.get("CPLUS_INCLUDE_PATH")
     custom_cc = os.environ.get("ARBOR_EXT_CC")
     custom_cxx = os.environ.get("ARBOR_EXT_CXX")
     gcc12, gxx12 = which("gcc-12"), which("g++-12")
+    # env.sh の micromamba GCC が nvcc の対応上限より新しい場合がある。
+    # gcc-12 が無ければ Ubuntu の system compiler を extension にだけ使う。
+    system_gcc = "/usr/bin/gcc"
+    system_gxx = "/usr/bin/g++"
     if custom_cc and custom_cxx:
         os.environ["CC"] = custom_cc
         os.environ["CXX"] = custom_cxx
     elif gcc12 and gxx12:
         os.environ["CC"] = gcc12
         os.environ["CXX"] = gxx12
+    elif Path(system_gcc).exists() and Path(system_gxx).exists():
+        os.environ["CC"] = system_gcc
+        os.environ["CXX"] = system_gxx
+        # env.sh が micromamba 用に加えた明示 /usr/include は system GCC の
+        # include_next 探索を壊す。Python include は load() が -isystem で渡す。
+        os.environ.pop("C_INCLUDE_PATH", None)
+        os.environ.pop("CPLUS_INCLUDE_PATH", None)
     try:
         return load(
             name="arbor_patch_starts",
@@ -47,6 +60,14 @@ def _load_extension():
             os.environ.pop("CXX", None)
         else:
             os.environ["CXX"] = old_cxx
+        if old_c_include is None:
+            os.environ.pop("C_INCLUDE_PATH", None)
+        else:
+            os.environ["C_INCLUDE_PATH"] = old_c_include
+        if old_cplus_include is None:
+            os.environ.pop("CPLUS_INCLUDE_PATH", None)
+        else:
+            os.environ["CPLUS_INCLUDE_PATH"] = old_cplus_include
 
 
 def patch_starts_cuda(raw: torch.Tensor, min_len: int, max_len: int) -> torch.Tensor:

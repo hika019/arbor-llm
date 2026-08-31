@@ -3,7 +3,7 @@
 #   python -m src.train.train --config configs/entropy_lm.yaml
 #   -> checkpoints/entropy_lm/latest を arbor 側の model.entropy_model_ckpt に指定
 #
-# データ混合は本走 (arbor_1b_8k.yaml) ベース + 日英の文体多様化 (下記)。
+# データ混合は本走 (arbor.yaml) ベース + 日英の文体多様化 (下記)。
 # max_bytes は本体の max_bytes 以上にすること (next_byte_entropy は本体の
 # 入力列を一発で通すため、RoPE バッファが本体の context をカバーする必要がある)。
 # 32768 にしてあるので 32k 拡張 run でもそのまま使える。ただし学習 context は
@@ -27,7 +27,7 @@ model:
   bitnet: false             # 境界判定用なので FP の通常 Transformer
   gradient_checkpointing: false
 
-# 本走 (arbor_1b_8k.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
+# 本走 (arbor.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
 # 本体学習開始後は差し替え不可なので、文体カバレッジは広めに取る。
 # 日本語は最低 60% を維持し、その中に日本語チャット/崩れ文も入れる。
 # 残りで英語・多言語 UTF-8・会話/typo/絵文字・
@@ -90,15 +90,10 @@ data:
     # ---- 会話 / typo / 絵文字 0.06 ----
     - path: "OpenAssistant/oasst1"      # 多言語チャット。崩れた文・顔文字・絵文字も含む
       weight: 0.06
-    # ---- code / markdown / math 0.10 ----
+    # ---- markdown / math 0.03 (code は学習データ非公開化のため除外) ----
     - path: "HuggingFaceTB/finemath"    # 数学
       name: "finemath-4plus"
       weight: 0.03
-    - path: "loubnabnl/github-code-more-filtering"  # 多言語 GitHub コード (32 言語, parquet 非 gated)
-      text_column: "code"
-      weight: 0.05
-    - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.02
   streaming: true
   shuffle_buffer: 2000
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)
@@ -107,7 +102,8 @@ data:
   micro_batch_size: 4
 
 optim:
-  optimizer: adamw_fused
+  optimizer: adamw
+  state_precision: fp32     # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
   lr: 3.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -120,7 +116,8 @@ optim:
   total_steps: 500000
 
 speed:
-  precision: bf16
+  device: auto              # choices: auto | cuda | mps | cpu
+  precision: bf16           # 計算dtype。choices: bf16 | fp16 | fp32 (bf8 非対応)
   tf32_matmul: true
   cudnn_benchmark: false
   torch_compile: true

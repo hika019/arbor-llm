@@ -7,7 +7,6 @@ pyyaml>=6.0          # config 読み込み
 numpy>=1.26          # RNG state 保存ほか
 safetensors>=0.4.3   # checkpoint の重み保存
 datasets==4.8.5       # HF streaming (state_dict resume には >=2.18 必須)
-bitsandbytes>=0.43   # optim.optimizer: bnb_adamw_8bit 用 (lion/adamw_fused なら不要)
 
 # ---- HF エクスポート / transformers からの推論 ----
 transformers>=4.45

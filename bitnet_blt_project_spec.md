@@ -63,7 +63,7 @@ BLT (Byte Latent Transformer) アーキテクチャに BitNet b1.58 (ternary量�
 | 項目 | 値 |
 |---|---|
 | GPU | RTX 4090 ×1（24GB VRAM） |
-| 必須最適化 | Flash Attention 2/3, BF16 mixed precision, torch.compile, gradient checkpointing, 8-bit Adam（bitsandbytes） |
+| 必須最適化 | SDPA, BF16 mixed precision, torch.compile, gradient checkpointing, 全parameter統一 FP32/INT8-state AdamW |
 
 ### 公開
 | 項目 | 値 |
@@ -145,7 +145,7 @@ BLT (Byte Latent Transformer) アーキテクチャに BitNet b1.58 (ternary量�
    ```bash
    pip install torch --index-url https://download.pytorch.org/whl/cu121
    ```
-3. **依存ライブラリ**: `transformers`, `flash-attn`（事前に `pip install packaging ninja`）, `bitsandbytes`, `accelerate`, `datasets`, `wandb`, `safetensors`, `sentencepiece`（teacher側で必要な場合）
+3. **依存ライブラリ**: `torch`, `transformers`, `accelerate`, `datasets`, `safetensors`
 4. `requirements.txt` は下限バージョン中心で管理、`.venv/` は `.gitignore` に追加
 5. BLT公式リポジトリ参照: https://github.com/facebookresearch/blt
 
@@ -170,7 +170,7 @@ BLT (Byte Latent Transformer) アーキテクチャに BitNet b1.58 (ternary量�
 3. **速度最適化（RTX 4090で1B学習を現実的時間に収めるため必須）**:
    - Flash Attention 2/3
    - gradient checkpointing（VRAM-throughput トレードオフ、layer 単位）
-   - 8-bit Adam（bitsandbytes、optimizer state を 1/4 に圧縮）
+   - `optim.state_precision: int8`（全parameterのoptimizer stateをblockwise INT8化）
    - BF16 mixed precision（マスター重みも BF16、A100 以降の TF32 は不要）
    - **torch.compile**（現状は mode="default", dynamic=True。max-autotune は未採用）
    - **TF32 有効化 / cudnn benchmark = True**

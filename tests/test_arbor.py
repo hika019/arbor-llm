@@ -52,6 +52,12 @@ def test_forward_handles_partial_patch(model):
     assert out.logits.shape == (1, 10, 260)
 
 
+def test_unknown_global_attention_impl_is_error():
+    cfg = ArborConfig.from_dict(dict(TINY, global_attn_impl="auto"))
+    with pytest.raises(ValueError, match="暗黙フォールバックは禁止"):
+        ArborModel(cfg)
+
+
 @pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
 def test_causality(mode, pos):
@@ -61,7 +67,7 @@ def test_causality(mode, pos):
     まとめて検証される (空白バイトを混ぜて境界が動く入力にする)。
     """
     torch.manual_seed(1)
-    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode))).eval()
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
     a = torch.randint(4, 260, (1, 32))
     a[0, ::5] = 0x20 + 4  # 空白を混ぜて space 境界を発生させる
     b = a.clone()
@@ -74,6 +80,40 @@ def test_causality(mode, pos):
     )
     # 当該位置以降には影響していること (degenerate でないことの確認)
     assert not torch.allclose(la[:, pos:], lb[:, pos:], atol=1e-5)
+
+
+def test_document_attention_isolation(monkeypatch):
+    """packing=document で連結した文書間に global attention が漏れないこと.
+
+    doc1 のバイトを 1 つ変えても doc2 の logits が不変であることを確認する
+    (#2: 文書境界 block-diagonal マスク)。マスクを無効化すると漏れることも
+    合わせて確認し、テスト自体が leak を検出できることを担保する。
+    """
+    torch.manual_seed(3)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
+    # doc1 = [0..7] (index 7 が EOS), doc2 = [8..15]。patch_size=4 なので
+    # 文書境界が patch 境界 (index 8) に揃い、straddle patch は生じない。
+    a = torch.randint(4, 260, (1, 16))
+    a[0, 7] = 2  # EOS
+    b = a.clone()
+    b[0, 2] = (a[0, 2] - 4 + 1) % 256 + 4  # doc1 内の 1 バイトだけ別バイトに
+    with torch.inference_mode():
+        la = m(a).logits
+        lb = m(b).logits
+    assert torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-5), (
+        "doc1 の変更が doc2 の logits に漏れている (global attention leak)"
+    )
+    # doc1 側は当然変化する (degenerate でないことの確認)
+    assert not torch.allclose(la[:, 2:8], lb[:, 2:8], atol=1e-5)
+
+    # マスクを無効化すると doc2 へ漏れる = テストが leak を検出できている
+    monkeypatch.setattr(ArborModel, "_global_doc_mask", lambda self, patch_doc: None)
+    with torch.inference_mode():
+        la_leak = m(a).logits
+        lb_leak = m(b).logits
+    assert not torch.allclose(la_leak[:, 8:], lb_leak[:, 8:], atol=1e-5), (
+        "マスク無効化でも doc2 が不変。テストが leak を検出できていない"
+    )
 
 
 @pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
@@ -253,7 +293,7 @@ def test_patch_starts_cuda_matches_cpu_reference():
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
     torch.manual_seed(3)
-    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode))).eval()
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
     ids = torch.randint(4, 260, (26,))
     ids[::5] = 0x20 + 4  # 空白を混ぜて動的境界を発生させる
     gen = ArborByteGenerator(m)
@@ -334,3 +374,44 @@ def test_param_count_reporting(model):
     counts = model.num_parameters()
     assert counts["total"] == sum(p.numel() for p in model.parameters())
     assert counts["global"] > 0 and counts["local_decoder"] > 0
+
+
+def test_rope_theta_per_level_and_fallback():
+    """rope_theta_global/local が階層別に効き、未指定なら rope_theta に落ちること (#1)."""
+    # 階層別指定: global と local で theta が分かれる
+    cfg = dict(TINY, rope_theta=500000.0, rope_theta_global=10000.0, rope_theta_local=123456.0)
+    m = ArborModel(ArborConfig.from_dict(cfg))
+    assert m.global_layers[0].attn.rope.theta == 10000.0
+    assert m.encoder_layers[0].attn.rope.theta == 123456.0
+    assert m.decoder_layers[0].attn.rope.theta == 123456.0
+
+    # 後方互換: global/local 未指定なら両方 rope_theta を使う
+    m2 = ArborModel(ArborConfig.from_dict(dict(TINY, rope_theta=777.0)))
+    assert m2.global_layers[0].attn.rope.theta == 777.0
+    assert m2.encoder_layers[0].attn.rope.theta == 777.0
+
+
+def test_global_attn_flex_matches_sdpa():
+    """global_attn_impl=flex が sdpa と同一 logits を返すこと (#CUDA speed path).
+
+    flex_attention (BlockMask + native GQA) は密マスク SDPA と同じ文書境界規則を
+    表す。torch に flex_attention が無い環境では skip。
+    """
+    pytest.importorskip("torch.nn.attention.flex_attention")
+    import warnings
+
+    torch.manual_seed(0)
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
+    x = torch.randint(4, 260, (2, 32))
+    x[0, 15] = 2  # EOS -> 複数文書
+    x[1, 7] = 2
+    x[1, 20] = 2
+    with torch.inference_mode(), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m.cfg.global_attn_impl = "sdpa"
+        la = m(x).logits
+        m.cfg.global_attn_impl = "flex"
+        lb = m(x).logits
+    assert torch.allclose(la, lb, atol=1e-4), (
+        f"flex と sdpa の logits 不一致 (max diff={(la - lb).abs().max().item():.2e})"
+    )

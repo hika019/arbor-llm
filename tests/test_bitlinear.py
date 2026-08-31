@@ -9,7 +9,11 @@ from src.model.bitlinear import (
     BitLinear,
     BitLinearGroup,
     activation_quant,
+    check_activation_precision,
+    quantize_activation,
     configure_bitlinear_training_cache,
+    fp8_gemm_supported,
+    set_bitlinear_fp8_mode,
     weight_quant,
 )
 
@@ -20,6 +24,43 @@ def test_weight_quant_is_ternary():
     scale = w.abs().mean()
     levels = torch.unique((w_q / scale).round())
     assert set(levels.tolist()) <= {-1.0, 0.0, 1.0}
+
+
+def test_bitlinear_default_activation_precision_is_int8():
+    layer = BitLinear(16, 8)
+    assert layer.activation_precision == "int8"
+
+
+def test_bitlinear_bf8_activation_weight_stays_ternary():
+    torch.manual_seed(0)
+    layer = BitLinear(16, 8, activation_precision="bf8")
+    x = torch.randn(4, 16)
+    y = layer(x)
+    assert y.shape == (4, 8)
+    # 重みは activation 精度に関係なく W1.58 ternary のまま
+    scale = layer.weight.abs().mean()
+    levels = torch.unique((weight_quant(layer.weight) / scale).round())
+    assert set(levels.tolist()) <= {-1.0, 0.0, 1.0}
+
+
+def test_bf8_activation_rounds_to_float8_grid():
+    x = torch.randn(4, 32)
+    q = quantize_activation(x, "bf8")
+    assert q.dtype == x.dtype
+    # bf8 fake-quant は float8_e5m2 グリッドに一致する
+    torch.testing.assert_close(q, x.to(torch.float8_e5m2).to(x.dtype))
+
+
+def test_bf16_activation_is_identity():
+    x = torch.randn(4, 32)
+    torch.testing.assert_close(quantize_activation(x, "bf16"), x)
+
+
+def test_unknown_activation_precision_is_error():
+    with pytest.raises(ValueError, match="activation_precision"):
+        check_activation_precision("int4")
+    with pytest.raises(ValueError, match="activation_precision"):
+        BitLinear(8, 8, activation_precision="fp8")
 
 
 def test_activation_quant_per_token_grid():
@@ -125,6 +166,59 @@ def test_configure_training_cache_installs_projection_groups():
     assert info["enabled"]
     assert info["qkv_groups"] > 0
     assert info["gate_up_groups"] > 0
+
+
+def test_fp8_auto_is_rejected_instead_of_falling_back():
+    model = torch.nn.Sequential(BitLinear(32, 16), BitLinear(16, 16))
+    with pytest.raises(ValueError, match="bitlinear fp8 mode"):
+        set_bitlinear_fp8_mode(model, "auto")
+
+
+def test_unknown_fp8_mode_is_error():
+    with pytest.raises(ValueError, match="bitlinear fp8 mode"):
+        set_bitlinear_fp8_mode(BitLinear(16, 16), "fp4")
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_fp8_bwd_preserves_forward_and_produces_finite_gradients_cuda():
+    torch.manual_seed(0)
+    ref = BitLinear(32, 32, activation_precision="bf16").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    fp8 = BitLinear(32, 32, activation_precision="bf16").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    fp8.load_state_dict(ref.state_dict())
+    info = set_bitlinear_fp8_mode(fp8, "bwd")
+    assert info["mode"] == "bwd"
+
+    x_ref = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_fp8 = x_ref.detach().clone().requires_grad_(True)
+    y_ref = ref(x_ref)
+    y_fp8 = fp8(x_fp8)
+    assert torch.equal(y_fp8, y_ref)
+
+    y_ref.square().mean().backward()
+    y_fp8.square().mean().backward()
+    assert torch.isfinite(x_fp8.grad).all()
+    assert torch.isfinite(fp8.weight.grad).all()
+    assert torch.nn.functional.cosine_similarity(
+        x_fp8.grad.float().flatten(), x_ref.grad.float().flatten(), dim=0
+    ) > 0.98
+    assert torch.nn.functional.cosine_similarity(
+        fp8.weight.grad.float().flatten(), ref.weight.grad.float().flatten(), dim=0
+    ) > 0.98
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_fp8_unaligned_shape_is_error_instead_of_bf16_fallback_cuda():
+    layer = BitLinear(32, 32, activation_precision="bf16").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    set_bitlinear_fp8_mode(layer, "bwd")
+    x = torch.randn(15, 32, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="暗黙フォールバックは禁止"):
+        layer(x)
 
 
 def test_bias_is_rejected():

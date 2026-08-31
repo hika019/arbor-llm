@@ -1,22 +1,34 @@
-# Arbor v2 1B / 8192 bytes ニュース混合 continued pretraining
+# Arbor v2 既定学習設定: arbor2_1b_8k_filter
 #
-# 推奨:
-#   python -m src.train.train --config configs/arbor_1b_8k_news_mix.yaml \
-#     --init-from checkpoints/arbor2_1b_8k_filter/step_0000050000
-# 再開:
-#   python -m src.train.train --config configs/arbor_1b_8k_news_mix.yaml --resume latest
+# 新規:   python -m src.train.train --config configs/arbor.yaml
+# 再開:   python -m src.train.train --config configs/arbor.yaml --resume latest
 #
 # 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (8 bytes/patch)
 # なので global は 1024 patches。実効バッチは 64 seq = 524k bytes/update。
+#
+# このbranchの既定値はCUDA sm89+専用。非対応deviceへは暗黙フォールバックしない。
+# MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_fp8: off を明示する。
 
-run_name: arbor2_1b_8k_news_mix
+run_name: arbor2_1b_8k_filter
 seed: 42
+
+# model.patching_mode を entropy に変えた時だけ参照する。ByteLM の model 定義を
+# Arbor 側へ複製せず、このファイルから自動読込する。
+entropy_lm_config: entropy_lm.yaml
 
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
-  patching_mode: static         # choices: static | space | entropy
-  patch_size: 8                 # 1 patch = 8 bytes (静的)
-  max_bytes: 8192               # 学習 context (bytes) = 1024 patches
+  # patching_mode: 一定 byte で区切る (entropy 不使用) なら static のまま。
+  #   static  … patch_size byte 固定で区切る (これが「一定 byte 区切り」)
+  #   utf8    … UTF-8 文字境界で区切る (min/max_patch_len 有効)
+  #   space   … 空白/改行直後で区切る (min/max_patch_len 有効)
+  #   entropy … ByteLM の予測エントロピー閾値で区切る (entropy_lm_config 必須)
+  patching_mode: static         # choices: static | utf8 | space | entropy
+  patch_size: 8                 # static 専用: 1 patch = N byte。range: 1..max_bytes の約数
+  min_patch_len: 3              # utf8/space/entropy 専用。range: 1..max_patch_len
+  max_patch_len: 16             # utf8/space/entropy 専用。range: >=min_patch_len
+  entropy_threshold: 2.0        # entropy 専用: 次 byte H (nats)。range: >0 (小さいほど細切れ)
+  max_bytes: 8192               # 学習 context (bytes)。static では patch_size の倍数
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
   num_heads: 16
@@ -31,10 +43,29 @@ model:
   num_local_encoder_layers: 2
   num_local_decoder_layers: 4
   # ---- 共通 ----
-  rope_theta: 500000.0
+  # RoPE。global は max_patches (static 8k/patch8 = 1024) 位置しか見ないため、
+  # 128k 長文脈向けの theta=500000 は大半の次元の波長が文脈長を桁で超え、位置
+  # 分解能を潰す (#1: 長距離一貫性が育たない疑い)。系列長相応の値へ下げる。
+  #   A/B: 旧挙動へ戻すなら rope_theta_global を 500000.0 にする。
+  # local は patch 内 (static) / flat バイト列 (dynamic) を見るので従来値を維持。
+  rope_theta: 500000.0          # 個別未指定の層のfallback (= local に適用)
+  rope_theta_global: 10000.0    # #1: 1024 patch 位置に見合う theta
+  rope_theta_local: 500000.0    # local は従来どおり
   norm_eps: 1.0e-5
-  bitnet: true
+  bitnet: true                  # choices: true (W1.58/A8 BitNet) | false (FP debug)
+  # BitLinear の活性量子化 (重みは常に W1.58 ternary)。
+  #   int8 … BitNet 公式 A8 (per-token absmax int8)
+  #   bf8  … 8bit float (float8_e5m2) fake-quant
+  #   bf16 … 量子化しない (活性は計算 dtype のまま)
+  activation_precision: int8    # choices: int8 | bf8 | bf16
+                                # int8=BitNet公式A8。bf8(float8_e5m2)は仮数2bitで
+                                # 実データ学習が発散したため非推奨。
   gradient_checkpointing: false # OOM 時のみ true
+  # global(patch階層) attention 実装。文書 packing のマスクを SDPA 密マスクで課すと
+  # flash 経路を外れて遅い。CUDA では flex にすると BlockMask で fuse + native GQA。
+  #   sdpa … 全 device 対応。 flex … CUDA + torch.compile 必須。
+  # 非対応環境での暗黙フォールバックは禁止。必要なら明示的にsdpaへ変更する。
+  global_attn_impl: flex        # RTX 4090実測: sdpa比 +3.7% (FP8 bwd併用、8k context)
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
 # weight_bytes は行選択確率ではなく、document packing 後の実測 byte 比率に近づくよう
@@ -46,7 +77,7 @@ data:
       name: "jpn_Jpan"
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
-      weight_bytes: 0.485
+      weight_bytes: 0.465
       text_filter:
         preset: ja_web_v1
     - id: wikipedia_ja
@@ -54,7 +85,7 @@ data:
       name: "20231101.ja"
       revision: main
       license_policy: "CC BY-SA/GFDL attribution requirements"
-      weight_bytes: 0.12
+      weight_bytes: 0.19
     - id: aozora_modern
       path: "globis-university/aozorabunko-clean"
       revision: main
@@ -72,51 +103,23 @@ data:
       path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
-      weight_bytes: 0.16
+      weight_bytes: 0.12
     - id: fineweb_en
       path: "HuggingFaceFW/fineweb"
       revision: main
       license_policy: "dataset card terms; web crawl mixture"
-      weight_bytes: 0.06
+      weight_bytes: 0.05
     - id: finemath_4plus
       path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
       name: "finemath-4plus"
       revision: main
       license_policy: "dataset card terms; math web mixture"
-      weight_bytes: 0.05
-      text_filter:
-        preset: en_web_quality_v1
-    - id: github_code_filtered
-      path: "loubnabnl/github-code-more-filtering"  # license/generated/vendor/secret/dup filter 前提
-      text_column: "code"
-      revision: main
-      license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
       weight_bytes: 0.06
-    - id: opc_code_web
-      path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      revision: main
-      license_policy: "dataset card terms; code/web mixture"
-      weight_bytes: 0.015
       text_filter:
         preset: en_web_quality_v1
-    - id: news_ja
-      path: "atsushi3110/news-ja"       # 日本語ニュース JSONL (url, text)
-      revision: main
-      license_policy: "Apache-2.0 tag on HF; source/provenance should be sampled before public use"
-      weight_bytes: 0.015
-      text_filter:
-        preset: ja_web_v1
-        min_chars: 180
-        min_sentence_end_count: 2
-    - id: jawiki_news_paragraphs
-      path: "hpprc/jawiki-news-paragraphs" # Wikinews 段落。短すぎる項目は filter で落とす
-      revision: main
-      license_policy: "CC BY-SA 4.0"
-      weight_bytes: 0.01
-      text_filter:
-        preset: ja_web_v1
-        min_chars: 160
-        min_sentence_end_count: 2
+    # NOTE: コード系データ (旧 opc_code_web / OpenCoder-LLM/opc-fineweb-code-corpus) は
+    # 提供元が非公開化したため除外した。weight_bytes は正規化されるため、残りソースの
+    # 相対比はそのまま保たれる (除外分 0.09 は他ソースへ比例配分される)。
   streaming: true
   packing: document
   eos_token_id: 2
@@ -129,13 +132,26 @@ data:
 
 # ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
 optim:
-  optimizer: bnb_adamw_8bit     # choices: lion | bnb_adamw_8bit | adamw_fused
+  optimizer: adamw              # choices: adamw | lion
+  state_precision: fp32         # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
+                                # fp32=2 moment合計8B/parameter(既定・最も安定),
+                                # int8/bf8=合計2B/parameter(+block scale)。
+                                # 実データ1000-step A/B: fp32はloss 5.7->1.89で安定。
+                                # 旧int8(線形blockwise)/bf8はstep300-500で発散したため、
+                                # int8はdynamic codebook量子化へ改良済み(下記)。VRAMを
+                                # 節約したい時のみint8を選ぶ(fp32比で二次モーメントの
+                                # underflowを防ぐ非線形符号帳を使用)。
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  weight_decay: 0.1
+  weight_decay: 0.1             # stage1 の weight decay (two_stage では stage2 で切替)
   grad_clip: 1.0
-  scheduler: cosine_warmup
+  # BitNet 公式レシピ (2B4T) の 2 段構成: 前半 高LR+WD / 後半 低LR cooldown+WD=0。
+  #   A/B: 旧挙動へ戻すなら scheduler: cosine_warmup にする (下記 stage2_* は無視される)。
+  scheduler: two_stage          # choices: cosine_warmup | two_stage
+  stage2_start_ratio: 0.5       # two_stage: この比率で stage1->stage2 (cooldown) へ
+  stage2_peak_lr_ratio: 0.5     # two_stage: stage2 開始時の lr (ピーク比)。ここから min へ
+  weight_decay_stage2: 0.0      # two_stage: stage2 の weight decay (公式は 0)
   min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
@@ -143,13 +159,18 @@ optim:
 
 # ---- スループット ----
 speed:
-  precision: bf16               # choices: bf16 | fp16 | fp32
+  device: auto                  # choices: auto | cuda | mps | cpu
+  precision: bf16               # 計算dtype。choices: bf16 | fp16 | fp32
+                                # (bf8 は forward の float8 カーネルが無く非対応)
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
   cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
+  bitlinear_fp8: bwd            # choices: off | bwd | full。bwd/fullはsm89+ CUDA必須。
+                                # bwdはforwardを維持し、backward GEMMのみFP8化。
+                                # 非対応環境ではエラー。fullは追加丸めが乗り通常は非推奨。
   bitnet_weight_cache: auto    # grad_accum内の量子化重み再計算を1回に削減 (bench実測+12.6%throughput)
   bitnet_weight_cache_gib: 1.25
   bitnet_weight_cache_min_numel: 65536
@@ -187,20 +208,10 @@ validation:
       revision: main
       split: train
       skip_samples: 20000
-    code:
-      source: "loubnabnl/github-code-more-filtering"
-      text_column: "code"
-      revision: main
-      split: train
-      skip_samples: 20000
-    news_ja:
-      source: "atsushi3110/news-ja"
-      revision: main
-      split: train
-      skip_samples: 20000
+    # code ドメインは学習データ非公開化に伴い除外
 
 checkpoint:
-  dir: ./checkpoints/arbor2_1b_8k_news_mix   # 実体は /home/hi/checkpoints (ext4) へのsymlink。drvfs直書きは遅く破損クラッシュ実績あり
+  dir: ./checkpoints/arbor2_1b_8k_filter
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000

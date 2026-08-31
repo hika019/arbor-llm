@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data.text_filter import evaluate_text_filter
-from src.data.text_filter import resolve_text_filter_config
+from src.data.text_filter import evaluate_text_filter  # noqa: E402
+from src.data.text_filter import resolve_text_filter_config  # noqa: E402
 
 
 def _find_source(config: dict[str, Any], source_id: str) -> dict[str, Any]:
@@ -43,7 +43,7 @@ def _format_sample(kind: str, index: int, text: str, decision) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sample accepted/rejected documents for a text_filter source.")
-    parser.add_argument("--config", default="configs/arbor_1b_8k_utf8.yaml")
+    parser.add_argument("--config", default="configs/arbor.yaml")
     parser.add_argument("--source-id", default="fineweb2_ja")
     parser.add_argument("--accepted", type=int, default=5)
     parser.add_argument("--rejected", type=int, default=5)

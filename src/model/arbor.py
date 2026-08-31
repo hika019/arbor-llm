@@ -49,7 +49,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -60,6 +60,11 @@ BYTE_OFFSET = 4  # 生バイト b は token id (b + 4)
 
 # 動的 patching の local attention を窓化する際の chunk 長 (T はこの倍数のとき窓経路)
 _WINDOW_CHUNK = 128
+
+
+def _is_block_mask(m: object) -> bool:
+    """flex_attention の BlockMask かどうか (torch 未対応環境でも壊れないよう名前で判定)."""
+    return type(m).__name__ == "BlockMask"
 
 
 @dataclass
@@ -128,9 +133,24 @@ class ArborConfig:
     num_hidden_layers: int = 16
     # ---- 共通 ----
     rope_theta: float = 500000.0
+    # RoPE theta を階層別に上書きする (None なら rope_theta を使う)。
+    #   global は max_patches (static 8k/patch8 = 1024) 位置しか見ないため、
+    #   128k 長文脈向けの大きな theta は位置分解能を潰す (#1)。系列長相応に下げる。
+    #   local は patch 内 (static) / flat バイト列 (dynamic) を見る。
+    rope_theta_global: float | None = None
+    rope_theta_local: float | None = None
     norm_eps: float = 1e-5
     bitnet: bool = True            # False で全 Linear を nn.Linear に (debug 用)
+    activation_precision: str = "int8"  # BitLinear の活性量子化: int8 | bf8 | bf16
     gradient_checkpointing: bool = False
+    # packing='document' の EOS 区切り。global attention を文書内に閉じる
+    # (block-diagonal) ためのバイト ID。data.eos_token_id と一致させること。
+    eos_token_id: int = 2
+    # global (patch 階層) attention の実装。
+    #   sdpa … 既定。文書マスク時は密 (B,1,K,K) マスク + SDPA (flash 非対応経路)。
+    #   flex … CUDA 向け。文書境界を BlockMask にして flex_attention で fuse し、
+    #          GQA も native (KV repeat_interleave 不要)。torch>=2.5 / 主に CUDA 用。
+    global_attn_impl: str = "sdpa"  # choices: sdpa | flex
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArborConfig":
@@ -191,20 +211,28 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     return out.flatten(-2)
 
 
-def _make_linear(in_f: int, out_f: int, bitnet: bool) -> nn.Module:
+def _make_linear(in_f: int, out_f: int, bitnet: bool, activation_precision: str = "int8") -> nn.Module:
     if bitnet:
         from src.model.bitlinear import BitLinear
 
-        return BitLinear(in_f, out_f)
+        return BitLinear(in_f, out_f, activation_precision=activation_precision)
     lin = nn.Linear(in_f, out_f, bias=False)
     nn.init.trunc_normal_(lin.weight, std=0.02, a=-0.06, b=0.06)
     return lin
 
 
+def _activation_desc(precision: str) -> str:
+    return {
+        "int8": "A8(absmax per-token int8)",
+        "bf8": "bf8(float8_e5m2)",
+        "bf16": "bf16(no activation quant)",
+    }.get(precision, precision)
+
+
 class Attention(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, rope: RotaryEmbedding,
-        bitnet: bool, norm_eps: float, causal: bool,
+        bitnet: bool, norm_eps: float, causal: bool, activation_precision: str = "int8",
     ):
         super().__init__()
         if dim % n_heads != 0 or n_heads % n_kv_heads != 0:
@@ -214,10 +242,10 @@ class Attention(nn.Module):
         self.head_dim = dim // n_heads
         self.causal = causal
         self.rope = rope
-        self.wq = _make_linear(dim, n_heads * self.head_dim, bitnet)
-        self.wk = _make_linear(dim, n_kv_heads * self.head_dim, bitnet)
-        self.wv = _make_linear(dim, n_kv_heads * self.head_dim, bitnet)
-        self.wo = _make_linear(n_heads * self.head_dim, dim, bitnet)
+        self.wq = _make_linear(dim, n_heads * self.head_dim, bitnet, activation_precision)
+        self.wk = _make_linear(dim, n_kv_heads * self.head_dim, bitnet, activation_precision)
+        self.wv = _make_linear(dim, n_kv_heads * self.head_dim, bitnet, activation_precision)
+        self.wo = _make_linear(n_heads * self.head_dim, dim, bitnet, activation_precision)
         # SubLN: 出力射影の前に正規化 (BitNet 2B4T の attn_sub_norm)
         self.attn_sub_norm = RMSNorm(n_heads * self.head_dim, norm_eps)
 
@@ -259,10 +287,17 @@ class Attention(nn.Module):
         else:
             n_rep = 1
         native_gqa = n_rep > 1 and attn_mask is None and not is_incremental
-        if n_rep > 1 and not native_gqa:
+        use_flex = _is_block_mask(attn_mask)
+        if n_rep > 1 and not native_gqa and not use_flex:
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
-        if isinstance(attn_mask, WindowMask):
+        if use_flex:
+            # CUDA 向け fused 経路。文書境界 BlockMask で causal+doc を課し、GQA も
+            # native (KV は複製しない)。torch.compile 併用で fused kernel になる。
+            from torch.nn.attention.flex_attention import flex_attention
+
+            out = flex_attention(q, k, v, block_mask=attn_mask, enable_gqa=n_rep > 1)
+        elif isinstance(attn_mask, WindowMask):
             # 動的 patching 用 (窓経路): T×T を実体化しない
             out = _windowed_sdpa(q, k, v, attn_mask)
         elif attn_mask is not None:
@@ -281,11 +316,12 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     """ReLU² gated FFN (BitNet 2B4T): down(subln(relu(gate(x))^2 * up(x)))"""
 
-    def __init__(self, dim: int, hidden: int, bitnet: bool, norm_eps: float):
+    def __init__(self, dim: int, hidden: int, bitnet: bool, norm_eps: float,
+                 activation_precision: str = "int8"):
         super().__init__()
-        self.gate = _make_linear(dim, hidden, bitnet)
-        self.up = _make_linear(dim, hidden, bitnet)
-        self.down = _make_linear(hidden, dim, bitnet)
+        self.gate = _make_linear(dim, hidden, bitnet, activation_precision)
+        self.up = _make_linear(dim, hidden, bitnet, activation_precision)
+        self.down = _make_linear(hidden, dim, bitnet, activation_precision)
         self.ffn_sub_norm = RMSNorm(hidden, norm_eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -302,12 +338,14 @@ class Block(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, ffn_hidden: int,
         rope: RotaryEmbedding, bitnet: bool, norm_eps: float, causal: bool,
+        activation_precision: str = "int8",
     ):
         super().__init__()
         self.attn_norm = RMSNorm(dim, norm_eps)
-        self.attn = Attention(dim, n_heads, n_kv_heads, rope, bitnet, norm_eps, causal)
+        self.attn = Attention(dim, n_heads, n_kv_heads, rope, bitnet, norm_eps, causal,
+                              activation_precision)
         self.ffn_norm = RMSNorm(dim, norm_eps)
-        self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps)
+        self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps, activation_precision)
 
     def forward(
         self,
@@ -349,6 +387,7 @@ class ByteLM(nn.Module):
         max_bytes = cfg.get("max_bytes", 2048)
         bitnet = cfg.get("bitnet", False)
         norm_eps = cfg.get("norm_eps", 1e-5)
+        activation_precision = cfg.get("activation_precision", "int8")
         attention_window = cfg.get("attention_window")
         self.attention_window = None if attention_window is None else int(attention_window)
         if self.attention_window is not None and self.attention_window <= 0:
@@ -358,7 +397,8 @@ class ByteLM(nn.Module):
         self.embed = nn.Embedding(self.vocab_size, h)
         nn.init.trunc_normal_(self.embed.weight, std=0.02, a=-0.06, b=0.06)
         self.layers = nn.ModuleList(
-            Block(h, n_heads, n_kv, ffn, rope, bitnet, norm_eps, causal=True)
+            Block(h, n_heads, n_kv, ffn, rope, bitnet, norm_eps, causal=True,
+                  activation_precision=activation_precision)
             for _ in range(n_layers)
         )
         self.norm = RMSNorm(h, norm_eps)
@@ -525,6 +565,14 @@ class ArborModel(nn.Module):
         super().__init__()
         if cfg.patching_mode not in ("static", "utf8", "space", "entropy"):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
+        if cfg.global_attn_impl not in ("sdpa", "flex"):
+            raise ValueError(
+                f"unknown global_attn_impl: {cfg.global_attn_impl!r} "
+                "(choices: sdpa | flex; 暗黙フォールバックは禁止)"
+            )
+        from src.model.bitlinear import check_activation_precision
+
+        check_activation_precision(cfg.activation_precision)
         self.cfg = cfg
         self.dynamic = cfg.patching_mode != "static"
         self.profile_sections = False
@@ -544,18 +592,20 @@ class ArborModel(nn.Module):
         nn.init.trunc_normal_(self.byte_emb.weight, std=0.02, a=-0.06, b=0.06)
 
         # 動的モードの local 層は flat (B,T) で動くので RoPE は絶対バイト位置
+        theta_global = cfg.rope_theta_global if cfg.rope_theta_global is not None else cfg.rope_theta
+        theta_local = cfg.rope_theta_local if cfg.rope_theta_local is not None else cfg.rope_theta
         local_rope = RotaryEmbedding(
             dl // cfg.local_num_heads,
             cfg.max_bytes if self.dynamic else p,
-            cfg.rope_theta,
+            theta_local,
         )
-        global_rope = RotaryEmbedding(dg // cfg.num_heads, self.max_patches, cfg.rope_theta)
+        global_rope = RotaryEmbedding(dg // cfg.num_heads, self.max_patches, theta_global)
 
         # Local Encoder: patch 内 bidirectional (patch 表現は次 patch 以降でしか使わない)
         self.encoder_layers = nn.ModuleList(
             Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
                   cfg.local_intermediate_size, local_rope, cfg.bitnet, cfg.norm_eps,
-                  causal=False)
+                  causal=False, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_encoder_layers)
         )
         # patch 表現: static は concat 射影、動的は max-pool 後に射影 (FP)
@@ -568,7 +618,8 @@ class ArborModel(nn.Module):
 
         self.global_layers = nn.ModuleList(
             Block(dg, cfg.num_heads, cfg.num_kv_heads, cfg.intermediate_size,
-                  global_rope, cfg.bitnet, cfg.norm_eps, causal=True)
+                  global_rope, cfg.bitnet, cfg.norm_eps, causal=True,
+                  activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_hidden_layers)
         )
         self.global_norm = RMSNorm(dg, cfg.norm_eps)
@@ -578,7 +629,7 @@ class ArborModel(nn.Module):
         self.decoder_layers = nn.ModuleList(
             Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
                   cfg.local_intermediate_size, local_rope, cfg.bitnet, cfg.norm_eps,
-                  causal=True)
+                  causal=True, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_decoder_layers)
         )
         self.head_norm = RMSNorm(dl, cfg.norm_eps)
@@ -607,6 +658,76 @@ class ArborModel(nn.Module):
         if self.dynamic:
             return self._forward_dynamic(input_ids)
         return self._forward_static(input_ids)
+
+    # ------------------------------------------------ document boundary mask
+    def _byte_doc_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """各バイトが属する文書番号 (B, T) を返す.
+
+        packing='document' は文書を EOS 区切りで連結する。EOS の「次」の
+        バイトから文書番号が 1 増える (EOS 自身は直前の文書に属す)。判定は
+        過去バイトのみに依存するので causal (未来を見ない)。生バイトは +4
+        offset されており EOS/PAD と衝突しないため == 判定で一意に取れる。
+        """
+        prev_is_eos = F.pad(
+            input_ids == self.cfg.eos_token_id, (1, 0), value=False
+        )[:, :-1]
+        return prev_is_eos.to(torch.long).cumsum(dim=1)
+
+    def _global_doc_mask(self, patch_doc: torch.Tensor) -> torch.Tensor:
+        """global (patch 階層) 用の block-diagonal + causal マスク (B,1,K,K).
+
+        global は 1 patch 右シフト後の causal。出力位置 j (= patch j の文脈) が
+        key 位置 j' に attend できるのは:
+          - j'=0 (先頭の学習可能 BOS。文書非依存で常に許可。全マスク行を防ぐ)
+          - それ以外は key s[j'] = patch j'-1 が patch j と同一文書のときだけ。
+        これにより文書 B の patch が無関係な文書 A の patch へ attend しない。
+        新しい文書の先頭 patch は BOS のみを文脈に持つ (文脈リセット)。
+        """
+        b, k = patch_doc.shape
+        device = patch_doc.device
+        causal = torch.tril(torch.ones(k, k, dtype=torch.bool, device=device))
+        # key 側 doc: s[0]=BOS(=-1 番兵), s[j']=patch j'-1 の doc
+        key_doc = F.pad(patch_doc[:, :-1], (1, 0), value=-1)
+        same_doc = patch_doc.unsqueeze(2) == key_doc.unsqueeze(1)  # (B,K,K)
+        bos_col = torch.zeros(k, dtype=torch.bool, device=device)
+        bos_col[0] = True
+        allow = causal.unsqueeze(0) & (same_doc | bos_col.view(1, 1, k))
+        return allow.unsqueeze(1)  # (B,1,K,K)
+
+    def _global_mask(self, patch_doc: torch.Tensor):
+        """cfg.global_attn_impl に応じて global 用マスクを返す (sdpa=密, flex=BlockMask).
+
+        実装はconfigの指定をそのまま使い、deviceに応じた暗黙フォールバックはしない。
+        """
+        impl = self.cfg.global_attn_impl
+        if impl == "flex":
+            return self._global_flex_block_mask(patch_doc)
+        if impl == "sdpa":
+            return self._global_doc_mask(patch_doc)
+        raise RuntimeError(f"unsupported global_attn_impl at runtime: {impl!r}")
+
+    def _global_flex_block_mask(self, patch_doc: torch.Tensor):
+        """_global_doc_mask と同じ許可規則を flex_attention の BlockMask で表す.
+
+        密 (B,1,K,K) マスクを実体化せず、CUDA では fused kernel になる。
+        許可規則: causal (kv<=q) かつ (kv==0 の BOS or 同一文書)。key 位置 kv は
+        右シフト後の global 入力位置なので、その doc は patch_doc[kv-1] (kv>=1)。
+        """
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        pd = patch_doc
+        k = pd.shape[1]
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            causal = kv_idx <= q_idx
+            is_bos = kv_idx == 0
+            key_doc = pd[b, torch.clamp(kv_idx - 1, min=0)]
+            same = pd[b, q_idx] == key_doc
+            return causal & (is_bos | same)
+
+        return create_block_mask(
+            mask_mod, B=pd.shape[0], H=None, Q_LEN=k, KV_LEN=k, device=pd.device
+        )
 
     @torch.compiler.disable
     def _debug_context_contribution(
@@ -648,7 +769,9 @@ class ArborModel(nn.Module):
             h = self._maybe_ckpt(layer, h)
         patches = self.patch_proj(h.view(b, k, -1))        # (B, K, dg)
 
-        g = self._run_global(patches)                      # (B, K, dl)
+        # patch の doc 番号 = patch 先頭バイトの doc。global を文書内に閉じる。
+        patch_doc = self._byte_doc_ids(input_ids)[:, ::p]  # (B, K)
+        g = self._run_global(patches, self._global_mask(patch_doc))  # (B, K, dl)
 
         # Local Decoder: byte_emb[i] + h_patch(i) を patch 内 causal で
         d = x.view(b, k, p, -1) + g.unsqueeze(2)
@@ -750,9 +873,15 @@ class ArborModel(nn.Module):
             pooled = torch.where(torch.isinf(pooled), torch.zeros_like(pooled), pooled)
             patches = self.patch_proj(pooled)              # (B, K, dg)
 
-            # global は plain causal でよい: 右シフト後、位置 j は patch j-1 を保持し、
-            # 使われる query t (有効 patch) に対して pad patch は必ず j > t 側に落ちる
-            g = self._run_global(patches)                  # (B, K, dl)
+            # patch の doc 番号 = patch 内バイトの最小 doc (= 先頭バイトの doc)。
+            # pad patch (バイト無し) は番兵の大きな値のまま残り、どの実文書とも
+            # 一致しないので key/query として実文書へ漏れない。
+            byte_doc = self._byte_doc_ids(input_ids)       # (B, T)
+            patch_doc = torch.full((b, k), 1 << 30, dtype=torch.long, device=x.device)
+            patch_doc.scatter_reduce_(1, patch_id, byte_doc, reduce="amin", include_self=True)
+            # global を文書内に閉じる (block-diagonal + causal)。右シフト後、位置 j は
+            # patch j-1 を保持し、pad patch は必ず j > t 側に落ちる
+            g = self._run_global(patches, self._global_mask(patch_doc))  # (B, K, dl)
             h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
 
             # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
@@ -817,14 +946,20 @@ class ArborModel(nn.Module):
         section_ms["patch_id_max"] = float(patch_id.max().cpu() + 1)
         return section_ms
 
-    def _run_global(self, patches: torch.Tensor) -> torch.Tensor:
-        """1 patch 右シフト + causal global を回し、local 次元へ射影して返す."""
+    def _run_global(
+        self, patches: torch.Tensor, attn_mask: "torch.Tensor | None" = None
+    ) -> torch.Tensor:
+        """1 patch 右シフト + causal global を回し、local 次元へ射影して返す.
+
+        attn_mask を渡すと causal に加えて文書境界 (block-diagonal) を課す。
+        None のときは従来どおり plain causal (native GQA fast-path)。
+        """
         b = patches.size(0)
         g = torch.cat(
             (self.global_bos.to(patches.dtype).expand(b, 1, -1), patches[:, :-1]), dim=1
         )
         for layer in self.global_layers:
-            g = self._maybe_ckpt(layer, g)
+            g = self._maybe_ckpt(layer, g, attn_mask)
         return self.global_to_local(self.global_norm(g))
 
     def _maybe_ckpt(
@@ -1035,7 +1170,8 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
         f"entropy_lm={counts['entropy_model'] / 1e6:.1f}M) "
         f"patching={cfg.patching_mode} bitnet={'ON' if cfg.bitnet else 'OFF'} "
         f"bitlinear_layers={n_bit} "
-        "weights=W1.58(absmean ternary) activations=A8(absmax per-token) "
+        "weights=W1.58(absmean ternary) "
+        f"activations={_activation_desc(cfg.activation_precision)} "
         "subln=ON backward=STE(detach)"
     )
     return model
