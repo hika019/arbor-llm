@@ -1,14 +1,16 @@
 """Optimizer / LR scheduler ファクトリ。
 
 optimizer は `optim.optimizer` (adamw | lion) と `optim.state_precision`
-(fp32 | int8 | bf8) で選ぶ。state_precision は adamw の optimizer state dtype を表し、
+(fp32 | int8 | bf8) で選ぶ。state_precision は adamw の optimizer state形式を表し、
 全 parameter に一様に適用される (小さい層も除外しない)。指定した実装/精度が
 使えない場合に別 optimizer や別精度へ暗黙フォールバックしてはいけない。
-bf8 は 8bit 浮動小数 (torch.float8_e5m2)。moment を bf8 で保持し、演算は FP32。
+int8 は blockwise scale + 非線形dynamic符号帳、bf8 はfloat8_e5m2でmomentを保持し、
+更新演算はどちらもFP32で行う。
 """
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Iterable
 
 import torch
@@ -17,37 +19,87 @@ import torch
 _INT8_STATE_BLOCK_SIZE = 2048
 _BF8_DTYPE = torch.float8_e5m2  # E5M2: bf16 と同じ指数幅で range 重視の 8bit float
 
+# ---- dynamic (非線形) 8bit 符号帳 --------------------------------------------
+# 旧実装は blockwise absmax の「線形」int8 だった。二次モーメント (常に正で裾が重い)
+# を線形量子化すると、block 内の大きな要素が scale を支配し、小さな v が 0 へ
+# underflow する。すると denom=sqrt(v)+eps≈eps となり update=m/eps が爆発して発散した
+# (実データ A/B で確認)。bitsandbytes 8bit Adam と同様に、対数(指数)間隔の符号帳を使い
+# 相対精度を保ちつつ広いレンジを表現して underflow を避ける。
+#
+#   signed   … 一次モーメント用。[-1,1] を対数間隔 (0 を厳密表現)。zero index=127。
+#   unsigned … 二次モーメント用。[0,1] を対数間隔 (0 を厳密表現)。zero index=0。
+# 量子化は block absmax で [-1,1]/[0,1] に正規化してから最近傍符号へ丸める。
+_SIGNED_MIN_LOG10 = -16.0   # 一次モーメント: absmax の 1e-16 まで表現
+_UNSIGNED_MIN_LOG10 = -12.0  # 二次モーメント: absmax の 1e-12 まで表現 (二乗でレンジ広い)
+_SIGNED_ZERO_INDEX = 127
+_UNSIGNED_ZERO_INDEX = 0
 
-def _quantize_int8_state(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """blockwise signed int8 + FP32 scale に量子化する。
 
-    optimizer state 専用。scale=0 を避けるため scale に FP32 の最小正規値を使う。
-    量子化 state は実際に torch.int8 で保持し、更新時だけ FP32 に戻す。
-    """
+@lru_cache(maxsize=8)
+def _dynamic_codebook(signed: bool, device_str: str) -> torch.Tensor:
+    """昇順ソート済みの 256 要素符号帳を返す (端点は厳密に ±1 / 0 / 1)。"""
+    device = torch.device(device_str)
+    if signed:
+        mag_pos = torch.logspace(_SIGNED_MIN_LOG10, 0.0, steps=128, device=device)
+        mag_neg = torch.logspace(_SIGNED_MIN_LOG10, 0.0, steps=127, device=device)
+        codes = torch.cat([-mag_neg.flip(0), torch.zeros(1, device=device), mag_pos])
+    else:
+        mag = torch.logspace(_UNSIGNED_MIN_LOG10, 0.0, steps=255, device=device)
+        codes = torch.cat([torch.zeros(1, device=device), mag])
+    return codes.contiguous().float()
+
+
+def _quantize_dynamic_state(
+    x: torch.Tensor, *, signed: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """block absmax + 非線形符号帳で uint8 index へ量子化する。返り値 (index, scale)。"""
     flat = x.float().reshape(-1)
     n = flat.numel()
     pad = (-n) % _INT8_STATE_BLOCK_SIZE
     if pad:
         flat = torch.cat((flat, flat.new_zeros(pad)))
     blocks = flat.view(-1, _INT8_STATE_BLOCK_SIZE)
-    scales = (blocks.abs().amax(dim=1) / 127.0).clamp_min(
-        torch.finfo(torch.float32).tiny
-    )
-    q = (blocks / scales[:, None]).round().clamp(-127, 127).to(torch.int8)
+    scales = blocks.abs().amax(dim=1).clamp_min(torch.finfo(torch.float32).tiny)
+    norm = blocks / scales[:, None]  # signed:[-1,1] / unsigned:[0,1]
+    codes = _dynamic_codebook(signed, str(x.device))
+    # 最近傍符号: searchsorted で挟む 2 符号のうち近い方を選ぶ
+    idx = torch.searchsorted(codes, norm.reshape(-1).contiguous())
+    idx = idx.clamp_(1, codes.numel() - 1)
+    left = codes[idx - 1]
+    right = codes[idx]
+    take_left = (norm.reshape(-1) - left).abs() <= (right - norm.reshape(-1)).abs()
+    q = torch.where(take_left, idx - 1, idx).to(torch.uint8)
     return q.reshape(-1)[:n].reshape_as(x), scales
 
 
-def _dequantize_int8_state(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def _dequantize_dynamic_state(
+    q: torch.Tensor, scale: torch.Tensor, *, signed: bool
+) -> torch.Tensor:
+    codes = _dynamic_codebook(signed, str(q.device))
+    vals = codes[q.reshape(-1).long()]
     flat_scale = scale.repeat_interleave(_INT8_STATE_BLOCK_SIZE)[: q.numel()]
-    return (q.reshape(-1).float() * flat_scale).reshape_as(q)
+    return (vals * flat_scale).reshape_as(q)
+
+
+def _quantize_int8_state(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """後方互換用エイリアス: 一次モーメント (signed) の dynamic 量子化。"""
+    return _quantize_dynamic_state(x, signed=True)
+
+
+def _dequantize_int8_state(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """後方互換用エイリアス: 一次モーメント (signed) の dynamic 逆量子化。"""
+    return _dequantize_dynamic_state(q, scale, signed=True)
 
 
 class AdamW8bit(torch.optim.Optimizer):
-    """CUDA/MPS/CPU 共通の、INT8 state を持つ AdamW。
+    """CUDA/MPS/CPU 共通の、8bit state を持つ AdamW。
 
-    ``exp_avg`` と ``exp_avg_sq`` は signed INT8、2048 要素 block ごとに FP32
-    scale を持つ。演算時だけ FP32 に dequantize し、step 後に明示的に再量子化する。
-    パラメータ・勾配・BitNet の W1.58/A8 forward を別形式へ置換しない。
+    ``exp_avg`` (一次) と ``exp_avg_sq`` (二次) は 2048 要素 block ごとに FP32 scale を
+    持つ uint8 index として保持する。量子化は「線形」ではなく対数間隔の dynamic 符号帳
+    (`_dynamic_codebook`) を使う: 一次は signed、二次は unsigned。二次モーメントの小さな
+    値が underflow して denom≈eps → update 爆発する旧線形実装の発散を避ける。
+    演算時だけ FP32 に dequantize し、step 後に明示的に再量子化する。パラメータ・勾配・
+    BitNet の W1.58/A8 forward を別形式へ置換しない。
     """
 
     def __init__(
@@ -70,12 +122,21 @@ class AdamW8bit(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """PyTorch の parameter-dtype cast 後に、宣言した state dtype を復元する。"""
+        """dynamic uint8 stateを復元する。旧linear int8 stateは明示エラーにする."""
+        for raw_state in state_dict.get("state", {}).values():
+            for key in ("exp_avg", "exp_avg_sq"):
+                value = raw_state.get(key)
+                if torch.is_tensor(value) and value.dtype == torch.int8:
+                    raise ValueError(
+                        "旧linear-int8 optimizer stateはdynamic-int8と非互換です。"
+                        "optimizer stateを初期化して再開してください。"
+                        "暗黙変換は行いません"
+                    )
         super().load_state_dict(state_dict)
         for p, state in self.state.items():
             for key in ("exp_avg", "exp_avg_sq"):
                 if key in state:
-                    state[key] = state[key].to(device=p.device, dtype=torch.int8)
+                    state[key] = state[key].to(device=p.device, dtype=torch.uint8)
             for key in ("exp_avg_scale", "exp_avg_sq_scale"):
                 if key in state:
                     state[key] = state[key].to(device=p.device, dtype=torch.float32)
@@ -103,8 +164,11 @@ class AdamW8bit(torch.optim.Optimizer):
                 if len(state) == 0:
                     state["step"] = 0
                     n_blocks = math.ceil(p.numel() / _INT8_STATE_BLOCK_SIZE)
-                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.int8)
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.int8)
+                    # 一次モーメントの零は signed 符号帳の zero index、二次は unsigned の 0。
+                    state["exp_avg"] = torch.full_like(
+                        p, _SIGNED_ZERO_INDEX, dtype=torch.uint8
+                    )
+                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.uint8)
                     state["exp_avg_scale"] = torch.ones(
                         n_blocks, device=p.device, dtype=torch.float32
                     )
@@ -114,11 +178,11 @@ class AdamW8bit(torch.optim.Optimizer):
 
                 state["step"] += 1
                 step = state["step"]
-                exp_avg = _dequantize_int8_state(
-                    state["exp_avg"], state["exp_avg_scale"]
+                exp_avg = _dequantize_dynamic_state(
+                    state["exp_avg"], state["exp_avg_scale"], signed=True
                 )
-                exp_avg_sq = _dequantize_int8_state(
-                    state["exp_avg_sq"], state["exp_avg_sq_scale"]
+                exp_avg_sq = _dequantize_dynamic_state(
+                    state["exp_avg_sq"], state["exp_avg_sq_scale"], signed=False
                 )
                 grad32 = grad.float()
 
@@ -135,9 +199,11 @@ class AdamW8bit(torch.optim.Optimizer):
                 update = exp_avg.div(denom).mul_(lr / bias_correction1)
                 p.add_(update.to(dtype=p.dtype), alpha=-1.0)
 
-                state["exp_avg"], state["exp_avg_scale"] = _quantize_int8_state(exp_avg)
-                state["exp_avg_sq"], state["exp_avg_sq_scale"] = _quantize_int8_state(
-                    exp_avg_sq
+                state["exp_avg"], state["exp_avg_scale"] = _quantize_dynamic_state(
+                    exp_avg, signed=True
+                )
+                state["exp_avg_sq"], state["exp_avg_sq_scale"] = _quantize_dynamic_state(
+                    exp_avg_sq, signed=False
                 )
 
         return loss

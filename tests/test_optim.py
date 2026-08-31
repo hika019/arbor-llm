@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 
@@ -10,6 +12,10 @@ from src.train.optim import (
     build_optimizer,
     build_scheduler,
     resolve_state_precision,
+)
+from src.train.optim import (
+    _quantize_dynamic_state,
+    _dequantize_dynamic_state,
 )
 
 
@@ -39,7 +45,7 @@ def test_build_optimizer_accepts_lion():
     assert isinstance(opt, Lion)
 
 
-def test_adamw_8bit_keeps_moments_as_int8():
+def test_adamw_8bit_keeps_moments_as_uint8_indices():
     p = torch.nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
     opt = AdamW8bit([p], lr=1e-2, betas=(0.9, 0.95), weight_decay=0.1)
 
@@ -47,8 +53,8 @@ def test_adamw_8bit_keeps_moments_as_int8():
     opt.step()
 
     state = opt.state[p]
-    assert state["exp_avg"].dtype == torch.int8
-    assert state["exp_avg_sq"].dtype == torch.int8
+    assert state["exp_avg"].dtype == torch.uint8
+    assert state["exp_avg_sq"].dtype == torch.uint8
     assert state["exp_avg_scale"].dtype == torch.float32
     assert state["exp_avg_sq_scale"].dtype == torch.float32
     assert state["step"] == 1
@@ -118,8 +124,8 @@ def test_adamw_int8_state_precision_applies_to_every_parameter():
     opt.step()
 
     for p in parameters:
-        assert opt.state[p]["exp_avg"].dtype == torch.int8
-        assert opt.state[p]["exp_avg_sq"].dtype == torch.int8
+        assert opt.state[p]["exp_avg"].dtype == torch.uint8
+        assert opt.state[p]["exp_avg_sq"].dtype == torch.uint8
 
 
 def test_adamw_bf8_keeps_moments_as_float8():
@@ -188,12 +194,28 @@ def test_adamw_8bit_checkpoint_restore_preserves_state_dtypes():
     opt2.load_state_dict(opt.state_dict())
     state = opt2.state[p2]
 
-    assert state["exp_avg"].dtype == torch.int8
-    assert state["exp_avg_sq"].dtype == torch.int8
+    assert state["exp_avg"].dtype == torch.uint8
+    assert state["exp_avg_sq"].dtype == torch.uint8
     assert state["exp_avg_scale"].dtype == torch.float32
     assert state["exp_avg_sq_scale"].dtype == torch.float32
     p2.grad = torch.ones_like(p2)
     opt2.step()
+
+
+def test_adamw_8bit_rejects_legacy_linear_int8_checkpoint():
+    p = torch.nn.Parameter(torch.ones(4))
+    opt = AdamW8bit([p], lr=1e-2)
+    p.grad = torch.ones_like(p)
+    opt.step()
+    legacy = copy.deepcopy(opt.state_dict())
+    for state in legacy["state"].values():
+        state["exp_avg"] = state["exp_avg"].to(torch.int8)
+        state["exp_avg_sq"] = state["exp_avg_sq"].to(torch.int8)
+
+    p2 = torch.nn.Parameter(torch.ones(4))
+    opt2 = AdamW8bit([p2], lr=1e-2)
+    with pytest.raises(ValueError, match="旧linear-int8"):
+        opt2.load_state_dict(legacy)
 
 
 def test_legacy_optimizer_name_is_not_implicitly_converted():
@@ -228,6 +250,60 @@ def test_precision_must_be_selected_by_state_precision():
 
 def test_resolve_state_precision_rejects_unknown_value():
     assert resolve_state_precision("fp32") == "fp32"
+
+
+def test_dynamic_quant_preserves_small_second_moment_values():
+    """裾の重い二次モーメント: 大きな値と極小値が混在しても小値が0に潰れないこと."""
+    torch.manual_seed(0)
+    x = torch.empty(4096)
+    x[:] = 1e-6
+    x[0] = 1.0  # block absmax を支配する外れ値
+    x[10] = 3.2e-5
+    q, scale = _quantize_dynamic_state(x, signed=False)
+    recon = _dequantize_dynamic_state(q, scale, signed=False)
+    assert q.dtype == torch.uint8
+    # 旧線形実装では 1e-6/(1.0/127)=0 に underflow していた。dynamic では相対誤差で残る。
+    assert (recon[1:] > 0).all()
+    rel = (recon[1:] - x[1:]).abs() / x[1:]
+    assert rel.max() < 0.2, float(rel.max())
+
+
+def test_dynamic_quant_signed_roundtrip_relative_error():
+    torch.manual_seed(0)
+    x = torch.randn(4096) * torch.logspace(-6, 0, 4096)
+    q, scale = _quantize_dynamic_state(x, signed=True)
+    recon = _dequantize_dynamic_state(q, scale, signed=True)
+    mask = x.abs() > x.abs().max() * 1e-6
+    rel = (recon[mask] - x[mask]).abs() / x[mask].abs()
+    assert rel.max() < 0.2, float(rel.max())
+
+
+def test_adamw8bit_dynamic_tracks_fp32_on_heavy_tailed_grads():
+    """裾の重い勾配で AdamW8bit(dynamic) が AdamWFP32 に追随し発散しないこと."""
+    from src.train.optim import AdamWFP32
+
+    torch.manual_seed(0)
+    dim = 4096
+    target = torch.randn(dim)
+    scales = torch.logspace(-3, 1, dim)  # 座標ごとに勾配スケールが桁違い
+
+    def make():
+        return torch.nn.Parameter(torch.zeros(dim))
+
+    p8, pf = make(), make()
+    o8 = AdamW8bit([p8], lr=1e-2, betas=(0.9, 0.95), weight_decay=0.0)
+    of = AdamWFP32([pf], lr=1e-2, betas=(0.9, 0.95), weight_decay=0.0)
+    for _ in range(200):
+        g = (torch.randn(dim) + (p8.detach() - target)) * scales
+        p8.grad = g.clone()
+        pf.grad = g.clone()
+        o8.step()
+        of.step()
+    assert torch.isfinite(p8).all()
+    # dynamic 8bit が fp32 と大きく乖離せず、発散していないこと
+    denom = pf.detach().norm().clamp_min(1e-6)
+    rel = (p8.detach() - pf.detach()).norm() / denom
+    assert rel < 0.1, float(rel)
     assert resolve_state_precision("int8") == "int8"
     assert resolve_state_precision("bf8") == "bf8"
     with pytest.raises(ValueError, match="state_precision"):

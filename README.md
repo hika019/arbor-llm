@@ -41,20 +41,20 @@ bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer �
 - 学習は BF16 シャドウ重みの QAT。推論は BitLinear の dequant キャッシュで
   毎回の重み再量子化を省く。packed ternary Triton 経路は速度診断用の明示 opt-in。
 
-実測 (RTX 4090 / WSL2, torch 2.11+cu128, synthetic, `T=8192`,
-`micro_batch=2`, `grad_accum=32`, compile + weight cache + 本番AdamW8bit):
+実データ1000-step A/B (RTX 4090 / WSL2, torch 2.11+cu128, `T=8192`,
+`micro_batch=2`, `grad_accum=32`, peak LR 2e-4):
 
-- FP8無効: **92.6k bytes/s**, 5.662 sec/step, peak VRAM 14.1 GiB
-- `bitlinear_fp8=bwd`:
-  **98.2k bytes/s**, 5.339 sec/step, peak VRAM 12.2 GiB
+- `state_precision=fp32` (既定): loss **5.7 → 1.89**、EMA 1.96
+- 改良dynamic `state_precision=int8`: loss **5.7 → 1.90**、EMA 2.00
+- 旧linear int8 / 無スケールbf8: step 300–500で発散
 
-同条件で **throughput +6.0% / step時間 -5.7% / peak VRAM -1.9 GiB**。
-forward は従来BF16のままなので、追加丸めはbackward勾配だけに限定される。
+改良int8は二次モーメントを対数間隔のdynamic符号帳で保持し、外れ値と同一blockに
+ある小さな値が0へunderflowする問題を解消した。学習曲線はfp32とほぼ一致する。
+ただし現状は符号帳検索のoptimizer処理が重いため、既定は高速かつ安定なfp32。
+VRAM制約がある場合のみ改良int8を明示選択する。
 
-数値安定性は本番モデル形状・本番AdamW8bit・8K context・micro-batch 2で
-**1000 optimizer step** のsoakを実施し、loss 5.7031 → 5.5477、
-全parameter finiteを100 stepごとに確認した。旧`state_precision=bf8`はFP8無効でも
-lossが発散し、FP8 bwd併用時は811 stepでNaNになったため既定から除外した。
+`bitlinear_fp8=bwd`はforwardを従来BF16のまま維持し、backward GEMMだけをFP8化する。
+追加丸めはbackward勾配に限定される。
 
 データは日本語 (fineweb-2 ja / wikipedia ja / 青空文庫 / 法令) + 英語
 (fineweb-edu / fineweb) + 数学 (finemath) の streaming 行レベル混合。既定 config
@@ -103,8 +103,9 @@ PY
   `ModuleNotFoundError: No module named 'datasets'`:
   `pip install -r requirements.txt` が入っていない。HF streaming データセットを読む
   本走 config (`configs/arbor.yaml`) では `datasets` が必須。
-- optimizer state精度は `optim.state_precision: fp32 | int8` で選ぶ。
+- optimizer state精度は `optim.state_precision: fp32 | int8 | bf8` で選ぶ。
   小さい層を含む全parameterへ一様に適用し、別精度への暗黙フォールバックはしない。
+  `int8`はdynamic符号帳版。旧linear-int8 checkpointは非互換として明示エラーになる。
   BitNet本体は引き続きW1.58/A8 + floating shadow weightのQATであり、
   integer Parameterへ置換しない。
 
@@ -198,8 +199,9 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   FP8化する`full`は追加丸めと速度低下があり得るため既定では使わない。
 - `model.global_attn_impl: flex` は CUDA + `torch.compile` 必須。条件を満たさない
   場合はエラーになり、SDPAへ暗黙フォールバックしない。
-- `optim.state_precision: int8` はblockwise scale付きmomentを使う。無スケール
-  `bf8` stateは1000-step soakで発散を確認しており、実験用途以外では使わない。
+- `optim.state_precision: fp32` が既定。実データ1000-stepでloss 1.89まで安定して低下。
+  `int8`はblockwise scale + 非線形dynamic符号帳で、同じ1000-stepをloss 1.90で完走。
+  無スケール`bf8`は発散を確認しており、実験用途以外では使わない。
 - `speed.sync_each_step: false` が既定。毎 step の `torch.cuda.synchronize()` は行わず、
   ログ/保存など scalar 化が必要な箇所でのみ同期する。
 - ログの throughput は `bytes/s`。entropy/space patching では `patches/s`,

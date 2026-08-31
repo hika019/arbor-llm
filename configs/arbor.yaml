@@ -57,7 +57,9 @@ model:
   #   int8 … BitNet 公式 A8 (per-token absmax int8)
   #   bf8  … 8bit float (float8_e5m2) fake-quant
   #   bf16 … 量子化しない (活性は計算 dtype のまま)
-  activation_precision: bf8     # choices: int8 | bf8 | bf16
+  activation_precision: int8    # choices: int8 | bf8 | bf16
+                                # int8=BitNet公式A8。bf8(float8_e5m2)は仮数2bitで
+                                # 実データ学習が発散したため非推奨。
   gradient_checkpointing: false # OOM 時のみ true
   # global(patch階層) attention 実装。文書 packing のマスクを SDPA 密マスクで課すと
   # flash 経路を外れて遅い。CUDA では flex にすると BlockMask で fuse + native GQA。
@@ -131,10 +133,14 @@ data:
 # ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
 optim:
   optimizer: adamw              # choices: adamw | lion
-  state_precision: int8         # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
-                                # fp32=8B/要素, int8=blockwise 1B, bf8=float8_e5m2 1B
-                                # bf8は無スケールmomentが小勾配でunderflowし、1000-step
-                                # soakで発散/NaNを確認したため既定にしない。
+  state_precision: fp32         # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
+                                # fp32=2 moment合計8B/parameter(既定・最も安定),
+                                # int8/bf8=合計2B/parameter(+block scale)。
+                                # 実データ1000-step A/B: fp32はloss 5.7->1.89で安定。
+                                # 旧int8(線形blockwise)/bf8はstep300-500で発散したため、
+                                # int8はdynamic codebook量子化へ改良済み(下記)。VRAMを
+                                # 節約したい時のみint8を選ぶ(fp32比で二次モーメントの
+                                # underflowを防ぐ非線形符号帳を使用)。
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
