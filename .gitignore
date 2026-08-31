@@ -36,6 +36,8 @@ Thumbs.db
 # logs
 *.log
 nohup.out
+# torch profiler の chrome trace (数百MBの巨大バイナリ; 成果物なので追跡しない)
+logs/torch_profile_*.json
 
 .deps/*
 .torch_extensions/
