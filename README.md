@@ -54,7 +54,11 @@ bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer �
 VRAM制約がある場合のみ改良int8を明示選択する。
 
 `bitlinear_fp8=bwd`はforwardを従来BF16のまま維持し、backward GEMMだけをFP8化する。
-追加丸めはbackward勾配に限定される。
+`bitlinear_fp8=int8`はnativeな
+`A8 INT8 × ternary INT8 → INT32 accumulation` forwardを使い、backwardは
+optimizer step単位でcacheしたFP8 weightのN×K/K×N両layoutを使う。sm89+ (RTX
+4090/5090) で動く。既定 `configs/arbor.yaml` はこのint8経路 + patch_size=16 +
+固定dim mean pooling + local encoder/decoder=1/2層で構成している。
 
 データは日本語 (fineweb-2 ja / wikipedia ja / 青空文庫 / 法令) + 英語
 (fineweb-edu / fineweb) + 数学 (finemath) の streaming 行レベル混合。既定 config
@@ -76,6 +80,17 @@ source .venv/bin/activate
 pip install -U pip wheel setuptools
 pip install torch --index-url https://download.pytorch.org/whl/cu128   # CUDA 12.8
 pip install -r requirements.txt
+```
+
+この作業環境にはPython 3.13.15をproject-localにも導入している。既存のCUDA依存を
+持つ`.venv` (Python 3.12)は壊さず、3.13を選ぶ場合だけ次を使う:
+
+```bash
+source scripts/env313.sh
+python3.13 --version
+# 初回のみ:
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
 ```
 
 Apple SiliconではPyTorchの通常wheelを使用する:
@@ -137,8 +152,9 @@ free -h
 32GB級GPUに加えて十分な CPU RAM と安定した外向きネットワークが必要。小さな環境では
 `--dry-run` で1 stepだけ実行し、必要なら `speed.micro_batch_size` を下げる。
 
-検証済み環境: Python 3.12 / torch 2.5.1+cu121 / transformers 4.57+ / datasets 4.8
-(RTX 4090, WSL2)。`source scripts/env.sh` で venv +
+検証済み環境: Python 3.12 / torch 2.11+cu128 / transformers 4.57+ / datasets 4.8
+(RTX 4090, WSL2)。Python 3.13.15ではproject sourceの`compileall`を確認済みで、
+CUDA学習依存は上記手順で別途導入する。`source scripts/env.sh` で venv +
 CUDA アロケータ設定 (expandable_segments) + inductor 設定が入る。
 
 動的 patching の CUDA extension は初回実行時に `.torch_extensions/` へ JIT build

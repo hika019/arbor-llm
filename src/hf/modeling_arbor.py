@@ -21,7 +21,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutput
 
 _ARBOR_FIELDS = (
-    "vocab_size", "patch_size", "max_bytes",
+    "vocab_size", "patch_size", "patch_pooling", "max_bytes",
     "patching_mode", "min_patch_len", "max_patch_len",
     "entropy_threshold", "entropy_model",
     "hidden_size", "num_heads", "num_kv_heads", "intermediate_size",
@@ -32,7 +32,7 @@ _ARBOR_FIELDS = (
 )
 
 _ARBOR_DEFAULTS = dict(
-    vocab_size=260, patch_size=4, max_bytes=2048,
+    vocab_size=260, patch_size=4, patch_pooling="legacy", max_bytes=2048,
     patching_mode="static", min_patch_len=2, max_patch_len=16,
     entropy_threshold=1.5, entropy_model=None,
     hidden_size=2048, num_heads=16, num_kv_heads=4, intermediate_size=5632,

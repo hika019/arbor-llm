@@ -49,7 +49,7 @@ def main() -> None:
     ap.add_argument(
         "--bitlinear-fp8",
         default=None,
-        choices=["off", "bwd", "full"],
+        choices=["off", "bwd", "full", "int8"],
         help="既定は config speed.bitlinear_fp8",
     )
     ap.add_argument(
@@ -111,10 +111,18 @@ def main() -> None:
     speed_cfg = cfg.get("speed", {})
     from src.model.bitlinear import (
         configure_bitlinear_training_cache,
+        install_arbor_projection_fusions,
         refresh_bitlinear_training_cache,
         set_bitlinear_fp8_mode,
     )
 
+    fp8_mode = args.bitlinear_fp8
+    if fp8_mode is None:
+        fp8_mode = speed_cfg.get("bitlinear_fp8", "off")
+    if fp8_mode in (None, False):
+        fp8_mode = "off"
+    install_arbor_projection_fusions(model)
+    fp8_info = set_bitlinear_fp8_mode(model, str(fp8_mode))
     cache_mode = args.weight_cache
     if cache_mode is None:
         cache_mode = speed_cfg.get("bitnet_weight_cache", "auto")
@@ -130,12 +138,6 @@ def main() -> None:
         max_cache_gib=cache_gib,
         min_numel=int(speed_cfg.get("bitnet_weight_cache_min_numel", 65536)),
     )
-    fp8_mode = args.bitlinear_fp8
-    if fp8_mode is None:
-        fp8_mode = speed_cfg.get("bitlinear_fp8", "off")
-    if fp8_mode in (None, False):
-        fp8_mode = "off"
-    fp8_info = set_bitlinear_fp8_mode(model, str(fp8_mode))
     print(f"[bench] device={device} dtype={args.dtype} seq={seq} "
           f"micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
           f"global_attn_impl={mcfg.get('global_attn_impl','sdpa')} "
@@ -144,6 +146,7 @@ def main() -> None:
         "[bench] "
         f"weight_cache={cache_info['mode']} cached_layers={cache_info['cached_layers']} "
         f"cache={cache_info['cache_gib']:.2f}GiB "
+        f"format={cache_info['cache_format']} "
         f"fp8={fp8_info['mode']}"
     )
 

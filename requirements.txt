@@ -1,6 +1,7 @@
 # PyTorch は CUDA 版を別途インストールする (README 参照):
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-# 検証済み: torch 2.5.1+cu121 / Python 3.12 (RTX 4090, WSL2)
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# 学習検証済み: torch 2.11+cu128 / Python 3.12 (RTX 4090, WSL2)
+# Python 3.13.15: project-local interpreterでproject sourceのcompileall確認済み
 
 # ---- 学習コア ----
 pyyaml>=6.0          # config 読み込み

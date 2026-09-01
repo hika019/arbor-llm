@@ -118,6 +118,10 @@ def test_training_weight_cache_matches_uncached_forward_and_grad():
     y2.square().mean().backward()
     assert torch.allclose(x2.grad, x1.grad, atol=1e-5)
     assert torch.allclose(cached.weight.grad, uncached.weight.grad, atol=1e-5)
+    assert cached._train_w_int8.dtype == torch.int8
+    assert cached._train_w_scale.dtype == torch.float32
+    assert cached._train_w_fp8 is None
+    assert cached.training_cache_bytes < cached.weight.numel() * cached.weight.element_size()
 
 
 def test_bitlinear_group_matches_individual_projections():
@@ -219,6 +223,88 @@ def test_fp8_unaligned_shape_is_error_instead_of_bf16_fallback_cuda():
     x = torch.randn(15, 32, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="暗黙フォールバックは禁止"):
         layer(x)
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_native_int8_forward_and_fp8_backward_cuda():
+    torch.manual_seed(0)
+    ref = BitLinear(32, 32).to(device="cuda", dtype=torch.bfloat16)
+    native = BitLinear(32, 32).to(device="cuda", dtype=torch.bfloat16)
+    native.load_state_dict(ref.state_dict())
+    set_bitlinear_fp8_mode(native, "int8")
+    native.enable_training_weight_cache(True)
+
+    assert native._train_w_int8.dtype == torch.int8
+    assert native._train_w_fp8.dtype == torch.float8_e4m3fn
+    assert native._train_w_fp8_t.is_contiguous()
+    x_ref = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_native = x_ref.detach().clone().requires_grad_(True)
+    y_ref = ref(x_ref)
+    y_native = native(x_native)
+    torch.testing.assert_close(y_native.float(), y_ref.float(), atol=3e-3, rtol=3e-3)
+
+    y_ref.square().mean().backward()
+    y_native.square().mean().backward()
+    assert torch.isfinite(x_native.grad).all()
+    assert torch.isfinite(native.weight.grad).all()
+    assert torch.nn.functional.cosine_similarity(
+        x_native.grad.float().flatten(), x_ref.grad.float().flatten(), dim=0
+    ) > 0.98
+    assert torch.nn.functional.cosine_similarity(
+        native.weight.grad.float().flatten(), ref.weight.grad.float().flatten(), dim=0
+    ) > 0.98
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_arbor_native_int8_caches_all_layers_and_trains_cuda():
+    from src.model.arbor import ArborConfig, ArborModel
+
+    cfg = ArborConfig.from_dict(
+        dict(
+            vocab_size=260, patch_size=4, patch_pooling="mean", max_bytes=64,
+            hidden_size=32, num_heads=4, num_kv_heads=2, intermediate_size=64,
+            num_hidden_layers=1,
+            local_hidden_size=16, local_num_heads=2, local_num_kv_heads=2,
+            local_intermediate_size=32,
+            num_local_encoder_layers=1, num_local_decoder_layers=1,
+        )
+    )
+    model = ArborModel(cfg).to(device="cuda", dtype=torch.bfloat16).train()
+    from src.model.bitlinear import install_arbor_projection_fusions
+
+    install_arbor_projection_fusions(model)
+    set_bitlinear_fp8_mode(model, "int8")
+    info = configure_bitlinear_training_cache(
+        model,
+        enabled="full",
+        grad_accum_steps=2,
+        max_cache_gib=0.1,
+        min_numel=0,
+    )
+    assert info["cached_layers"] == info["eligible_layers"]
+    assert info["cache_format"] == "int8+fp8_dual_layout"
+    x = torch.randint(4, 260, (1, 64), device="cuda")
+    loss = model(x).logits.float().square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_native_int8_bitlinear_torch_compile_cuda():
+    layer = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16).train()
+    set_bitlinear_fp8_mode(layer, "int8")
+    layer.enable_training_weight_cache(True)
+    compiled = torch.compile(layer)
+    x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    loss = compiled(x).float().square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(layer.weight.grad).all()
 
 
 def test_bias_is_rejected():

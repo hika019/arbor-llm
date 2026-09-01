@@ -533,10 +533,13 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     if fp8_raw in (None, False):
         fp8_raw = "off"
     fp8_mode = str(fp8_raw).lower()
-    if fp8_mode not in {"off", "bwd", "full"}:
+    if fp8_mode == "native":
+        fp8_mode = "int8"
+        speed_cfg["bitlinear_fp8"] = "int8"
+    if fp8_mode not in {"off", "bwd", "full", "int8"}:
         raise ValueError(
             f"unknown speed.bitlinear_fp8: {fp8_mode!r} "
-            "(choices: off | bwd | full; auto/fallbackは禁止)"
+            "(choices: off | bwd | full | int8; auto/fallbackは禁止)"
         )
     if fp8_mode != "off" and device.type != "cuda":
         raise ValueError(
@@ -754,12 +757,20 @@ def main() -> int:
     try:
         from src.model.bitlinear import (
             configure_bitlinear_training_cache,
+            install_arbor_projection_fusions,
             refresh_bitlinear_training_cache,
+            set_bitlinear_fp8_mode,
         )
     except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
         refresh_bitlinear_training_cache = None
     else:
         speed_cfg = cfg.get("speed", {})
+        # modeを先に設定し、cache allocatorがINT8/FP8両layoutの実コストを使う。
+        install_arbor_projection_fusions(base_model)
+        fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
+        if fp8_raw in (None, False):
+            fp8_raw = "off"
+        fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
         bitnet_cache_info = configure_bitlinear_training_cache(
             base_model,
             enabled=speed_cfg.get("bitnet_weight_cache", "auto"),
@@ -774,17 +785,10 @@ def main() -> int:
             f"{bitnet_cache_info['eligible_layers']} "
             f"fused_groups={bitnet_cache_info['fused_groups']} "
             f"cache={bitnet_cache_info['cache_gib']:.2f}GiB "
+            f"format={bitnet_cache_info['cache_format']} "
             f"qkv_groups={bitnet_cache_info['qkv_groups']} "
             f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
         )
-        # FP8 GEMM は射影融合後に設定する (BitLinearGroup にも反映するため)。
-        # YAML 1.1 では裸の `off` が False になるので明示的に正規化する。
-        fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
-        if fp8_raw in (None, False):
-            fp8_raw = "off"
-        from src.model.bitlinear import set_bitlinear_fp8_mode
-
-        fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
         print(
             f"[train] bitlinear_fp8={fp8_info['mode']} "
             f"layers={fp8_info['layers']}"

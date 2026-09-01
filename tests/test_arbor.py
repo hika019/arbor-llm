@@ -58,6 +58,39 @@ def test_unknown_global_attention_impl_is_error():
         ArborModel(cfg)
 
 
+def test_unknown_patch_pooling_is_error():
+    cfg = ArborConfig.from_dict(dict(TINY, patch_pooling="attention"))
+    with pytest.raises(ValueError, match="patch_pooling"):
+        ArborModel(cfg)
+
+
+@pytest.mark.parametrize("pooling", ["mean", "max"])
+def test_fixed_dim_patch_pooling_is_patch_size_independent(pooling):
+    cfg4 = ArborConfig.from_dict(dict(TINY, patch_size=4, patch_pooling=pooling))
+    cfg8 = ArborConfig.from_dict(dict(TINY, patch_size=8, patch_pooling=pooling))
+    m4 = ArborModel(cfg4).eval()
+    m8 = ArborModel(cfg8).eval()
+    assert m4.patch_proj.in_features == TINY["local_hidden_size"]
+    assert m8.patch_proj.in_features == TINY["local_hidden_size"]
+    x = torch.randint(4, 260, (1, 32))
+    with torch.inference_mode():
+        assert m4(x).logits.shape == (1, 32, 260)
+        assert m8(x).logits.shape == (1, 32, 260)
+
+
+def test_dynamic_mean_patch_pooling_forward_and_grad():
+    cfg = ArborConfig.from_dict(
+        dict(tiny_cfg("space"), patch_pooling="mean")
+    )
+    m = ArborModel(cfg)
+    x = torch.randint(4, 260, (2, 30))
+    x[:, ::5] = 0x20 + 4
+    loss = m(x).logits.float().square().mean()
+    loss.backward()
+    assert m.patch_proj.weight.grad is not None
+    assert torch.isfinite(m.patch_proj.weight.grad).all()
+
+
 @pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
 def test_causality(mode, pos):
@@ -317,6 +350,21 @@ def test_generator_context_rebuild():
             logits = gen.push(4 + (i * 7) % 256)
     assert torch.isfinite(logits).all()
     assert len(gen.byte_ids) <= 16
+
+
+def test_generator_matches_full_forward_with_mean_pooling():
+    torch.manual_seed(5)
+    cfg = ArborConfig.from_dict(
+        dict(TINY, patch_size=8, patch_pooling="mean", max_bytes=32)
+    )
+    m = ArborModel(cfg).eval()
+    ids = torch.randint(4, 260, (24,))
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i, byte_id in enumerate(ids):
+            inc = gen.push(int(byte_id))
+            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
+            assert torch.allclose(inc, full, atol=2e-4)
 
 
 def test_byte_lm_forward_and_entropy():

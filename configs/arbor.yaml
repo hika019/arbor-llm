@@ -1,15 +1,15 @@
-# Arbor v2 既定学習設定: arbor2_1b_8k_filter
+# Arbor v2 既定low-bit学習設定: arbor2_1b_8k_lowbit
 #
 # 新規:   python -m src.train.train --config configs/arbor.yaml
 # 再開:   python -m src.train.train --config configs/arbor.yaml --resume latest
 #
-# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching (8 bytes/patch)
-# なので global は 1024 patches。実効バッチは 64 seq = 524k bytes/update。
+# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching
+# (16 bytes/patch) なので global は512 patches。実効バッチは64 seq=524k bytes/update。
 #
 # このbranchの既定値はCUDA sm89+専用。非対応deviceへは暗黙フォールバックしない。
 # MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_fp8: off を明示する。
 
-run_name: arbor2_1b_8k_filter
+run_name: arbor2_1b_8k_lowbit
 seed: 42
 
 # model.patching_mode を entropy に変えた時だけ参照する。ByteLM の model 定義を
@@ -24,7 +24,11 @@ model:
   #   space   … 空白/改行直後で区切る (min/max_patch_len 有効)
   #   entropy … ByteLM の予測エントロピー閾値で区切る (entropy_lm_config 必須)
   patching_mode: static         # choices: static | utf8 | space | entropy
-  patch_size: 8                 # static 専用: 1 patch = N byte。range: 1..max_bytes の約数
+  patch_size: 16                # static 専用: 1 patch = N byte。8192/16=512 global patches
+  # patch 表現の pooling。mean/max は patch_size 非依存の固定 local_hidden dim
+  # projection なので patch_size を変えても patch_proj shape が変わらない。
+  #   legacy … 旧挙動 (static=concat / dynamic=max)。旧 checkpoint 互換用。
+  patch_pooling: mean           # choices: legacy | mean | max
   min_patch_len: 3              # utf8/space/entropy 専用。range: 1..max_patch_len
   max_patch_len: 16             # utf8/space/entropy 専用。range: >=min_patch_len
   entropy_threshold: 2.0        # entropy 専用: 次 byte H (nats)。range: >0 (小さいほど細切れ)
@@ -40,16 +44,16 @@ model:
   local_num_heads: 12
   local_num_kv_heads: 12
   local_intermediate_size: 2048
-  num_local_encoder_layers: 2
-  num_local_decoder_layers: 4
+  num_local_encoder_layers: 1   # local は全 byte 位置で計算するため層を薄くして budget を global へ
+  num_local_decoder_layers: 2
   # ---- 共通 ----
-  # RoPE。global は max_patches (static 8k/patch8 = 1024) 位置しか見ないため、
+  # RoPE。global は max_patches (static 8k/patch16 = 512) 位置しか見ないため、
   # 128k 長文脈向けの theta=500000 は大半の次元の波長が文脈長を桁で超え、位置
   # 分解能を潰す (#1: 長距離一貫性が育たない疑い)。系列長相応の値へ下げる。
   #   A/B: 旧挙動へ戻すなら rope_theta_global を 500000.0 にする。
   # local は patch 内 (static) / flat バイト列 (dynamic) を見るので従来値を維持。
   rope_theta: 500000.0          # 個別未指定の層のfallback (= local に適用)
-  rope_theta_global: 10000.0    # #1: 1024 patch 位置に見合う theta
+  rope_theta_global: 10000.0    # #1: 512 patch 位置に見合う theta
   rope_theta_local: 500000.0    # local は従来どおり
   norm_eps: 1.0e-5
   bitnet: true                  # choices: true (W1.58/A8 BitNet) | false (FP debug)
@@ -168,14 +172,14 @@ speed:
   compile_mode: default         # choices: default | reduce-overhead | max-autotune
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
   cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
-  bitlinear_fp8: bwd            # choices: off | bwd | full。bwd/fullはsm89+ CUDA必須。
-                                # bwdはforwardを維持し、backward GEMMのみFP8化。
-                                # 非対応環境ではエラー。fullは追加丸めが乗り通常は非推奨。
-  bitnet_weight_cache: auto    # grad_accum内の量子化重み再計算を1回に削減 (bench実測+12.6%throughput)
-  bitnet_weight_cache_gib: 1.25
-  bitnet_weight_cache_min_numel: 65536
+  bitlinear_fp8: int8           # choices: off | bwd | full | int8。bwd/full/int8はsm89+ CUDA。
+                                # int8=A8 INT8×ternary INT8 forward + cached FP8 backward (本命)。
+                                # bwd=forward BF16 維持で backward のみ FP8。fullは追加丸めが乗る。
+  bitnet_weight_cache: full     # int8 は全 BitLinear の low-bit cache が必須
+  bitnet_weight_cache_gib: 3.25 # INT8 ternary + FP8(N×K/K×N)両layout用
+  bitnet_weight_cache_min_numel: 0
   sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
-  micro_batch_size: 2           # patch_size 8 で global 系列が半減するため 2 を本命にする
+  micro_batch_size: 2           # patch16 + local 1/2層で余裕があれば 4 も A/B 候補
   grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)。
                                 # それでも溢れる時は gradient_checkpointing: true + torch_compile: false
                                 # (compile×ckpt 併用は torch2.5 で NaN になるため train.py が弾く)
@@ -211,7 +215,7 @@ validation:
     # code ドメインは学習データ非公開化に伴い除外
 
 checkpoint:
-  dir: ./checkpoints/arbor2_1b_8k_filter
+  dir: ./checkpoints/arbor2_1b_8k_lowbit
   save_every_steps: 1000
   keep_last_k: 3
   keep_every_n_steps: 10000

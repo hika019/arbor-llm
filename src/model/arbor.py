@@ -111,6 +111,9 @@ class ArborConfig:
     # ---- patching ----
     patching_mode: str = "static"  # choices: static | utf8 | space | entropy
     patch_size: int = 4            # static 用: 1 patch のバイト数
+    # legacy: static=concat / dynamic=max (旧checkpoint互換)。
+    # mean/max: static/dynamic共通の固定 local_hidden dim pooling。
+    patch_pooling: str = "legacy"  # choices: legacy | mean | max
     min_patch_len: int = 2         # 動的用: これ未満では区切らない
     max_patch_len: int = 16        # 動的用: これに達したら強制的に区切る
     max_patches: int | None = None # 動的用: 固定 pad する patch 数。None なら worst-case
@@ -565,6 +568,11 @@ class ArborModel(nn.Module):
         super().__init__()
         if cfg.patching_mode not in ("static", "utf8", "space", "entropy"):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
+        if cfg.patch_pooling not in ("legacy", "mean", "max"):
+            raise ValueError(
+                f"unknown patch_pooling: {cfg.patch_pooling!r} "
+                "(choices: legacy | mean | max)"
+            )
         if cfg.global_attn_impl not in ("sdpa", "flex"):
             raise ValueError(
                 f"unknown global_attn_impl: {cfg.global_attn_impl!r} "
@@ -608,8 +616,14 @@ class ArborModel(nn.Module):
                   causal=False, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_encoder_layers)
         )
-        # patch 表現: static は concat 射影、動的は max-pool 後に射影 (FP)
-        self.patch_proj = nn.Linear(dl if self.dynamic else p * dl, dg, bias=False)
+        # 新構造ではstatic/dynamicとも固定dim pooling。legacyだけ旧checkpointの
+        # static concat projection shapeを維持する。
+        patch_input_dim = (
+            p * dl
+            if cfg.patch_pooling == "legacy" and not self.dynamic
+            else dl
+        )
+        self.patch_proj = nn.Linear(patch_input_dim, dg, bias=False)
         nn.init.trunc_normal_(self.patch_proj.weight, std=0.02, a=-0.06, b=0.06)
         # 右シフトの先頭 patch。ゼロ初期化禁止: 厳密ゼロ行は全層で 0 のまま伝播し、
         # RMSNorm backward の 1/sqrt(eps) 増幅が全層で複利になって勾配が overflow する
@@ -767,7 +781,14 @@ class ArborModel(nn.Module):
         h = x.view(b * k, p, -1)                           # patch 内 encoder
         for layer in self.encoder_layers:
             h = self._maybe_ckpt(layer, h)
-        patches = self.patch_proj(h.view(b, k, -1))        # (B, K, dg)
+        h_patch = h.view(b, k, p, -1)
+        if self.cfg.patch_pooling == "legacy":
+            pooled = h_patch.flatten(2)
+        elif self.cfg.patch_pooling == "mean":
+            pooled = h_patch.mean(dim=2)
+        else:
+            pooled = h_patch.amax(dim=2)
+        patches = self.patch_proj(pooled)                  # (B, K, dg)
 
         # patch の doc 番号 = patch 先頭バイトの doc。global を文書内に閉じる。
         patch_doc = self._byte_doc_ids(input_ids)[:, ::p]  # (B, K)
@@ -865,12 +886,25 @@ class ArborModel(nn.Module):
             for layer in self.encoder_layers:
                 h = self._maybe_ckpt(layer, h, enc_mask)
 
-            # patch ごとに max-pool して (B, K, dl) へ。pad patch は 0 埋め
-            # (decoder から一切 gather されないため勾配は流れない)
+            # patchごとの固定dim pooling。legacy dynamicは旧挙動(max)。
+            # pad patchは0埋めでdecoderからgatherされないため勾配は流れない。
             idx = patch_id.unsqueeze(-1).expand(-1, -1, h.size(-1))
-            pooled = h.new_full((b, k, h.size(-1)), float("-inf"))
-            pooled.scatter_reduce_(1, idx, h, reduce="amax", include_self=True)
-            pooled = torch.where(torch.isinf(pooled), torch.zeros_like(pooled), pooled)
+            if cfg.patch_pooling == "mean":
+                pooled = h.new_zeros((b, k, h.size(-1)))
+                pooled.scatter_add_(1, idx, h)
+                counts = h.new_zeros((b, k, 1))
+                counts.scatter_add_(
+                    1,
+                    patch_id.unsqueeze(-1),
+                    h.new_ones((b, t, 1)),
+                )
+                pooled = pooled / counts.clamp_min(1.0)
+            else:
+                pooled = h.new_full((b, k, h.size(-1)), float("-inf"))
+                pooled.scatter_reduce_(1, idx, h, reduce="amax", include_self=True)
+                pooled = torch.where(
+                    torch.isinf(pooled), torch.zeros_like(pooled), pooled
+                )
             patches = self.patch_proj(pooled)              # (B, K, dg)
 
             # patch の doc 番号 = patch 内バイトの最小 doc (= 先頭バイトの doc)。
@@ -1084,10 +1118,13 @@ class ArborByteGenerator:
         pos = 0 if not self.m.dynamic else self.cur_patch_start
         for layer in self.m.encoder_layers:
             x = layer(x, pos_offset=pos)
-        if self.m.dynamic:
-            patch_emb = self.m.patch_proj(x.amax(dim=1))     # max-pool (1, dg)
-        else:
+        pooling = self.cfg.patch_pooling
+        if pooling == "legacy" and not self.m.dynamic:
             patch_emb = self.m.patch_proj(x.reshape(1, -1))  # concat (1, dg)
+        elif pooling == "mean":
+            patch_emb = self.m.patch_proj(x.mean(dim=1))
+        else:
+            patch_emb = self.m.patch_proj(x.amax(dim=1))
         self._push_global(patch_emb.view(1, 1, -1))
         self.cur_patch_start += len(self.cur_patch)
         self.cur_patch = []
