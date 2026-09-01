@@ -169,12 +169,13 @@ speed:
   tf32_matmul: true
   cudnn_benchmark: true
   torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
-  compile_mode: default         # choices: default | reduce-overhead | max-autotune
+  compile_mode: default         # grad_accum>1: default|max-autotune-no-cudagraphs (CUDA Graph modeは禁止)
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
   cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
   bitlinear_fp8: int8           # choices: off | bwd | full | int8。bwd/full/int8はsm89+ CUDA。
                                 # int8=A8 INT8×ternary INT8 forward + cached FP8 backward (本命)。
                                 # bwd=forward BF16 維持で backward のみ FP8。fullは追加丸めが乗る。
+  bitlinear_int8_backend: auto  # choices: auto | int_mm | triton。5090では両者をA/Bする。
   bitnet_weight_cache: full     # int8 は全 BitLinear の low-bit cache が必須
   bitnet_weight_cache_gib: 3.25 # INT8 ternary + FP8(N×K/K×N)両layout用
   bitnet_weight_cache_min_numel: 0

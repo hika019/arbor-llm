@@ -546,6 +546,26 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             f"speed.bitlinear_fp8={fp8_mode} はCUDA専用です。"
             "暗黙フォールバックは行わないため、offを明示してください"
         )
+    int8_backend = str(speed_cfg.get("bitlinear_int8_backend", "auto")).lower()
+    if int8_backend not in {"auto", "int_mm", "triton"}:
+        raise ValueError(
+            f"unknown speed.bitlinear_int8_backend: {int8_backend!r} "
+            "(choices: auto | int_mm | triton)"
+        )
+    compile_mode = str(speed_cfg.get("compile_mode", "default"))
+    grad_accum = int(speed_cfg.get("grad_accum_steps", 1))
+    if (
+        device.type == "cuda"
+        and speed_cfg.get("torch_compile", True)
+        and grad_accum > 1
+        and compile_mode in {"reduce-overhead", "max-autotune"}
+    ):
+        raise ValueError(
+            f"speed.compile_mode={compile_mode} は CUDA Graphs を使うため "
+            f"grad_accum_steps>1 (={grad_accum}) と併用不可 "
+            "(gradient tensor 上書きで実行時クラッシュ)。"
+            "compile_mode=default か max-autotune-no-cudagraphs を使うこと"
+        )
     if device.type != "mps":
         return resolved
 
@@ -650,14 +670,26 @@ def apply_compile_settings(
     if not speed.get("torch_compile", True):
         print("[train] torch_compile=OFF")
         return model
+    # compile_mode=reduce-overhead / max-autotune は CUDA Graphs を有効にする。
+    # gradient accumulation では複数 microbatch の backward で同じ graph を replay し、
+    # 「CUDAGraphs が上書きした gradient tensor へアクセスした」実行時クラッシュを
+    # 起こす (compile_mode=max-autotune + grad_accum=16 で再現済み)。黙って走らせると
+    # accumulation 途中で落ちるので、config 段階で弾き cudagraph 無しの mode を案内する。
+    mode = speed.get("compile_mode", "default")
+    grad_accum = int(speed.get("grad_accum_steps", 1))
+    if grad_accum > 1 and mode in {"reduce-overhead", "max-autotune"}:
+        raise ValueError(
+            f"speed.compile_mode={mode} は CUDA Graphs を使うため grad_accum_steps>1 "
+            f"(={grad_accum}) と併用不可 (gradient tensor 上書きで実行時クラッシュ)。"
+            "compile_mode=default か max-autotune-no-cudagraphs を使うか、"
+            "grad_accum_steps=1 にすること"
+        )
     # torch.compile は Inductor→(CUDA|CPU) 前提。MPS backend は codegen が不安定で
     # 落ちる/遅い。compile は結果を変えない速度最適化なので、非 CUDA では
     # semantic を変えずに OFF にする (別 optimizer/精度への置換とは異なる)。
     if device.type != "cuda":
         print(f"[train] torch_compile=OFF (device={device.type}: CUDA 以外は非対応)")
         return model
-    mode = speed.get("compile_mode", "default")
-
     # torch 2.5 では compile × gradient_checkpointing の併用で最初の backward
     # から loss が NaN になる (1B/小モデル・窓/密マスク・モデル全体/層単位
     # compile の全組合せで再現を確認済み)。黙って走らせると run 全体が無駄に
@@ -760,6 +792,7 @@ def main() -> int:
             install_arbor_projection_fusions,
             refresh_bitlinear_training_cache,
             set_bitlinear_fp8_mode,
+            set_bitlinear_int8_backend,
         )
     except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
         refresh_bitlinear_training_cache = None
@@ -770,6 +803,9 @@ def main() -> int:
         fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
         if fp8_raw in (None, False):
             fp8_raw = "off"
+        int8_backend = set_bitlinear_int8_backend(
+            str(speed_cfg.get("bitlinear_int8_backend", "auto"))
+        )
         fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
         bitnet_cache_info = configure_bitlinear_training_cache(
             base_model,
@@ -791,7 +827,7 @@ def main() -> int:
         )
         print(
             f"[train] bitlinear_fp8={fp8_info['mode']} "
-            f"layers={fp8_info['layers']}"
+            f"int8_backend={int8_backend} layers={fp8_info['layers']}"
         )
 
     model = apply_compile_settings(model, cfg["speed"], device)
@@ -812,6 +848,13 @@ def main() -> int:
     else:
         data_cfg.setdefault("micro_batch_size", 4)
     data_cfg.setdefault("seed", cfg.get("seed", 42))
+    # static patching では document 境界を patch 境界へ align しないと、straddle patch
+    # 内で 2 文書が混ざり local 階層の document isolation が壊れる。model.patch_size を
+    # dataloader へ渡し、document packing 側で新文書を patch 境界から始めさせる。
+    # 動的 patching (utf8/space/entropy) は境界がデータ依存なので align しない。
+    model_cfg = cfg.get("model", {})
+    if str(model_cfg.get("patching_mode", "static")) == "static":
+        data_cfg.setdefault("patch_align", int(model_cfg.get("patch_size", 1)))
     # pinned host memory は CUDA の H2D 転送専用の最適化。非 CUDA では効果が無く
     # DataLoader が警告を出すだけなので、結果を変えない範囲で OFF にする。
     if device.type != "cuda" and data_cfg.get("pin_memory", False):
@@ -847,6 +890,8 @@ def main() -> int:
             val_data_cfg.setdefault("pin_memory", data_cfg.get("pin_memory", True))
             val_data_cfg.setdefault("micro_batch_size", val_micro_batch)
             val_data_cfg.setdefault("seed", cfg.get("seed", 42) + 10_000)
+            if "patch_align" in data_cfg:
+                val_data_cfg.setdefault("patch_align", data_cfg["patch_align"])
             validation_loaders[domain_name] = build_byte_dataloader(val_data_cfg, split="validation")
         # 初回 validation で読んだ batch を保持して再利用する (domain 毎 ~17MB)。
         # 2 回目以降はネットワークアクセス無し・毎回同一データで bpb を比較できる。

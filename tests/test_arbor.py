@@ -100,7 +100,7 @@ def test_causality(mode, pos):
     まとめて検証される (空白バイトを混ぜて境界が動く入力にする)。
     """
     torch.manual_seed(1)
-    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode))).eval()
     a = torch.randint(4, 260, (1, 32))
     a[0, ::5] = 0x20 + 4  # 空白を混ぜて space 境界を発生させる
     b = a.clone()
@@ -146,6 +146,31 @@ def test_document_attention_isolation(monkeypatch):
         lb_leak = m(b).logits
     assert not torch.allclose(la_leak[:, 8:], lb_leak[:, 8:], atol=1e-5), (
         "マスク無効化でも doc2 が不変。テストが leak を検出できていない"
+    )
+
+
+def test_document_isolation_with_padding_to_patch_boundary():
+    """短いdocをPADでpatch境界へ揃えた場合も、前文書が次文書へ漏れないこと.
+
+    patch_size=4, docA=[0,1,EOS], PAD=[3], docB starts at index 4。
+    packing側のpatch_align=4が生成する形を直接モデルへ通す regression test。
+    """
+    torch.manual_seed(7)
+    m = ArborModel(
+        ArborConfig.from_dict(dict(tiny_cfg("static"), patch_pooling="mean"))
+    ).eval()
+    a = torch.randint(4, 260, (1, 12))
+    a[0, 2] = 2  # doc A EOS
+    a[0, 3] = 3  # patch boundary までの alignment PAD
+    a[0, 9] = 2  # doc B EOS
+    b = a.clone()
+    b[0, 0] = (a[0, 0] - 4 + 1) % 256 + 4
+    with torch.inference_mode():
+        la = m(a).logits
+        lb = m(b).logits
+    assert not torch.allclose(la[:, :3], lb[:, :3], atol=1e-5)
+    assert torch.allclose(la[:, 4:], lb[:, 4:], atol=1e-5), (
+        "patch境界へalignしたdoc Aの変更がdoc Bへ漏れている"
     )
 
 

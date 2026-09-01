@@ -214,6 +214,63 @@ def test_document_packing_masks_cross_document_label(monkeypatch):
     assert sample["fill_ratio"].item() == 1.0
 
 
+def test_document_packing_aligns_new_document_to_patch_boundary(monkeypatch):
+    """patch_align>1 のとき、新 document は必ず patch 境界から始まる (P0 isolation)."""
+    ds = ByteStreamDataset(
+        sources=[{"path": "a", "weight_bytes": 1.0}],
+        context_length=8,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+        patch_align=4,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: ([[{"text": "abc"}, {"text": "de"}]], [{"path": "a", "weight_bytes": 1.0}]),
+    )
+
+    sample = next(ds._iter_hf_document_packed())
+    ids = sample["input_ids"].tolist()
+    # docA(abc)+EOS = 4 byte でちょうど patch 境界。次の PAD 無しで docB が index 4 から。
+    assert ids[:4] == [ord("a"), ord("b"), ord("c"), 2]
+    # docA+EOS が既に境界に揃うので PAD は挿入されず docB が index 4 (patch 境界) から
+    assert ids[4] == ord("d")
+    assert ids[5] == ord("e")
+
+
+def test_document_packing_pads_short_document_to_patch_boundary(monkeypatch):
+    """EOS が patch 境界に揃わないとき PAD で境界まで埋め、次文書を境界から開始する."""
+    ds = ByteStreamDataset(
+        sources=[{"path": "a", "weight_bytes": 1.0}],
+        context_length=12,
+        byte_offset=0,
+        packing="document",
+        eos_token_id=2,
+        pad_token_id=3,
+        patch_align=4,
+    )
+    monkeypatch.setattr(
+        ds,
+        "_build_hf_source_streams",
+        lambda: ([[{"text": "ab"}, {"text": "cd"}]], [{"path": "a", "weight_bytes": 1.0}]),
+    )
+
+    sample = next(ds._iter_hf_document_packed())
+    ids = sample["input_ids"].tolist()
+    labels = sample["labels"].tolist()
+    # docA "ab"+EOS = 3 byte → patch_align=4 まで PAD 1 個埋め、docB は index 4 から。
+    # pack: [a,b,EOS,PAD, c,d,EOS, ...]; context_length+1=13 を 12 で切り出す。
+    assert ids[:4] == [ord("a"), ord("b"), 2, 3]
+    assert ids[4] == ord("c")           # docB が patch 境界 (index 4) から開始
+    assert ids[5] == ord("d")
+    # 各 patch(4byte) は 1 文書のみ: patch0=docA+PAD, patch1=docB。境界跨ぎ無し。
+    # PAD 位置と、PAD→docB を予測する transition の label は学習対象外 (-100)。
+    assert labels[2] == -100            # EOS→PAD
+    assert labels[3] == -100            # PAD→docB 先頭 (boundary mask)
+
+
 def test_ja_web_text_filter_accepts_paragraph_text():
     text = 3 * (
         "日本の四季には春、夏、秋、冬があり、それぞれに異なる気候と風景があります。"

@@ -113,6 +113,42 @@ def test_fp8_on_non_cuda_is_error():
         adapt_config_for_device(cfg, torch.device("cpu"))
 
 
+def test_unknown_int8_backend_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_int8_backend": "cutlass"},
+    }
+    with pytest.raises(ValueError, match="bitlinear_int8_backend"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+@pytest.mark.parametrize("compile_mode", ["reduce-overhead", "max-autotune"])
+def test_cuda_graph_compile_modes_reject_gradient_accumulation(compile_mode):
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "torch_compile": True,
+            "compile_mode": compile_mode,
+            "grad_accum_steps": 16,
+        },
+    }
+    with pytest.raises(ValueError, match="CUDA Graphs.*grad_accum_steps"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+@pytest.mark.parametrize("compile_mode", ["default", "max-autotune-no-cudagraphs"])
+def test_non_cudagraph_compile_modes_allow_gradient_accumulation(compile_mode):
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "torch_compile": True,
+            "compile_mode": compile_mode,
+            "grad_accum_steps": 16,
+        },
+    }
+    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+
+
 def test_entropy_model_config_is_loaded_from_single_reference(tmp_path):
     entropy_path = tmp_path / "entropy_lm.yaml"
     entropy_path.write_text(

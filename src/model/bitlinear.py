@@ -229,13 +229,13 @@ if triton is not None:
         amax = tl.max(tl.abs(x), axis=0)
         inv_scale = tl.maximum(amax / 127.0, 1.0e-5 / 127.0)
         scaled = x / inv_scale
-        # 外部libdevice aliasはtorch.compileのTriton source抽出で失われるため、
-        # kernel内演算だけでround-to-nearestを行う。
-        q = tl.where(
-            scaled >= 0,
-            tl.floor(scaled + 0.5),
-            tl.ceil(scaled - 0.5),
-        )
+        # torch.round と同じ round-half-to-even にする (既定 fake-quant path の
+        # (x*scale).round() と rounding 規則を一致させる)。外部 libdevice alias は
+        # torch.compile の Triton source 抽出で失われるため kernel 内演算だけで行う。
+        nearest = tl.floor(scaled + 0.5)
+        is_tie = (nearest - scaled) == 0.5
+        is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
+        q = tl.where(is_tie & is_odd, nearest - 1.0, nearest)
         q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
         tl.store(q_ptr + row * stride_qm + offs, q, mask=mask)
         tl.store(inv_scale_ptr + row, inv_scale)
@@ -364,8 +364,19 @@ def _int8_linear(
     # PyTorchのCUDA INT8 GEMM dispatcherはcuBLASLt/CUTLASSのdevice最適kernelを
     # 選び、手書きTritonよりAda実測で高速。公開APIがまだ無いため局所wrapperに
     # 隔離し、未提供buildでは下のTriton kernelへ戻す。
-    # CUDA _int_mm currently rejects M<=16; small local/global batches use Triton.
-    if hasattr(torch, "_int_mm") and x_int8.size(0) > 16:
+    backend = _int8_backend
+    use_int_mm = (
+        backend in {"auto", "int_mm"}
+        and hasattr(torch, "_int_mm")
+        and x_int8.size(0) > 16
+    )
+    # CUDA _int_mm currently rejects M<=16; autoではsmall MをTritonへ送る。
+    if backend == "int_mm" and not use_int_mm:
+        raise RuntimeError(
+            "bitlinear_int8_backend=int_mm requires torch._int_mm and M>16; "
+            f"got M={x_int8.size(0)}"
+        )
+    if use_int_mm:
         acc = torch._int_mm(x_int8, w_int8.t())
         return (
             acc.float()
@@ -455,6 +466,23 @@ class _CachedBitLinearGroupSTE(torch.autograd.Function):
 _FP8_E4M3 = torch.float8_e4m3fn
 _FP8_MAX = 448.0  # e4m3fn の最大有限値
 _FP8_MODES = ("off", "bwd", "full", "int8")
+_INT8_BACKENDS = ("auto", "int_mm", "triton")
+_int8_backend = "auto"
+
+
+def set_bitlinear_int8_backend(backend: str) -> str:
+    """native INT8 forward backendを選ぶ (process-global, compile前に設定)."""
+    global _int8_backend
+    normalized = str(backend).lower().replace("-", "_")
+    if normalized not in _INT8_BACKENDS:
+        raise ValueError(
+            f"unknown bitlinear int8 backend: {backend!r} "
+            f"(choices: {_INT8_BACKENDS})"
+        )
+    if normalized == "triton" and triton is None:
+        raise RuntimeError("bitlinear int8 backend=triton には Triton が必要です")
+    _int8_backend = normalized
+    return normalized
 
 
 def fp8_gemm_supported() -> bool:

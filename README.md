@@ -59,6 +59,16 @@ VRAM制約がある場合のみ改良int8を明示選択する。
 optimizer step単位でcacheしたFP8 weightのN×K/K×N両layoutを使う。sm89+ (RTX
 4090/5090) で動く。既定 `configs/arbor.yaml` はこのint8経路 + patch_size=16 +
 固定dim mean pooling + local encoder/decoder=1/2層で構成している。
+INT8 GEMMは`speed.bitlinear_int8_backend: auto|int_mm|triton`でA/Bできる。
+
+`data.packing=document`かつstatic patchingでは、dataloaderが新しいdocumentを
+`model.patch_size`境界へPAD alignする。これによりlocal encoder/decoderでも
+document境界を跨ぐpatchを作らない。また新document先頭ではglobal residual入力も
+BOSへresetし、attention mask外のresidual経路から前文書が漏れるのを防ぐ。
+
+`grad_accum_steps>1`ではCUDA Graphsを使う`compile_mode=reduce-overhead`および
+`max-autotune`を起動時に拒否する。`default`または
+`max-autotune-no-cudagraphs`を使う。
 
 データは日本語 (fineweb-2 ja / wikipedia ja / 青空文庫 / 法令) + 英語
 (fineweb-edu / fineweb) + 数学 (finemath) の streaming 行レベル混合。既定 config

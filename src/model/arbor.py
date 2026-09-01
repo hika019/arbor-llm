@@ -792,7 +792,9 @@ class ArborModel(nn.Module):
 
         # patch の doc 番号 = patch 先頭バイトの doc。global を文書内に閉じる。
         patch_doc = self._byte_doc_ids(input_ids)[:, ::p]  # (B, K)
-        g = self._run_global(patches, self._global_mask(patch_doc))  # (B, K, dl)
+        g = self._run_global(
+            patches, self._global_mask(patch_doc), patch_doc
+        )  # (B, K, dl)
 
         # Local Decoder: byte_emb[i] + h_patch(i) を patch 内 causal で
         d = x.view(b, k, p, -1) + g.unsqueeze(2)
@@ -915,7 +917,9 @@ class ArborModel(nn.Module):
             patch_doc.scatter_reduce_(1, patch_id, byte_doc, reduce="amin", include_self=True)
             # global を文書内に閉じる (block-diagonal + causal)。右シフト後、位置 j は
             # patch j-1 を保持し、pad patch は必ず j > t 側に落ちる
-            g = self._run_global(patches, self._global_mask(patch_doc))  # (B, K, dl)
+            g = self._run_global(
+                patches, self._global_mask(patch_doc), patch_doc
+            )  # (B, K, dl)
             h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
 
             # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
@@ -981,17 +985,27 @@ class ArborModel(nn.Module):
         return section_ms
 
     def _run_global(
-        self, patches: torch.Tensor, attn_mask: "torch.Tensor | None" = None
+        self,
+        patches: torch.Tensor,
+        attn_mask: "torch.Tensor | None" = None,
+        patch_doc: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """1 patch 右シフト + causal global を回し、local 次元へ射影して返す.
 
         attn_mask を渡すと causal に加えて文書境界 (block-diagonal) を課す。
+        patch_doc を渡すと新文書先頭の右シフト入力をBOSへresetし、前文書patchが
+        residual streamへ直接残る経路も遮断する。
         None のときは従来どおり plain causal (native GQA fast-path)。
         """
         b = patches.size(0)
-        g = torch.cat(
-            (self.global_bos.to(patches.dtype).expand(b, 1, -1), patches[:, :-1]), dim=1
-        )
+        bos = self.global_bos.to(patches.dtype).expand(b, 1, -1)
+        g = torch.cat((bos, patches[:, :-1]), dim=1)
+        if patch_doc is not None:
+            # attention maskだけでは、右シフト後の residual stream g[j]=patch[j-1] に
+            # 前文書のpatch表現が残る。新文書先頭では入力自体をBOSへ置換し、
+            # local→global residual経由のdocument leakも遮断する。
+            new_doc = F.pad(patch_doc[:, 1:] != patch_doc[:, :-1], (1, 0), value=True)
+            g = torch.where(new_doc.unsqueeze(-1), bos, g)
         for layer in self.global_layers:
             g = self._maybe_ckpt(layer, g, attn_mask)
         return self.global_to_local(self.global_norm(g))

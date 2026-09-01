@@ -14,6 +14,7 @@ from src.model.bitlinear import (
     configure_bitlinear_training_cache,
     fp8_gemm_supported,
     set_bitlinear_fp8_mode,
+    set_bitlinear_int8_backend,
     weight_quant,
 )
 
@@ -183,6 +184,12 @@ def test_unknown_fp8_mode_is_error():
         set_bitlinear_fp8_mode(BitLinear(16, 16), "fp4")
 
 
+def test_unknown_int8_backend_is_error():
+    with pytest.raises(ValueError, match="int8 backend"):
+        set_bitlinear_int8_backend("cutlass")
+    assert set_bitlinear_int8_backend("auto") == "auto"
+
+
 @pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
 def test_fp8_bwd_preserves_forward_and_produces_finite_gradients_cuda():
     torch.manual_seed(0)
@@ -305,6 +312,24 @@ def test_native_int8_bitlinear_torch_compile_cuda():
     assert torch.isfinite(loss)
     assert torch.isfinite(x.grad).all()
     assert torch.isfinite(layer.weight.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_a8_quantize_rows_uses_round_half_to_even_cuda():
+    from src.model.bitlinear import _quantize_a8_rows
+
+    # amax=127 の行なので inv_scale=1.0。scaled は入力そのままで tie を作る。
+    x = torch.tensor(
+        [[0.5, 1.5, 2.5, 3.5, 127.0, -0.5, -1.5, -2.5]],
+        device="cuda", dtype=torch.float32,
+    )
+    q, inv_scale = _quantize_a8_rows(x)
+    # torch.round と同じ ties-to-even: 0.5->0, 1.5->2, 2.5->2, 3.5->4, -0.5->0, -1.5->-2, -2.5->-2
+    assert q[0].tolist() == [0, 2, 2, 4, 127, 0, -2, -2]
+    torch.testing.assert_close(inv_scale, torch.ones(1, device="cuda"))
+    # 参照 (x*scale).round() と bit 一致することも確認
+    ref = (x * (127.0 / x.abs().amax(dim=-1, keepdim=True))).round().clamp(-128, 127)
+    torch.testing.assert_close(q.float(), ref, atol=0, rtol=0)
 
 
 def test_bias_is_rejected():
