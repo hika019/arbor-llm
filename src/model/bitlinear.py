@@ -218,14 +218,13 @@ if triton is not None:
     def _a8_quantize_rows_kernel(
         x_ptr, q_ptr, inv_scale_ptr,
         m: tl.constexpr, k: tl.constexpr,
-        stride_xm: tl.constexpr, stride_qm: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
         """1 program/row で absmax reduction と INT8 write をまとめる."""
         row = tl.program_id(0)
         offs = tl.arange(0, BLOCK_K)
         mask = offs < k
-        x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + row * k + offs, mask=mask, other=0.0).to(tl.float32)
         amax = tl.max(tl.abs(x), axis=0)
         inv_scale = tl.maximum(amax / 127.0, 1.0e-5 / 127.0)
         scaled = x / inv_scale
@@ -237,15 +236,13 @@ if triton is not None:
         is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
         q = tl.where(is_tie & is_odd, nearest - 1.0, nearest)
         q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
-        tl.store(q_ptr + row * stride_qm + offs, q, mask=mask)
+        tl.store(q_ptr + row * k + offs, q, mask=mask)
         tl.store(inv_scale_ptr + row, inv_scale)
 
     @triton.jit
     def _int8_bitlinear_kernel(
         x_ptr, w_ptr, inv_sx_ptr, sw_ptr, y_ptr,
         m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
-        stride_xm: tl.constexpr, stride_wn: tl.constexpr,
-        stride_ym: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
         """A8 INT8 × ternary INT8 -> INT32 accumulate -> scaled output."""
@@ -259,12 +256,12 @@ if triton is not None:
         for k0 in range(0, k, BLOCK_K):
             k_idx = k0 + offs_k
             x = tl.load(
-                x_ptr + offs_m[:, None] * stride_xm + k_idx[None, :],
+                x_ptr + offs_m[:, None] * k + k_idx[None, :],
                 mask=(offs_m[:, None] < m) & (k_idx[None, :] < k),
                 other=0,
             )
             w = tl.load(
-                w_ptr + offs_n[None, :] * stride_wn + k_idx[:, None],
+                w_ptr + offs_n[None, :] * k + k_idx[:, None],
                 mask=(offs_n[None, :] < n) & (k_idx[:, None] < k),
                 other=0,
             )
@@ -274,7 +271,7 @@ if triton is not None:
         sw = tl.load(sw_ptr + offs_n, mask=offs_n < n, other=0.0)
         y = acc.to(tl.float32) * inv_sx[:, None] * sw[None, :]
         tl.store(
-            y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :],
+            y_ptr + offs_m[:, None] * n + offs_n[None, :],
             y,
             mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
         )
@@ -283,7 +280,6 @@ if triton is not None:
     def _fp8_cast_transpose_kernel(
         x_ptr, out_ptr, scale_ptr,
         rows: tl.constexpr, cols: tl.constexpr,
-        stride_xr: tl.constexpr, stride_or: tl.constexpr,
         BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr,
     ):
         """tensorwise FP8 cast を transpose layout へ直接 write する."""
@@ -293,7 +289,7 @@ if triton is not None:
         c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         mask = (r[:, None] < rows) & (c[None, :] < cols)
         x = tl.load(
-            x_ptr + r[:, None] * stride_xr + c[None, :],
+            x_ptr + r[:, None] * cols + c[None, :],
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -301,7 +297,7 @@ if triton is not None:
         q = tl.maximum(-448.0, tl.minimum(448.0, x / scale))
         # out は (cols, rows) row-major。store時にFP8へcastされる。
         tl.store(
-            out_ptr + c[None, :] * stride_or + r[:, None],
+            out_ptr + c[None, :] * rows + r[:, None],
             q,
             mask=mask,
         )
@@ -344,7 +340,7 @@ def _quantize_a8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     block_k = triton.next_power_of_2(k)
     _a8_quantize_rows_kernel[(m,)](
         x2, q, inv_scale,
-        m, k, x2.stride(0), q.stride(0),
+        m, k,
         BLOCK_K=block_k,
         num_warps=8 if block_k >= 2048 else 4,
     )
@@ -393,7 +389,6 @@ def _int8_linear(
     _int8_bitlinear_kernel[grid](
         x_int8, w_int8, inv_sx, row_scale, y,
         m, n, k,
-        x_int8.stride(0), w_int8.stride(0), y.stride(0),
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=4,
     )
@@ -509,6 +504,7 @@ def _cast_fp8_tensorwise_transposed(
     t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """tensorwise FP8 cast を転置済み row-major layout へ直接書く."""
+    t = t.contiguous()
     scale = (t.abs().amax().float() / _FP8_MAX).clamp_min(1e-12)
     if triton is None or not t.is_cuda:
         return (
@@ -521,7 +517,7 @@ def _cast_fp8_tensorwise_transposed(
     grid = (triton.cdiv(rows, block_r), triton.cdiv(cols, block_c))
     _fp8_cast_transpose_kernel[grid](
         t, out, scale,
-        rows, cols, t.stride(0), out.stride(0),
+        rows, cols,
         BLOCK_R=block_r, BLOCK_C=block_c,
         num_warps=4,
     )

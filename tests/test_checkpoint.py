@@ -152,3 +152,86 @@ def test_async_save_exception_surfaces_on_wait(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="background checkpoint save failed"):
         manager.wait_for_pending_save()
+
+
+def test_validation_metadata_updates_without_rewriting_checkpoint(tmp_path):
+    model = _model()
+    optimizer = _optimizer(model)
+    manager = CheckpointManager(
+        tmp_path, keep_last_k=2, keep_every_n_steps=None, async_save=True
+    )
+    recovery_meta = CheckpointMeta(
+        global_step=10,
+        best_loss=2.0,
+        extra={"validation": None, "validation_status": "pending"},
+    )
+    step_dir = manager.save(model, optimizer, None, None, recovery_meta)
+    manager.wait_for_pending_save()
+    weights_mtime = (step_dir / "model.safetensors").stat().st_mtime_ns
+
+    validated_meta = CheckpointMeta(
+        global_step=10,
+        best_loss=1.5,
+        extra={
+            "validation": {"mean_bpb": 1.5},
+            "validation_status": "complete",
+        },
+    )
+    manager.update_metadata(step_dir, validated_meta, is_best=True)
+
+    assert (step_dir / "model.safetensors").stat().st_mtime_ns == weights_mtime
+    on_disk = CheckpointMeta.from_dict(json.loads((step_dir / "meta.json").read_text()))
+    assert on_disk.best_loss == 1.5
+    assert on_disk.extra["validation_status"] == "complete"
+    assert manager.resolve("best") == step_dir.resolve()
+
+
+def test_recovery_checkpoint_is_durable_before_validation_failure(tmp_path):
+    """validationが例外終了しても、直前stepの完全なcheckpointからresumeできる."""
+    model = _model()
+    optimizer = _optimizer(model)
+    manager = CheckpointManager(
+        tmp_path, keep_last_k=2, keep_every_n_steps=None, async_save=True
+    )
+    expected = model.weight.detach().clone()
+    meta = CheckpointMeta(
+        global_step=20,
+        best_loss=1.0,
+        extra={"validation": None, "validation_status": "pending"},
+    )
+
+    step_dir = manager.save(model, optimizer, None, {"offset": 20}, meta)
+    manager.wait_for_pending_save()  # training loop must do this before validation
+    with pytest.raises(RuntimeError, match="validation crash"):
+        raise RuntimeError("validation crash")
+
+    restored = _model()
+    loaded_meta, dl_state = manager.load("latest", restored, map_location="cpu")
+    assert loaded_meta.global_step == 20
+    assert loaded_meta.extra["validation_status"] == "pending"
+    assert dl_state == {"offset": 20}
+    assert torch.equal(restored.weight, expected)
+
+
+def test_update_metadata_accepts_save_returned_path_with_relative_root(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    model = _model()
+    optimizer = _optimizer(model)
+    manager = CheckpointManager(
+        "checkpoints", keep_last_k=2, keep_every_n_steps=None, async_save=False
+    )
+    step_dir = manager.save(
+        model, optimizer, None, None, CheckpointMeta(global_step=3)
+    )
+
+    manager.update_metadata(
+        step_dir,
+        CheckpointMeta(global_step=3, best_loss=0.75),
+        is_best=True,
+    )
+
+    assert manager.resolve("best") == (tmp_path / step_dir).resolve()
+    meta = json.loads((step_dir / "meta.json").read_text())
+    assert meta["best_loss"] == 0.75

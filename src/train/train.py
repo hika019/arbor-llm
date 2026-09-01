@@ -708,6 +708,43 @@ def apply_compile_settings(
     print(f"[train] torch_compile=ON mode={mode}")
     return torch.compile(model, mode=mode)
 
+
+def build_validation_model(
+    base_model: torch.nn.Module,
+    validation_cfg: dict,
+    device: torch.device,
+) -> torch.nn.Module:
+    """Build a validation-only wrapper sharing parameters with ``base_model``.
+
+    Training用compiled wrapperをvalidationへ流用するとtrain/evalで別graphが同じ
+    compile policyに混在する。既定は安定性優先のeager。明示した場合だけtrainingと
+    独立したcompile modeで別wrapperを作る。
+    """
+    if not validation_cfg.get("enabled", False):
+        return base_model
+    if not validation_cfg.get("torch_compile", False):
+        print("[val] model=eager (training compiled wrapperとは分離)")
+        return base_model
+    if device.type != "cuda":
+        print(f"[val] torch_compile=OFF (device={device.type}: CUDA 以外は非対応)")
+        return base_model
+    mode = str(validation_cfg.get("compile_mode", "default"))
+    allowed = {
+        "default",
+        "lite",
+        "reduce-overhead",
+        "max-autotune-no-cudagraphs",
+        "max-autotune",
+    }
+    if mode not in allowed:
+        raise ValueError(
+            f"unknown validation.compile_mode: {mode!r} "
+            f"(choices: {sorted(allowed)})"
+        )
+    print(f"[val] model=compiled mode={mode} (training wrapperとは分離)")
+    return torch.compile(base_model, mode=mode)
+
+
 # ------------------------------------------------------------------- main
 def main() -> int:
     timing_mark("process_start")
@@ -831,6 +868,9 @@ def main() -> int:
         )
 
     model = apply_compile_settings(model, cfg["speed"], device)
+    validation_model = build_validation_model(
+        base_model, cfg.get("validation", {}), device
+    )
     timing_mark("compile_wrapper_created", device)
 
     # ---- データ (streaming, メモリに全部載せない) ----
@@ -1170,6 +1210,39 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 - probe 失敗で学習は止めない
             print(f"[probe] failed (continuing training): {type(e).__name__}: {e}")
             return None
+
+    def make_checkpoint_meta(
+        *,
+        step: int,
+        best_value: float,
+        validation_results: dict[str, float] | None,
+        validation_status: str,
+    ) -> CheckpointMeta:
+        return CheckpointMeta(
+            global_step=step,
+            best_loss=best_value,
+            config_hash=cfg_hash,
+            git_sha=(
+                git_info.get("sha")
+                if isinstance(git_info.get("sha"), str)
+                else None
+            ),
+            git_dirty=(
+                git_info.get("dirty")
+                if isinstance(git_info.get("dirty"), bool)
+                else None
+            ),
+            wandb_run_id=os.environ.get("WANDB_RUN_ID"),
+            extra={
+                "git": git_info,
+                "run": run_info,
+                "best_metric": (
+                    "validation_mean_bpb" if validation_enabled else "train_ema_loss"
+                ),
+                "validation": validation_results,
+                "validation_status": validation_status,
+            },
+        )
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -1650,64 +1723,15 @@ def main() -> int:
             if should_save:
                 stop_save = stop.requested
                 validation_results: dict[str, float] | None = None
-                is_best = bool(best_improved_tensor.cpu())
+                is_best = (
+                    bool(best_improved_tensor.cpu())
+                    if not validation_enabled
+                    else False
+                )
                 if stop_save and validation_enabled:
                     print(
                         "[train] stop checkpoint: skipping validation for fast shutdown"
                     )
-                if validation_enabled and not stop_save:
-                    val_t0 = time.perf_counter()
-                    validation_results = evaluate_validation(
-                        model,
-                        validation_loaders,
-                        device,
-                        compute_dtype,
-                        use_autocast,
-                        int(validation_cfg.get("max_batches", 16)),
-                        batch_cache=validation_batch_cache,
-                    )
-                    mean_bpb = validation_results.get("mean_bpb")
-                    if mean_bpb is None:
-                        is_best = False
-                        print("[val] no valid labels; best not updated")
-                    else:
-                        val_score = torch.tensor(mean_bpb, device=device, dtype=torch.float32)
-                        is_best = bool((val_score < best_loss_tensor).cpu())
-                        best_loss_tensor = torch.minimum(best_loss_tensor, val_score)
-                        parts = " ".join(
-                            f"{k}={v:.4f}" for k, v in sorted(validation_results.items())
-                        )
-                        print(
-                            f"[val] step={global_step} {parts} "
-                            f"elapsed={time.perf_counter() - val_t0:.1f}s"
-                        )
-                    with metrics_path.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps({
-                            "step": global_step,
-                            "validation": validation_results,
-                            "best_metric": "validation_mean_bpb",
-                            "time": time.time(),
-                        }) + "\n")
-                best_loss = float(best_loss_tensor.cpu())
-                best_improved_tensor = torch.tensor(False, device=device)
-                meta = CheckpointMeta(
-                    global_step=global_step,
-                    best_loss=best_loss,
-                    config_hash=cfg_hash,
-                    git_sha=git_info.get("sha") if isinstance(git_info.get("sha"), str) else None,
-                    git_dirty=(
-                        git_info.get("dirty") if isinstance(git_info.get("dirty"), bool) else None
-                    ),
-                    wandb_run_id=os.environ.get("WANDB_RUN_ID"),
-                    extra={
-                        "git": git_info,
-                        "run": run_info,
-                        "best_metric": (
-                            "validation_mean_bpb" if validation_enabled else "train_ema_loss"
-                        ),
-                        "validation": validation_results,
-                    },
-                )
                 if cpu_prefetcher is not None:
                     # loader state と未消費 batch を同一瞬間のペアで取る (排他は内部 lock)
                     dl_state, pending_cpu = cpu_prefetcher.state_dict()
@@ -1723,19 +1747,100 @@ def main() -> int:
                     prefetched = data_iter.state_dict()
                     if prefetched is not None:
                         dl_state["_cuda_prefetch_next_batch"] = prefetched
+
+                # P0: validation開始前に、このoptimizer stepのmodel/optimizer/
+                # scheduler/dataloader stateをrecovery checkpointとして確定する。
+                # CUDA illegal memory access後の救済saveは安全でないため、async設定でも
+                # publish完了を待ってからvalidationへ進む。
+                best_loss = float(best_loss_tensor.cpu())
+                validation_status = (
+                    "skipped_stop"
+                    if stop_save and validation_enabled
+                    else "pending"
+                    if validation_enabled
+                    else "disabled"
+                )
+                recovery_meta = make_checkpoint_meta(
+                    step=global_step,
+                    best_value=best_loss,
+                    validation_results=None,
+                    validation_status=validation_status,
+                )
                 t0 = time.perf_counter()
                 saved_dir = ckpt.save(
-                    base_model, optimizer, scheduler, dl_state, meta, config=effective_cfg,
+                    base_model,
+                    optimizer,
+                    scheduler,
+                    dl_state,
+                    recovery_meta,
+                    config=effective_cfg,
                     is_best=is_best,
                     is_final=global_step >= total_steps,
                     force_sync=stop_save,
                 )
+                ckpt.wait_for_pending_save()
                 save_seconds = time.perf_counter() - t0
                 print(
-                    f"[train] saved checkpoint @ step={global_step}"
+                    f"[train] recovery checkpoint durable @ step={global_step}"
                     f"{' (best)' if is_best else ''} in {save_seconds:.1f}s"
-                    f"{' (background write continues)' if ckpt.async_save and not stop_save and global_step < total_steps else ''}"
                 )
+
+                # P1: validationはtraining用compiled wrapperではなく、base_modelを
+                # 共有する独立wrapper (既定eager) で実行する。validationがここで
+                # 例外終了しても、上のrecovery checkpointは既にresume可能。
+                if validation_enabled and not stop_save:
+                    val_t0 = time.perf_counter()
+                    validation_results = evaluate_validation(
+                        validation_model,
+                        validation_loaders,
+                        device,
+                        compute_dtype,
+                        use_autocast,
+                        int(validation_cfg.get("max_batches", 16)),
+                        batch_cache=validation_batch_cache,
+                    )
+                    mean_bpb = validation_results.get("mean_bpb")
+                    if mean_bpb is None:
+                        is_best = False
+                        print("[val] no valid labels; best not updated")
+                    else:
+                        val_score = torch.tensor(
+                            mean_bpb, device=device, dtype=torch.float32
+                        )
+                        is_best = bool((val_score < best_loss_tensor).cpu())
+                        best_loss_tensor = torch.minimum(best_loss_tensor, val_score)
+                        parts = " ".join(
+                            f"{k}={v:.4f}"
+                            for k, v in sorted(validation_results.items())
+                        )
+                        print(
+                            f"[val] step={global_step} {parts} "
+                            f"elapsed={time.perf_counter() - val_t0:.1f}s"
+                        )
+                    with metrics_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "step": global_step,
+                            "validation": validation_results,
+                            "best_metric": "validation_mean_bpb",
+                            "time": time.time(),
+                        }) + "\n")
+
+                    best_loss = float(best_loss_tensor.cpu())
+                    validated_meta = make_checkpoint_meta(
+                        step=global_step,
+                        best_value=best_loss,
+                        validation_results=validation_results,
+                        validation_status="complete",
+                    )
+                    ckpt.update_metadata(
+                        saved_dir, validated_meta, is_best=is_best
+                    )
+                    print(
+                        f"[train] checkpoint metadata updated @ step={global_step}"
+                        f"{' (best)' if is_best else ''}"
+                    )
+
+                best_improved_tensor = torch.tensor(False, device=device)
                 if sampling_enabled:
                     sample_at_checkpoint(saved_dir, global_step)
                 if probes_enabled:
@@ -1763,6 +1868,7 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.synchronize()
         model = None
+        validation_model = None
         base_model = None
         optimizer = None
         scheduler = None

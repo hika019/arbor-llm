@@ -9,6 +9,8 @@ from src.train.train import resolve_entropy_lm_reference
 from src.train.train import adapt_config_for_device
 from src.train.train import pick_device
 from src.train.train import byte_kind_loss_stats
+from src.train.train import build_validation_model
+from src.train.train import evaluate_validation
 from src.train.train import CudaBatchPrefetcher
 from src.train.train import ThreadedBatchPrefetcher
 from src.train.train import rebase_scheduler_lr
@@ -147,6 +149,159 @@ def test_non_cudagraph_compile_modes_allow_gradient_accumulation(compile_mode):
         },
     }
     assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+
+
+def test_validation_model_is_eager_and_separate_from_training_wrapper_by_default():
+    base = torch.nn.Linear(4, 4)
+    train_wrapper = object()
+
+    val_model = build_validation_model(
+        base,
+        {"enabled": True, "torch_compile": False},
+        torch.device("cuda"),
+    )
+
+    assert val_model is base
+    assert val_model is not train_wrapper
+
+
+def test_validation_model_uses_independent_compile_mode(monkeypatch):
+    base = torch.nn.Linear(4, 4)
+    calls = []
+    wrapper = torch.nn.Sequential(base)
+
+    def fake_compile(model, *, mode):
+        calls.append((model, mode))
+        return wrapper
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    val_model = build_validation_model(
+        base,
+        {"enabled": True, "torch_compile": True, "compile_mode": "default"},
+        torch.device("cuda"),
+    )
+
+    assert val_model is wrapper
+    assert calls == [(base, "default")]
+
+
+def test_validation_model_rejects_unknown_compile_mode():
+    with pytest.raises(ValueError, match="validation.compile_mode"):
+        build_validation_model(
+            torch.nn.Linear(4, 4),
+            {"enabled": True, "torch_compile": True, "compile_mode": "turbo"},
+            torch.device("cuda"),
+        )
+
+
+def test_validation_exception_restores_shared_base_model_training_state():
+    class FailingModel(torch.nn.Module):
+        def forward(self, input_ids):
+            raise RuntimeError("validation failure")
+
+    model = FailingModel().train()
+    loaders = {
+        "unit": [
+            {
+                "input_ids": torch.ones(1, 4, dtype=torch.long),
+                "labels": torch.ones(1, 4, dtype=torch.long),
+            }
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="validation failure"):
+        evaluate_validation(
+            model,
+            loaders,
+            torch.device("cpu"),
+            torch.float32,
+            False,
+            1,
+        )
+
+    assert model.training
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiled_train_eager_validation_compiled_train_cuda():
+    """train wrapper→eager validation→同じtrain wrapper復帰のCUDA回帰テスト."""
+    from src.model.arbor import ArborConfig, ArborModel
+    from src.model.bitlinear import (
+        configure_bitlinear_training_cache,
+        install_arbor_projection_fusions,
+        refresh_bitlinear_training_cache,
+        set_bitlinear_fp8_mode,
+        set_bitlinear_int8_backend,
+    )
+
+    cfg = ArborConfig.from_dict(
+        {
+            "vocab_size": 260,
+            "patch_size": 4,
+            "patch_pooling": "mean",
+            "max_bytes": 64,
+            "hidden_size": 32,
+            "num_heads": 4,
+            "num_kv_heads": 2,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "local_hidden_size": 16,
+            "local_num_heads": 2,
+            "local_num_kv_heads": 2,
+            "local_intermediate_size": 32,
+            "num_local_encoder_layers": 1,
+            "num_local_decoder_layers": 1,
+        }
+    )
+    base = ArborModel(cfg).to(device="cuda", dtype=torch.bfloat16).train()
+    install_arbor_projection_fusions(base)
+    set_bitlinear_int8_backend("auto")
+    set_bitlinear_fp8_mode(base, "int8")
+    configure_bitlinear_training_cache(
+        base,
+        enabled="full",
+        grad_accum_steps=1,
+        max_cache_gib=0.1,
+        min_numel=0,
+    )
+    train_model = torch.compile(base, mode="default")
+    val_model = build_validation_model(
+        base,
+        {"enabled": True, "torch_compile": False},
+        torch.device("cuda"),
+    )
+    assert val_model is base
+    optimizer = torch.optim.AdamW(base.parameters(), lr=1e-4)
+    x = torch.randint(4, 260, (1, 64), device="cuda")
+
+    def train_step():
+        optimizer.zero_grad(set_to_none=True)
+        logits = train_model(x).logits
+        loss = torch.nn.functional.cross_entropy(
+            logits[:, :-1].float().reshape(-1, logits.size(-1)),
+            x[:, 1:].reshape(-1),
+        )
+        loss.backward()
+        optimizer.step()
+        refresh_bitlinear_training_cache(base)
+        return loss.detach()
+
+    before = train_step()
+    val_batch = {"input_ids": x.cpu(), "labels": x.cpu()}
+    results = evaluate_validation(
+        val_model,
+        {"unit": [val_batch]},
+        torch.device("cuda"),
+        torch.bfloat16,
+        True,
+        1,
+    )
+    after = train_step()
+
+    assert torch.isfinite(before)
+    assert torch.isfinite(after)
+    assert torch.isfinite(torch.tensor(results["mean_bpb"]))
+    assert base.training
 
 
 def test_entropy_model_config_is_loaded_from_single_reference(tmp_path):

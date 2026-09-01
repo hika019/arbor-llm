@@ -187,6 +187,10 @@ speed:
 
 validation:
   enabled: true
+  # training用compiled wrapperとは分離。安定性優先のeagerが既定。
+  # CUDA上で独立compileする場合だけtrueにし、compile_modeを個別指定する。
+  torch_compile: false
+  compile_mode: default
   max_batches: 64
   micro_batch_size: 2
   domains:

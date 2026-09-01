@@ -70,6 +70,15 @@ BOSへresetし、attention mask外のresidual経路から前文書が漏れる�
 `max-autotune`を起動時に拒否する。`default`または
 `max-autotune-no-cudagraphs`を使う。
 
+checkpoint stepでは、まずmodel/optimizer/scheduler/dataloaderを含むrecovery
+checkpointを完全にpublishし、その後にvalidationを実行する。validation成功後は
+modelを再保存せず`meta.json`と`best` symlinkだけをatomic更新する。validationが
+CUDA errorで終了しても、そのstepから`--resume latest`できる。
+
+validationはtraining用`torch.compile` wrapperを流用しない。既定は共有
+`base_model`のeager evalで、`validation.torch_compile: true`を指定した場合だけ
+`validation.compile_mode`による独立wrapperを作る。
+
 データは日本語 (fineweb-2 ja / wikipedia ja / 青空文庫 / 法令) + 英語
 (fineweb-edu / fineweb) + 数学 (finemath) の streaming 行レベル混合。既定 config
 では正規化後で日本語 ~75% / 英語 ~19% / 数学 ~7%。コード系データセット

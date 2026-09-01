@@ -187,6 +187,53 @@ class CheckpointManager:
         """Block until any in-flight async save finishes; re-raises its exception if it failed."""
         self._await_thread()
 
+    def update_metadata(
+        self,
+        step_dir: str | os.PathLike,
+        meta: CheckpointMeta,
+        *,
+        is_best: bool = False,
+    ) -> None:
+        """Update an already-published checkpoint's metadata and optional best link.
+
+        Recovery checkpoint本体はvalidation前に保存し、validation成功後は重いmodel /
+        optimizer stateを再保存せずmeta.jsonとbest symlinkだけを更新するために使う。
+        meta.jsonは一時ファイルへ書いてfsync後にatomic replaceする。
+        """
+        self._await_thread()
+        path = Path(step_dir)
+        # save()の戻り値はrootがrelativeならroot/stepというrelative path。
+        # それを再びrootへ連結するとroot/root/stepになるため、まず渡されたpathを
+        # そのまま解決し、存在しない場合だけstep名としてroot配下を探す。
+        if not path.is_dir() and not path.is_absolute():
+            path = self.root / path
+        if not path.is_dir():
+            raise FileNotFoundError(f"checkpoint step directory not found: {path}")
+        if path.resolve().parent != self.root.resolve():
+            raise ValueError(
+                f"checkpoint step directory is outside manager root: {path}"
+            )
+        match = _STEP_RE.match(path.name)
+        if match is None:
+            raise ValueError(f"not a checkpoint step directory: {path}")
+        if int(meta.global_step) != int(match.group(1)):
+            raise ValueError(
+                f"metadata step mismatch: dir={path.name} meta={meta.global_step}"
+            )
+
+        meta_path = path / "meta.json"
+        tmp_path = path / "meta.json.tmp"
+        tmp_path.write_text(json.dumps(meta.to_dict(), indent=2))
+        fd = os.open(tmp_path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, meta_path)
+        _fsync_dir(path)
+        if is_best:
+            _atomic_symlink(self.root / "best", path.name)
+
     # ------------------------------------------------------------------ load
     def load(
         self,
