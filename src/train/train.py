@@ -1498,7 +1498,7 @@ def main() -> int:
 
             if cfg["optim"].get("grad_clip"):
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), cfg["optim"]["grad_clip"], foreach=True
+                    model.parameters(), cfg["optim"]["grad_clip"]
                 )
             opt_start = start_gpu_section("optimizer")
             optimizer.step()
