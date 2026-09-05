@@ -131,7 +131,10 @@ class CheckpointManager:
         # captured below is a detached copy, so the background thread below
         # (or the synchronous path) never touches tensors the training loop
         # might mutate in-place afterwards (e.g. optimizer.step()).
-        weights = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+        weights = {
+            k: v.detach().to("cpu", copy=True).contiguous()
+            for k, v in model.state_dict().items()
+        }
         optimizer_state = _cpu_snapshot(optimizer.state_dict())
         scheduler_state = _cpu_snapshot(scheduler.state_dict()) if scheduler is not None else None
         dataloader_state_cpu = _cpu_snapshot(dataloader_state) if dataloader_state is not None else None
