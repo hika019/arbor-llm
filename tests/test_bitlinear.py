@@ -125,6 +125,21 @@ def test_training_weight_cache_matches_uncached_forward_and_grad():
     assert cached.training_cache_bytes < cached.weight.numel() * cached.weight.element_size()
 
 
+def test_ternary_training_cache_uses_two_packed_layouts():
+    layer = BitLinear(33, 17)
+    layer._fp8_mode = "ternary"
+    layer.enable_training_weight_cache(True)
+
+    assert layer._train_w_int8 is None
+    assert layer._train_w_fp8 is None
+    assert layer._train_w_fp8_t is None
+    assert layer._train_w_packed.dtype == torch.uint8
+    assert layer._train_w_packed.shape == (17, 9)
+    assert layer._train_w_packed_t.shape == (33, 5)
+    assert layer.training_cache_bytes == layer.cache_cost_bytes
+    assert layer.training_cache_bytes < layer.weight.numel()
+
+
 def test_bitlinear_group_matches_individual_projections():
     torch.manual_seed(0)
     a = BitLinear(32, 16)
@@ -262,6 +277,114 @@ def test_native_int8_forward_and_fp8_backward_cuda():
     ) > 0.98
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_ternary_forward_dgrad_and_wgrad_cuda():
+    torch.manual_seed(0)
+    # packed kernelはFP8/cuBLASの16要素alignment制約を持たない。
+    ref = BitLinear(33, 17).to(device="cuda", dtype=torch.bfloat16)
+    packed = BitLinear(33, 17).to(device="cuda", dtype=torch.bfloat16)
+    packed.load_state_dict(ref.state_dict())
+    info = set_bitlinear_fp8_mode(packed, "ternary")
+    packed.enable_training_weight_cache(True)
+
+    assert info["mode"] == "ternary"
+    assert packed._train_w_int8 is None
+    assert packed._train_w_packed.dtype == torch.uint8
+    assert packed._train_w_packed_t.dtype == torch.uint8
+    x_ref = torch.randn(7, 33, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_packed = x_ref.detach().clone().requires_grad_(True)
+    y_ref = ref(x_ref)
+    y_packed = packed(x_packed)
+    torch.testing.assert_close(
+        y_packed.float(), y_ref.float(), atol=4e-3, rtol=4e-3
+    )
+
+    y_ref.square().mean().backward()
+    y_packed.square().mean().backward()
+    assert torch.isfinite(x_packed.grad).all()
+    assert torch.isfinite(packed.weight.grad).all()
+    assert torch.nn.functional.cosine_similarity(
+        x_packed.grad.float().flatten(), x_ref.grad.float().flatten(), dim=0
+    ) > 0.98
+    assert torch.nn.functional.cosine_similarity(
+        packed.weight.grad.float().flatten(), ref.weight.grad.float().flatten(), dim=0
+    ) > 0.98
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_ternary_group_supports_distinct_weight_scales_cuda():
+    torch.manual_seed(1)
+    a = BitLinear(32, 16).to(device="cuda", dtype=torch.bfloat16)
+    b = BitLinear(32, 32).to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        b.weight.mul_(3.0)
+    group = BitLinearGroup((a, b), kind="test").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    set_bitlinear_fp8_mode(group, "ternary")
+    group.enable_training_weight_cache(True)
+
+    x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+    expected = torch.cat((a(x), b(x)), dim=-1)
+    actual = group(x)
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=5e-3, rtol=5e-3
+    )
+    assert group._train_w_scale[:16].mean() < group._train_w_scale[16:].mean()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_ternary_bitlinear_torch_compile_cuda():
+    layer = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16).train()
+    set_bitlinear_fp8_mode(layer, "ternary")
+    layer.enable_training_weight_cache(True)
+    compiled = torch.compile(layer)
+    x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    loss = compiled(x).float().square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(layer.weight.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arbor_packed_ternary_caches_all_layers_and_trains_cuda():
+    from src.model.arbor import ArborConfig, ArborModel
+
+    cfg = ArborConfig.from_dict(
+        dict(
+            vocab_size=260, patch_size=4, patch_pooling="mean", max_bytes=64,
+            hidden_size=32, num_heads=4, num_kv_heads=2, intermediate_size=64,
+            num_hidden_layers=1,
+            local_hidden_size=16, local_num_heads=2, local_num_kv_heads=2,
+            local_intermediate_size=32,
+            num_local_encoder_layers=1, num_local_decoder_layers=1,
+        )
+    )
+    model = ArborModel(cfg).to(device="cuda", dtype=torch.bfloat16).train()
+    from src.model.bitlinear import install_arbor_projection_fusions
+
+    install_arbor_projection_fusions(model)
+    set_bitlinear_fp8_mode(model, "ternary")
+    info = configure_bitlinear_training_cache(
+        model,
+        enabled="full",
+        grad_accum_steps=2,
+        max_cache_gib=0.1,
+        min_numel=0,
+    )
+    assert info["cached_layers"] == info["eligible_layers"]
+    assert info["cache_format"] == "packed2_dual_layout"
+    x = torch.randint(4, 260, (1, 64), device="cuda")
+    loss = model(x).logits.float().square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
 @pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
 def test_arbor_native_int8_caches_all_layers_and_trains_cuda():
     from src.model.arbor import ArborConfig, ArborModel
@@ -376,3 +499,18 @@ def test_frozen_inference_matches_reference_cuda():
     assert lin._w_packed is None
     assert lin._w_dq is not None
     assert torch.allclose(out, ref, atol=3e-2, rtol=1e-2), float((out - ref).abs().max())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_frozen_packed_inference_matches_reference_cuda(monkeypatch):
+    monkeypatch.setenv("ARBOR_PACKED_BITLINEAR_INFERENCE", "1")
+    torch.manual_seed(0)
+    lin = BitLinear(128, 96).to(device="cuda", dtype=torch.bfloat16).eval()
+    x = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
+    ref = lin(x).float()
+    lin.freeze_for_inference()
+    assert lin._w_packed is not None
+    out = lin(x).float()
+    assert torch.allclose(out, ref, atol=3e-2, rtol=1e-2), float(
+        (out - ref).abs().max()
+    )

@@ -49,7 +49,7 @@ def main() -> None:
     ap.add_argument(
         "--bitlinear-fp8",
         default=None,
-        choices=["off", "bwd", "full", "int8"],
+        choices=["off", "bwd", "full", "int8", "ternary"],
         help="既定は config speed.bitlinear_fp8",
     )
     ap.add_argument(

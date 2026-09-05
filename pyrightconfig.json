@@ -1,0 +1,20 @@
+{
+  "include": [
+    "src",
+    "scripts",
+    "tests"
+  ],
+  "exclude": [
+    ".git",
+    ".venv",
+    "checkpoints",
+    "data",
+    "export",
+    "logs"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "off",
+  "reportMissingTypeStubs": false
+}

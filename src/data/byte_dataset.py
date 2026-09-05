@@ -165,15 +165,19 @@ class ByteStreamDataset(IterableDataset):
         is_target: list[bool] = []
         for role, content in messages:
             for b in f"<|{role}|>\n".encode("utf-8"):
-                tokens.append(b + off); is_target.append(False)
+                tokens.append(b + off)
+                is_target.append(False)
             tgt = loss_all or (role == "assistant")
             for b in content.encode("utf-8"):
-                tokens.append(b + off); is_target.append(tgt)
+                tokens.append(b + off)
+                is_target.append(tgt)
             if role == "assistant":
                 if self.sft_add_eos:
-                    tokens.append(self.eos_token_id); is_target.append(True)
+                    tokens.append(self.eos_token_id)
+                    is_target.append(True)
             else:
-                tokens.append(ord("\n") + off); is_target.append(False)
+                tokens.append(ord("\n") + off)
+                is_target.append(False)
 
         block = self.context_length + 1
         tokens = tokens[:block]

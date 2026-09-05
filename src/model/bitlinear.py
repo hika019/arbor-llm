@@ -19,7 +19,8 @@
 でき、CPU でもそのまま動く。学習は BF16 シャドウ重みが master。
 
 低ビット GEMM (任意, sm89+):
-`set_bitlinear_fp8_mode(model, "bwd"|"full"|"int8")` で学習 GEMM を置き換える。
+`set_bitlinear_fp8_mode(model, "bwd"|"full"|"int8"|"ternary")` で学習 GEMM を
+置き換える。
 ternary 重みは optimizer step 後に INT8 {-1,0,+1} と FP8 の両レイアウトへ
 一度だけ変換し、gradient accumulation 中は再量子化・transpose しない。
   - "bwd":  forward は BF16 のまま (数値は既定パスと同一)。dgrad/wgrad のみ FP8。
@@ -29,6 +30,9 @@ ternary 重みは optimizer step 後に INT8 {-1,0,+1} と FP8 の両レイア�
   - "int8": forward は A8 INT8 × ternary INT8、INT32 accumulation の native
             CUDA GEMM。per-token activation scale × per-weight scale で BF16 に戻す。
             backward は cached FP8 weight と FP8 GEMM を使う。RTX 5090向け既定候補。
+  - "ternary": forward / dX は 2bit packed weight を直接 decode して
+               ADD / SUB / SKIP する Triton kernel。dW は A8 INT8 dense GEMM。
+               shadow weight は BF16 のまま保持し、optimizer step 後だけcache更新。
 
 推論パス (任意): `freeze_for_inference()` を呼ぶと dequantize 済み ternary 重みを
 キャッシュし、以後の eval forward で毎回の重み再量子化を省く。実験的な
@@ -36,6 +40,8 @@ packed ternary Triton カーネルは `ARBOR_PACKED_BITLINEAR_INFERENCE=1` の�
 有効にする。packed 経路は速いが、行数によって通常 eval forward と丸めが変わり、
 逐次生成の argmax が分岐し得るため既定では使わない。
 """
+# Tritonの`tl.constexpr`はJIT DSLの注釈であり、Python型式ではない。
+# pyright: reportInvalidTypeForm=false
 from __future__ import annotations
 
 import math
@@ -178,36 +184,66 @@ if triton is not None:
         x_ptr, w_ptr, sx_ptr, sw_ptr, y_ptr,
         m: tl.constexpr, n: tl.constexpr, k: tl.constexpr, k_packed: tl.constexpr,
         stride_xm: tl.constexpr, stride_ym: tl.constexpr,
+        SCALE_PER_OUTPUT: tl.constexpr,
+        ADD_SUB: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
+        """2bit weightをregisterでdecodeするpacked GEMM core."""
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.int32)
 
-        for k0 in range(0, k, BLOCK_K):
-            k_idxs = k0 + offs_k
-            x = tl.load(
-                x_ptr + offs_m[:, None] * stride_xm + k_idxs[None, :],
-                mask=(offs_m[:, None] < m) & (k_idxs[None, :] < k),
-                other=0,
-            )
-            pack_idxs = k_idxs // 4
-            shifts = (k_idxs % 4) * 2
-            packed = tl.load(
-                w_ptr + offs_n[None, :] * k_packed + pack_idxs[:, None],
-                mask=(offs_n[None, :] < n) & (k_idxs[:, None] < k),
-                other=1,  # code 1 = ternary 0
-            )
-            codes = ((packed >> shifts[:, None]) & 3).to(tl.int32)
-            w = (codes - 1).to(tl.int8)
-            acc += tl.dot(x, w, out_dtype=tl.float32)
+        if ADD_SUB:
+            # 学習prototype: multiplyせずADD / SUB / SKIPとして直接accumulate。
+            for k0 in range(0, k, BLOCK_K):
+                for kk in tl.static_range(0, BLOCK_K):
+                    k_idx = k0 + kk
+                    x = tl.load(
+                        x_ptr + offs_m * stride_xm + k_idx,
+                        mask=(offs_m < m) & (k_idx < k),
+                        other=0,
+                    ).to(tl.int32)
+                    packed = tl.load(
+                        w_ptr + offs_n * k_packed + k_idx // 4,
+                        mask=(offs_n < n) & (k_idx < k),
+                        other=1,  # code 1 = ternary 0
+                    )
+                    code = ((packed >> ((k_idx % 4) * 2)) & 3).to(tl.int32)
+                    signed_x = tl.where(
+                        code[None, :] == 2,
+                        x[:, None],
+                        tl.where(code[None, :] == 0, -x[:, None], 0),
+                    )
+                    acc += signed_x
+        else:
+            # 既存推論経路: packed load/decode後にvectorized INT8 dot。
+            offs_k = tl.arange(0, BLOCK_K)
+            for k0 in range(0, k, BLOCK_K):
+                k_idxs = k0 + offs_k
+                x = tl.load(
+                    x_ptr + offs_m[:, None] * stride_xm + k_idxs[None, :],
+                    mask=(offs_m[:, None] < m) & (k_idxs[None, :] < k),
+                    other=0,
+                )
+                pack_idxs = k_idxs // 4
+                shifts = (k_idxs % 4) * 2
+                packed = tl.load(
+                    w_ptr + offs_n[None, :] * k_packed + pack_idxs[:, None],
+                    mask=(offs_n[None, :] < n) & (k_idxs[:, None] < k),
+                    other=1,  # code 1 = ternary 0
+                )
+                codes = ((packed >> shifts[:, None]) & 3).to(tl.int32)
+                w = (codes - 1).to(tl.int8)
+                acc += tl.dot(x, w, out_dtype=tl.int32)
 
         sx = tl.load(sx_ptr + offs_m, mask=offs_m < m, other=0.0).to(tl.float32)
-        sw = tl.load(sw_ptr).to(tl.float32)
-        y = acc * sx[:, None] * sw
+        if SCALE_PER_OUTPUT:
+            sw = tl.load(sw_ptr + offs_n, mask=offs_n < n, other=0.0).to(tl.float32)
+        else:
+            sw = tl.full((BLOCK_N,), tl.load(sw_ptr), tl.float32)
+        y = acc.to(tl.float32) * sx[:, None] * sw[None, :]
         tl.store(
             y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :],
             y,
@@ -231,6 +267,32 @@ if triton is not None:
         # torch.round と同じ round-half-to-even にする (既定 fake-quant path の
         # (x*scale).round() と rounding 規則を一致させる)。外部 libdevice alias は
         # torch.compile の Triton source 抽出で失われるため kernel 内演算だけで行う。
+        nearest = tl.floor(scaled + 0.5)
+        is_tie = (nearest - scaled) == 0.5
+        is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
+        q = tl.where(is_tie & is_odd, nearest - 1.0, nearest)
+        q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
+        tl.store(q_ptr + row * k + offs, q, mask=mask)
+        tl.store(inv_scale_ptr + row, inv_scale)
+
+    @triton.jit
+    def _a8_quantize_rows_scaled_kernel(
+        x_ptr, col_scale_ptr, q_ptr, inv_scale_ptr,
+        m: tl.constexpr, k: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """列scale適用とper-row A8 quantizationを融合する (dXのdY用)."""
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_K)
+        mask = offs < k
+        x = tl.load(x_ptr + row * k + offs, mask=mask, other=0.0).to(tl.float32)
+        col_scale = tl.load(
+            col_scale_ptr + offs, mask=mask, other=0.0
+        ).to(tl.float32)
+        x = x * col_scale
+        amax = tl.max(tl.abs(x), axis=0)
+        inv_scale = tl.maximum(amax / 127.0, 1.0e-5 / 127.0)
+        scaled = x / inv_scale
         nearest = tl.floor(scaled + 0.5)
         is_tie = (nearest - scaled) == 0.5
         is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
@@ -277,6 +339,45 @@ if triton is not None:
         )
 
     @triton.jit
+    def _int8_wgrad_kernel(
+        g_ptr, x_ptr, sg_ptr, sx_ptr, out_ptr,
+        m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr,
+    ):
+        """tensorwise INT8 dY^T @ X。dY transposeをmaterializeしない."""
+        pid_n = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        offs_m = tl.arange(0, BLOCK_M)
+        acc = tl.zeros((BLOCK_N, BLOCK_K), tl.int32)
+
+        for m0 in range(0, m, BLOCK_M):
+            m_idx = m0 + offs_m
+            g = tl.load(
+                g_ptr + m_idx[None, :] * n + offs_n[:, None],
+                mask=(m_idx[None, :] < m) & (offs_n[:, None] < n),
+                other=0,
+            )
+            x = tl.load(
+                x_ptr + m_idx[:, None] * k + offs_k[None, :],
+                mask=(m_idx[:, None] < m) & (offs_k[None, :] < k),
+                other=0,
+            )
+            acc += tl.dot(g, x, out_dtype=tl.int32)
+
+        scale = (
+            tl.load(sg_ptr).to(tl.float32)
+            * tl.load(sx_ptr).to(tl.float32)
+        )
+        value = acc.to(tl.float32) * scale
+        tl.store(
+            out_ptr + offs_n[:, None] * k + offs_k[None, :],
+            value,
+            mask=(offs_n[:, None] < n) & (offs_k[None, :] < k),
+        )
+
+    @triton.jit
     def _fp8_cast_transpose_kernel(
         x_ptr, out_ptr, scale_ptr,
         rows: tl.constexpr, cols: tl.constexpr,
@@ -307,19 +408,25 @@ def _packed_linear(
     x_q: torch.Tensor,      # (M, K) int8
     inv_sx: torch.Tensor,   # (M,) float32: 行ごとの 1/activation_scale
     w_packed: torch.Tensor, # (N, ceil(K/4)) uint8
-    sw: torch.Tensor,       # () float32: weight scale
+    sw: torch.Tensor,       # () または (N,) float32: weight scale
     k: int,
     n: int,
     out_dtype: torch.dtype,
+    *,
+    add_sub: bool = False,
 ) -> torch.Tensor:
     m = x_q.size(0)
+    if sw.numel() not in (1, n):
+        raise ValueError(f"packed weight scale must have 1 or N={n} values")
     y = torch.empty((m, n), device=x_q.device, dtype=out_dtype)
-    block_m, block_n, block_k = 16, 32, 64
+    block_m, block_n, block_k = 16, 32, 32
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
     _packed_bitlinear_kernel[grid](
         x_q.contiguous(), w_packed, inv_sx.contiguous(), sw.contiguous(), y,
         m, n, k, w_packed.size(1),
         x_q.stride(0), y.stride(0),
+        SCALE_PER_OUTPUT=sw.numel() != 1,
+        ADD_SUB=add_sub,
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=4,
     )
@@ -345,6 +452,62 @@ def _quantize_a8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_warps=8 if block_k >= 2048 else 4,
     )
     return q, inv_scale
+
+
+def _quantize_a8_rows_scaled(
+    x: torch.Tensor, col_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """列scaleを掛けながらper-token A8 quantizationする."""
+    if triton is None or not x.is_cuda:
+        raise RuntimeError("packed ternary dX には CUDA + Triton が必要です")
+    x2 = x.contiguous()
+    scale = col_scale.contiguous()
+    m, k = x2.shape
+    if scale.numel() != k:
+        raise ValueError(f"col_scale must have K={k} values")
+    q = torch.empty_like(x2, dtype=torch.int8)
+    inv_scale = torch.empty(m, device=x.device, dtype=torch.float32)
+    block_k = triton.next_power_of_2(k)
+    _a8_quantize_rows_scaled_kernel[(m,)](
+        x2, scale, q, inv_scale,
+        m, k,
+        BLOCK_K=block_k,
+        num_warps=8 if block_k >= 2048 else 4,
+    )
+    return q, inv_scale
+
+
+def _quantize_int8_tensorwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """dense low-bit wgrad用のtensorwise symmetric INT8 quantization."""
+    scale = (x.detach().abs().amax().float() / 127.0).clamp_min(1e-12)
+    q = (x / scale).round().clamp(-128, 127).to(torch.int8)
+    return q.contiguous(), scale
+
+
+def _lowbit_wgrad(
+    grad_output: torch.Tensor,
+    x_q: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Q(dY)^T Q(X) によるlow-bit shadow-weight gradient."""
+    if triton is None or not grad_output.is_cuda:
+        raise RuntimeError("low-bit wgrad には CUDA + Triton が必要です")
+    g_int8, sg = _quantize_int8_tensorwise(grad_output)
+    x_int8, sx = _quantize_int8_tensorwise(x_q)
+    m, n = g_int8.shape
+    k = x_int8.size(1)
+    out = torch.empty((n, k), device=grad_output.device, dtype=out_dtype)
+    block_n, block_k, block_m = 32, 32, 32
+    grid = (triton.cdiv(n, block_n), triton.cdiv(k, block_k))
+    _int8_wgrad_kernel[grid](
+        g_int8, x_int8, sg, sx, out,
+        m, n, k,
+        BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m,
+        num_warps=4,
+    )
+    return out
 
 
 def _int8_linear(
@@ -460,7 +623,7 @@ class _CachedBitLinearGroupSTE(torch.autograd.Function):
 # ---------------------------------------------------------------- FP8 GEMM
 _FP8_E4M3 = torch.float8_e4m3fn
 _FP8_MAX = 448.0  # e4m3fn の最大有限値
-_FP8_MODES = ("off", "bwd", "full", "int8")
+_FP8_MODES = ("off", "bwd", "full", "int8", "ternary")
 _INT8_BACKENDS = ("auto", "int_mm", "triton")
 _int8_backend = "auto"
 
@@ -683,8 +846,73 @@ class _Int8BitLinearSTE(torch.autograd.Function):
         return (grad_x, None, None, None, None, None, *grad_weights)
 
 
+class TernaryBitLinearSTE(torch.autograd.Function):
+    """Packed W1.58 forward/dX + dense INT8 dW の学習用STE."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        w_packed: torch.Tensor,
+        w_packed_t: torch.Tensor,
+        row_scale: torch.Tensor,
+        out_sizes: tuple[int, ...],
+        *shadow_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        del shadow_weights
+        ctx.input_shape = tuple(x.shape)
+        ctx.out_sizes = out_sizes
+        x2 = x.reshape(-1, w_packed_t.size(0))
+        x_int8, inv_sx = _quantize_a8_rows(x2)
+        ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale)
+        y = _packed_linear(
+            x_int8,
+            inv_sx,
+            w_packed,
+            row_scale,
+            x2.size(1),
+            row_scale.numel(),
+            x.dtype,
+            add_sub=True,
+        )
+        return y.reshape(*ctx.input_shape[:-1], row_scale.numel())
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x_int8, inv_sx, w_packed_t, row_scale = ctx.saved_tensors
+        n = row_scale.numel()
+        g2 = grad_output.reshape(-1, n)
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            # dX = (dY * weight_scale) @ ternary_code。
+            g_int8, inv_sg = _quantize_a8_rows_scaled(g2, row_scale)
+            one = row_scale.new_ones(())
+            grad_x = _packed_linear(
+                g_int8,
+                inv_sg,
+                w_packed_t,
+                one,
+                n,
+                w_packed_t.size(0),
+                grad_output.dtype,
+                add_sub=True,
+            ).reshape(ctx.input_shape)
+
+        needs_w = ctx.needs_input_grad[5:]
+        if any(needs_w):
+            x_q = x_int8.to(grad_output.dtype) * inv_sx.to(
+                grad_output.dtype
+            ).unsqueeze(1)
+            grad_w = _lowbit_wgrad(g2, x_q, grad_output.dtype)
+            raw = grad_w.split(ctx.out_sizes, dim=0)
+            grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
+        else:
+            grad_weights = tuple(None for _ in ctx.out_sizes)
+        return (grad_x, None, None, None, None, *grad_weights)
+
+
 def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]:
-    """module 以下の BitLinear / BitLinearGroup に FP8 モードを設定する.
+    """module 以下の BitLinear / BitLinearGroup に low-bit GEMM モードを設定する.
 
     QKV/gate-up 融合後 (install_arbor_projection_fusions 後) に呼ぶこと。
     """
@@ -701,13 +929,19 @@ def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]
         (child.weight if isinstance(child, BitLinear) else child.members()[0].weight).is_cuda
         for child in targets
     )
-    if normalized != "off" and not (has_cuda_weights and fp8_gemm_supported()):
+    needs_fp8 = normalized in {"bwd", "full", "int8"}
+    if normalized != "off" and not has_cuda_weights:
+        raise RuntimeError(
+            f"bitlinear mode={normalized} には CUDA GPU が必要です。"
+            "暗黙フォールバックは行いません"
+        )
+    if needs_fp8 and not fp8_gemm_supported():
         raise RuntimeError(
             "bitlinear_fp8 には compute capability 8.9 以上の CUDA GPU が必要 "
             "(FP8 scaled GEMM)。暗黙フォールバックは行いません"
         )
-    if normalized == "int8" and triton is None:
-        raise RuntimeError("bitlinear_fp8=int8 には Triton が必要です")
+    if normalized in {"int8", "ternary"} and triton is None:
+        raise RuntimeError(f"bitlinear_fp8={normalized} には Triton が必要です")
     for child in targets:
         child._fp8_mode = normalized
     return {"mode": normalized, "layers": len(targets)}
@@ -741,6 +975,8 @@ class BitLinear(nn.Module):
         self.register_buffer("_train_w_scale", None, persistent=False)
         self.register_buffer("_train_w_fp8", None, persistent=False)
         self.register_buffer("_train_w_fp8_t", None, persistent=False)
+        self.register_buffer("_train_w_packed", None, persistent=False)
+        self.register_buffer("_train_w_packed_t", None, persistent=False)
         self._train_cache_enabled = False
         self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
         # 推論凍結用 (freeze_for_inference 後のみ非 None)
@@ -760,8 +996,14 @@ class BitLinear(nn.Module):
     def training_weight_cache_enabled(self) -> bool:
         return (
             self._train_cache_enabled
-            and self._train_w_int8 is not None
             and self._train_w_scale is not None
+            and (
+                self._train_w_int8 is not None
+                or (
+                    self._train_w_packed is not None
+                    and self._train_w_packed_t is not None
+                )
+            )
         )
 
     @property
@@ -771,6 +1013,8 @@ class BitLinear(nn.Module):
             self._train_w_scale,
             self._train_w_fp8,
             self._train_w_fp8_t,
+            self._train_w_packed,
+            self._train_w_packed_t,
         )
         return sum(
             cache.numel() * cache.element_size()
@@ -780,6 +1024,13 @@ class BitLinear(nn.Module):
 
     @property
     def cache_cost_bytes(self) -> int:
+        if self._fp8_mode == "ternary":
+            # forward / dX 向け2bit layoutを各1つ + output row scale。
+            return (
+                math.ceil(self.in_features / 4) * self.out_features
+                + math.ceil(self.out_features / 4) * self.in_features
+                + self.out_features * 4
+            )
         # INT8 ternary + row scale。FP8 backward時は N×K / K×N の両layout。
         cost = self.weight.numel() + self.out_features * 4
         if self._fp8_mode != "off":
@@ -803,6 +1054,8 @@ class BitLinear(nn.Module):
         self._train_w_scale = None
         self._train_w_fp8 = None
         self._train_w_fp8_t = None
+        self._train_w_packed = None
+        self._train_w_packed_t = None
 
     @torch.no_grad()
     def refresh_training_weight_cache(self) -> None:
@@ -810,14 +1063,39 @@ class BitLinear(nn.Module):
             return
         w_int8, scale = ternary_quantize_int8(self.weight)
         row_scale = scale.expand(self.out_features).contiguous()
-        self._train_w_int8 = w_int8.contiguous()
         self._train_w_scale = row_scale
-        if self._fp8_mode != "off":
-            self._train_w_fp8 = w_int8.to(_FP8_E4M3).contiguous()
-            self._train_w_fp8_t = self._train_w_fp8.t().contiguous()
-        else:
+        if self._fp8_mode == "ternary":
+            self._train_w_int8 = None
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
+            self._train_w_packed = pack_ternary_weight(w_int8)
+            self._train_w_packed_t = pack_ternary_weight(
+                w_int8.t().contiguous()
+            )
+        elif self._fp8_mode != "off":
+            self._train_w_int8 = w_int8.contiguous()
+            self._train_w_fp8 = w_int8.to(_FP8_E4M3).contiguous()
+            self._train_w_fp8_t = self._train_w_fp8.t().contiguous()
+            self._train_w_packed = None
+            self._train_w_packed_t = None
+        else:
+            self._train_w_int8 = w_int8.contiguous()
+            self._train_w_fp8 = None
+            self._train_w_fp8_t = None
+            self._train_w_packed = None
+            self._train_w_packed_t = None
+
+    def _cached_packed_weights(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.training_weight_cache_enabled:
+            raise RuntimeError("BitLinear packed low-bit cache is not enabled")
+        if self._train_w_packed is None or self._train_w_packed_t is None:
+            raise RuntimeError(
+                "bitlinear_fp8=ternary was configured after cache allocation; "
+                "refresh_bitlinear_training_cache() を実行してください"
+            )
+        return self._train_w_packed, self._train_w_packed_t, self._train_w_scale
 
     def _cached_fp8_weights(
         self,
@@ -950,6 +1228,25 @@ class BitLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.frozen and not self.training:
             return self._forward_inference(x)
+        if self.training and self._fp8_mode == "ternary":
+            if self.activation_precision != "int8":
+                raise RuntimeError(
+                    "bitlinear_fp8=ternary は activation_precision=int8 専用です"
+                )
+            if not x.is_cuda:
+                raise RuntimeError(
+                    "bitlinear_fp8=ternary received non-CUDA input; "
+                    "暗黙フォールバックは禁止"
+                )
+            w_packed, w_packed_t, row_scale = self._cached_packed_weights()
+            return TernaryBitLinearSTE.apply(
+                x,
+                w_packed,
+                w_packed_t,
+                row_scale,
+                (self.out_features,),
+                self.weight,
+            )
         if self.training and self._fp8_mode == "int8":
             if self.activation_precision != "int8":
                 raise RuntimeError(
@@ -1003,6 +1300,8 @@ class BitLinearGroup(nn.Module):
         self.register_buffer("_train_w_scale", None, persistent=False)
         self.register_buffer("_train_w_fp8", None, persistent=False)
         self.register_buffer("_train_w_fp8_t", None, persistent=False)
+        self.register_buffer("_train_w_packed", None, persistent=False)
+        self.register_buffer("_train_w_packed_t", None, persistent=False)
         self._train_cache_enabled = False
         self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
 
@@ -1016,6 +1315,12 @@ class BitLinearGroup(nn.Module):
     @property
     def cache_cost_bytes(self) -> int:
         numel = sum(member.weight.numel() for member in self.members())
+        if self._fp8_mode == "ternary":
+            return (
+                math.ceil(self.in_features / 4) * self.out_features
+                + math.ceil(self.out_features / 4) * self.in_features
+                + self.out_features * 4
+            )
         cost = numel + self.out_features * 4
         if self._fp8_mode != "off":
             cost += 2 * numel
@@ -1025,8 +1330,14 @@ class BitLinearGroup(nn.Module):
     def training_weight_cache_enabled(self) -> bool:
         return (
             self._train_cache_enabled
-            and self._train_w_int8 is not None
             and self._train_w_scale is not None
+            and (
+                self._train_w_int8 is not None
+                or (
+                    self._train_w_packed is not None
+                    and self._train_w_packed_t is not None
+                )
+            )
         )
 
     @property
@@ -1036,6 +1347,8 @@ class BitLinearGroup(nn.Module):
             self._train_w_scale,
             self._train_w_fp8,
             self._train_w_fp8_t,
+            self._train_w_packed,
+            self._train_w_packed_t,
         )
         return sum(
             cache.numel() * cache.element_size()
@@ -1058,6 +1371,8 @@ class BitLinearGroup(nn.Module):
         self._train_w_scale = None
         self._train_w_fp8 = None
         self._train_w_fp8_t = None
+        self._train_w_packed = None
+        self._train_w_packed_t = None
 
     @torch.no_grad()
     def refresh_training_weight_cache(self) -> None:
@@ -1071,12 +1386,37 @@ class BitLinearGroup(nn.Module):
             row_scales.append(scale.expand(member.out_features))
         self._train_w_int8 = torch.cat(quantized, dim=0).contiguous()
         self._train_w_scale = torch.cat(row_scales, dim=0).float().contiguous()
-        if self._fp8_mode != "off":
+        if self._fp8_mode == "ternary":
+            w_int8 = self._train_w_int8
+            self._train_w_packed = pack_ternary_weight(w_int8)
+            self._train_w_packed_t = pack_ternary_weight(
+                w_int8.t().contiguous()
+            )
+            self._train_w_int8 = None
+            self._train_w_fp8 = None
+            self._train_w_fp8_t = None
+        elif self._fp8_mode != "off":
             self._train_w_fp8 = self._train_w_int8.to(_FP8_E4M3).contiguous()
             self._train_w_fp8_t = self._train_w_fp8.t().contiguous()
+            self._train_w_packed = None
+            self._train_w_packed_t = None
         else:
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
+            self._train_w_packed = None
+            self._train_w_packed_t = None
+
+    def _cached_packed_weights(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.training_weight_cache_enabled:
+            raise RuntimeError("BitLinearGroup packed low-bit cache is not enabled")
+        if self._train_w_packed is None or self._train_w_packed_t is None:
+            raise RuntimeError(
+                "bitlinear_fp8=ternary was configured after cache allocation; "
+                "refresh_bitlinear_training_cache() を実行してください"
+            )
+        return self._train_w_packed, self._train_w_packed_t, self._train_w_scale
 
     def _cached_fp8_weights(
         self,
@@ -1097,6 +1437,26 @@ class BitLinearGroup(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         members = self.members()
+        if self.training and self._fp8_mode == "ternary":
+            if self.activation_precision != "int8":
+                raise RuntimeError(
+                    "bitlinear_fp8=ternary は activation_precision=int8 専用です"
+                )
+            if not x.is_cuda:
+                raise RuntimeError(
+                    "bitlinear_fp8=ternary received non-CUDA input; "
+                    "暗黙フォールバックは禁止"
+                )
+            w_packed, w_packed_t, row_scale = self._cached_packed_weights()
+            weights = tuple(member.weight for member in members)
+            return TernaryBitLinearSTE.apply(
+                x,
+                w_packed,
+                w_packed_t,
+                row_scale,
+                self.out_splits,
+                *weights,
+            )
         if self.training and self._fp8_mode == "int8":
             if self.activation_precision != "int8":
                 raise RuntimeError(
@@ -1247,12 +1607,12 @@ def configure_bitlinear_training_cache(
     fusion_info = install_arbor_projection_fusions(module)
     all_modules = list(module.modules())
     groups = [child for child in all_modules if isinstance(child, BitLinearGroup)]
-    native_int8 = any(
+    native_lowbit = any(
         isinstance(child, (BitLinear, BitLinearGroup))
-        and child._fp8_mode == "int8"
+        and child._fp8_mode in {"int8", "ternary"}
         for child in all_modules
     )
-    effective_min_numel = 0 if native_int8 else int(min_numel)
+    effective_min_numel = 0 if native_lowbit else int(min_numel)
     linears = [
         child
         for child in all_modules
@@ -1313,7 +1673,7 @@ def configure_bitlinear_training_cache(
     cached_matrices = sum(group.matrix_count for group in selected_groups) + len(
         selected_linears
     )
-    if native_int8 and cached_matrices != len(linears):
+    if native_lowbit and cached_matrices != len(linears):
         required = sum(group.cache_cost_bytes for group in groups)
         covered_by_any_group = {
             id(member) for group in groups for member in group.members()
@@ -1324,7 +1684,7 @@ def configure_bitlinear_training_cache(
             if id(layer) not in covered_by_any_group
         )
         raise RuntimeError(
-            "bitlinear_fp8=int8 は全BitLinearのlow-bit cacheを必要とします: "
+            "bitlinear_fp8=int8/ternary は全BitLinearのlow-bit cacheを必要とします: "
             f"cached={cached_matrices}/{len(linears)}, "
             f"budget={0 if budget is None else budget / 2**30:.2f}GiB, "
             f"required≈{required / 2**30:.2f}GiB。"
@@ -1340,7 +1700,15 @@ def configure_bitlinear_training_cache(
         "cache_bytes": used,
         "cache_gib": used / 2**30,
         "grad_accum_steps": int(grad_accum_steps),
-        "cache_format": "int8+fp8_dual_layout" if any(
+        "cache_format": (
+            "packed2_dual_layout"
+            if any(
+                isinstance(child, (BitLinear, BitLinearGroup))
+                and child._fp8_mode == "ternary"
+                for child in all_modules
+            )
+            else "int8+fp8_dual_layout"
+        ) if any(
             isinstance(child, (BitLinear, BitLinearGroup))
             and child._fp8_mode != "off"
             for child in all_modules

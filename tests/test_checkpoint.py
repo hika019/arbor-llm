@@ -200,7 +200,7 @@ def test_recovery_checkpoint_is_durable_before_validation_failure(tmp_path):
         extra={"validation": None, "validation_status": "pending"},
     )
 
-    step_dir = manager.save(model, optimizer, None, {"offset": 20}, meta)
+    manager.save(model, optimizer, None, {"offset": 20}, meta)
     manager.wait_for_pending_save()  # training loop must do this before validation
     with pytest.raises(RuntimeError, match="validation crash"):
         raise RuntimeError("validation crash")

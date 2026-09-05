@@ -536,10 +536,10 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     if fp8_mode == "native":
         fp8_mode = "int8"
         speed_cfg["bitlinear_fp8"] = "int8"
-    if fp8_mode not in {"off", "bwd", "full", "int8"}:
+    if fp8_mode not in {"off", "bwd", "full", "int8", "ternary"}:
         raise ValueError(
             f"unknown speed.bitlinear_fp8: {fp8_mode!r} "
-            "(choices: off | bwd | full | int8; auto/fallbackは禁止)"
+            "(choices: off | bwd | full | int8 | ternary; auto/fallbackは禁止)"
         )
     if fp8_mode != "off" and device.type != "cuda":
         raise ValueError(

@@ -14,7 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.infer.generate import BYTE_OFFSET, VOCAB_SIZE, load_checkpoint_config, load_inference_model, resolve_checkpoint
+from src.infer.generate import (  # noqa: E402
+    BYTE_OFFSET,
+    VOCAB_SIZE,
+    load_checkpoint_config,
+    load_inference_model,
+    resolve_checkpoint,
+)
 
 
 def ids(s: str) -> list[int]:
