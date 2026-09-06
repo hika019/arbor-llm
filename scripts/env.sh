@@ -32,7 +32,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # TORCHINDUCTOR_COMPILE_THREADS は未指定なら PyTorch が CPU 数から決める。
 # 1Bモデルの初回compileはhost RAMのpeakが大きいため、WSL既定環境では控えめにする。
 # 潤沢なRAMの環境では source 前に上書きしてよい。
-export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-2}"
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-6}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 # stdout をファイルにリダイレクトする本番run向け: block buffering だと

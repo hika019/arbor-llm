@@ -431,6 +431,10 @@ def _packed_linear_tile(
 ) -> tuple[int, int, int, int]:
     if grouped_decode:
         return 32, 64, 128, 4
+    if k == 4096 and n == 768 and m >= 32768:
+        return 128, 128, 64, 4
+    if k == 768 and n == 4096 and m >= 131072:
+        return 128, 128, 64, 4
     if m >= 16384 and ((k == 768 and n == 4096) or (k == 4096 and n == 768)):
         return 128, 64, 64, 4
     if m >= 32 and n >= 64:

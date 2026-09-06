@@ -267,8 +267,14 @@ def test_lowbit_tile_presets_cover_small_and_arbor_shapes():
         16384, 4096, 768, grouped_decode=False
     ) == (128, 64, 64, 4)
     assert _packed_linear_tile(
+        32768, 768, 4096, grouped_decode=False
+    ) == (128, 128, 64, 4)
+    assert _packed_linear_tile(
         16384, 768, 4096, grouped_decode=False
     ) == (128, 64, 64, 4)
+    assert _packed_linear_tile(
+        131072, 4096, 768, grouped_decode=False
+    ) == (128, 128, 64, 4)
     assert _packed_linear_tile(
         1024, 11264, 2048, grouped_decode=False
     ) == (32, 64, 32, 4)
