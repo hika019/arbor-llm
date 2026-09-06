@@ -47,6 +47,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+if hasattr(torch, "_scaled_mm_v2"):
+    torch.compiler.allow_in_graph(torch._scaled_mm_v2)
+
 try:
     import triton
     import triton.language as tl
