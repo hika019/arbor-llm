@@ -61,7 +61,16 @@ def main() -> None:
     ap.add_argument(
         "--ternary-backend",
         default=None,
-        choices=["dot", "add_sub", "tl_dot", "tensor_core"],
+        choices=[
+            "dot",
+            "dot_current",
+            "add_sub",
+            "tl_dot",
+            "tensor_core",
+            "optimized",
+            "current",
+            "legacy",
+        ],
         help="packed ternary forward/dX backend。既定は config speed.bitlinear_ternary_backend",
     )
     ap.add_argument(

@@ -211,6 +211,7 @@ def test_unknown_int8_backend_is_error():
 def test_ternary_backend_aliases_and_unknown_backend():
     assert set_bitlinear_ternary_backend("tensor-core") == "dot"
     assert set_bitlinear_ternary_backend("tl_dot") == "dot"
+    assert set_bitlinear_ternary_backend("current") == "dot_current"
     assert set_bitlinear_ternary_backend("add-sub") == "add_sub"
     assert set_bitlinear_ternary_backend("dot") == "dot"
     with pytest.raises(ValueError, match="ternary backend"):
@@ -218,8 +219,15 @@ def test_ternary_backend_aliases_and_unknown_backend():
 
 
 def test_lowbit_tile_presets_cover_small_and_arbor_shapes():
-    assert _packed_linear_tile(7, 17, 33, add_sub=True) == (16, 32, 32, 4)
-    assert _packed_linear_tile(1024, 2048, 2048, add_sub=False) == (
+    assert _packed_linear_tile(
+        7, 17, 33, add_sub=True, grouped_decode=False
+    ) == (16, 32, 32, 4)
+    assert _packed_linear_tile(
+        1024, 2048, 2048, add_sub=False, grouped_decode=True
+    ) == (32, 64, 128, 4)
+    assert _packed_linear_tile(
+        1024, 2048, 2048, add_sub=False, grouped_decode=False
+    ) == (
         32, 64, 32, 4
     )
     assert _wgrad_tile(7, 17, 33) == (32, 32, 32, 4)
@@ -298,7 +306,7 @@ def test_native_int8_forward_and_fp8_backward_cuda():
     ) > 0.98
 
 
-@pytest.mark.parametrize("ternary_backend", ["dot", "add_sub"])
+@pytest.mark.parametrize("ternary_backend", ["dot", "dot_current", "add_sub"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_ternary_forward_dgrad_and_wgrad_cuda(ternary_backend):
     torch.manual_seed(0)

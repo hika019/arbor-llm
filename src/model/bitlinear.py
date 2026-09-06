@@ -31,8 +31,9 @@ ternary 重みは optimizer step 後に INT8 {-1,0,+1} と FP8 の両レイア�
             CUDA GEMM。per-token activation scale × per-weight scale で BF16 に戻す。
             backward は cached FP8 weight と FP8 GEMM を使う。RTX 5090向け既定候補。
   - "ternary": forward / dX は 2bit packed weight を直接 decode する Triton
-               kernel。既定は Tensor Core を使う tl.dot backend で、ADD/SUB backend
-               は明示A/B用。dW は A8 INT8 dense GEMM。
+               kernel。既定は packed byte を4 weight単位でload/decodeして
+               Tensor Core を使う tl.dot backend。旧decodeとADD/SUB backendは
+               明示A/B用。dW は A8 INT8 dense GEMM。
                shadow weight は BF16 のまま保持し、optimizer step 後だけcache更新。
 
 推論パス (任意): `freeze_for_inference()` を呼ぶと dequantize 済み ternary 重みを
@@ -190,6 +191,7 @@ if triton is not None:
         stride_xm: tl.constexpr, stride_ym: tl.constexpr,
         SCALE_PER_OUTPUT: tl.constexpr,
         ADD_SUB: tl.constexpr,
+        GROUPED_DECODE: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
         """2bit weightをregisterでdecodeするpacked GEMM core."""
@@ -221,8 +223,47 @@ if triton is not None:
                         tl.where(code[None, :] == 0, -x[:, None], 0),
                     )
                     acc += signed_x
+        elif GROUPED_DECODE:
+            # packed byteを4 weight単位で1回だけloadし、4本のINT8 dotへ分ける。
+            # 旧decode pathは同じpacked byteをK方向に4回参照する形になる。
+            offs_pk = tl.arange(0, BLOCK_K // 4)
+            for k0 in range(0, k, BLOCK_K):
+                k_base = k0 + offs_pk * 4
+                packed = tl.load(
+                    w_ptr + offs_n[None, :] * k_packed + (k_base // 4)[:, None],
+                    mask=(offs_n[None, :] < n) & (k_base[:, None] < k),
+                    other=1,  # code 1 = ternary 0
+                )
+                w0 = ((packed & 3).to(tl.int32) - 1).to(tl.int8)
+                w1 = (((packed >> 2) & 3).to(tl.int32) - 1).to(tl.int8)
+                w2 = (((packed >> 4) & 3).to(tl.int32) - 1).to(tl.int8)
+                w3 = (((packed >> 6) & 3).to(tl.int32) - 1).to(tl.int8)
+                x0 = tl.load(
+                    x_ptr + offs_m[:, None] * stride_xm + (k_base + 0)[None, :],
+                    mask=(offs_m[:, None] < m) & ((k_base + 0)[None, :] < k),
+                    other=0,
+                )
+                x1 = tl.load(
+                    x_ptr + offs_m[:, None] * stride_xm + (k_base + 1)[None, :],
+                    mask=(offs_m[:, None] < m) & ((k_base + 1)[None, :] < k),
+                    other=0,
+                )
+                x2 = tl.load(
+                    x_ptr + offs_m[:, None] * stride_xm + (k_base + 2)[None, :],
+                    mask=(offs_m[:, None] < m) & ((k_base + 2)[None, :] < k),
+                    other=0,
+                )
+                x3 = tl.load(
+                    x_ptr + offs_m[:, None] * stride_xm + (k_base + 3)[None, :],
+                    mask=(offs_m[:, None] < m) & ((k_base + 3)[None, :] < k),
+                    other=0,
+                )
+                acc += tl.dot(x0, w0, out_dtype=tl.int32)
+                acc += tl.dot(x1, w1, out_dtype=tl.int32)
+                acc += tl.dot(x2, w2, out_dtype=tl.int32)
+                acc += tl.dot(x3, w3, out_dtype=tl.int32)
         else:
-            # 既存推論経路: packed load/decode後にvectorized INT8 dot。
+            # 旧decode経路: packed load/decode後にvectorized INT8 dot。
             offs_k = tl.arange(0, BLOCK_K)
             for k0 in range(0, k, BLOCK_K):
                 k_idxs = k0 + offs_k
@@ -409,11 +450,13 @@ if triton is not None:
 
 
 def _packed_linear_tile(
-    m: int, n: int, k: int, *, add_sub: bool
+    m: int, n: int, k: int, *, add_sub: bool, grouped_decode: bool
 ) -> tuple[int, int, int, int]:
     del k
     if add_sub:
         return 16, 32, 32, 4
+    if grouped_decode:
+        return 32, 64, 128, 4
     if m >= 32 and n >= 64:
         return 32, 64, 32, 4
     return 16, 32, 32, 4
@@ -437,13 +480,14 @@ def _packed_linear(
     out_dtype: torch.dtype,
     *,
     add_sub: bool = False,
+    grouped_decode: bool = True,
 ) -> torch.Tensor:
     m = x_q.size(0)
     if sw.numel() not in (1, n):
         raise ValueError(f"packed weight scale must have 1 or N={n} values")
     y = torch.empty((m, n), device=x_q.device, dtype=out_dtype)
     block_m, block_n, block_k, num_warps = _packed_linear_tile(
-        m, n, k, add_sub=add_sub
+        m, n, k, add_sub=add_sub, grouped_decode=grouped_decode
     )
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
     _packed_bitlinear_kernel[grid](
@@ -452,6 +496,7 @@ def _packed_linear(
         x_q.stride(0), y.stride(0),
         SCALE_PER_OUTPUT=sw.numel() != 1,
         ADD_SUB=add_sub,
+        GROUPED_DECODE=grouped_decode,
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=num_warps,
     )
@@ -650,7 +695,7 @@ _FP8_E4M3 = torch.float8_e4m3fn
 _FP8_MAX = 448.0  # e4m3fn の最大有限値
 _FP8_MODES = ("off", "bwd", "full", "int8", "ternary")
 _INT8_BACKENDS = ("auto", "int_mm", "triton")
-_TERNARY_BACKENDS = ("dot", "add_sub")
+_TERNARY_BACKENDS = ("dot", "dot_current", "add_sub")
 _int8_backend = "auto"
 _ternary_backend = "dot"
 
@@ -674,8 +719,10 @@ def set_bitlinear_ternary_backend(backend: str) -> str:
     """packed ternary forward/dX backendを選ぶ (process-global, compile前に設定)."""
     global _ternary_backend
     normalized = str(backend).lower().replace("-", "_")
-    if normalized in {"tl_dot", "tensor_core"}:
+    if normalized in {"tl_dot", "tensor_core", "optimized"}:
         normalized = "dot"
+    if normalized in {"current", "legacy"}:
+        normalized = "dot_current"
     if normalized not in _TERNARY_BACKENDS:
         raise ValueError(
             f"unknown bitlinear ternary backend: {backend!r} "
@@ -899,6 +946,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         w_packed_t: torch.Tensor,
         row_scale: torch.Tensor,
         add_sub: bool,
+        grouped_decode: bool,
         out_sizes: tuple[int, ...],
         *shadow_weights: torch.Tensor,
     ) -> torch.Tensor:
@@ -906,6 +954,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         ctx.input_shape = tuple(x.shape)
         ctx.out_sizes = out_sizes
         ctx.add_sub = add_sub
+        ctx.grouped_decode = grouped_decode
         x2 = x.reshape(-1, w_packed_t.size(0))
         x_int8, inv_sx = _quantize_a8_rows(x2)
         ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale)
@@ -918,6 +967,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
             row_scale.numel(),
             x.dtype,
             add_sub=add_sub,
+            grouped_decode=grouped_decode,
         )
         return y.reshape(*ctx.input_shape[:-1], row_scale.numel())
 
@@ -940,9 +990,10 @@ class TernaryBitLinearSTE(torch.autograd.Function):
                 w_packed_t.size(0),
                 grad_output.dtype,
                 add_sub=ctx.add_sub,
+                grouped_decode=ctx.grouped_decode,
             ).reshape(ctx.input_shape)
 
-        needs_w = ctx.needs_input_grad[6:]
+        needs_w = ctx.needs_input_grad[7:]
         if any(needs_w):
             x_q = x_int8.to(grad_output.dtype) * inv_sx.to(
                 grad_output.dtype
@@ -952,7 +1003,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
             grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
         else:
             grad_weights = tuple(None for _ in ctx.out_sizes)
-        return (grad_x, None, None, None, None, None, *grad_weights)
+        return (grad_x, None, None, None, None, None, None, *grad_weights)
 
 
 def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]:
@@ -1264,6 +1315,7 @@ class BitLinear(nn.Module):
             y = _packed_linear(
                 x_q, (1.0 / scale).reshape(-1), self._w_packed, self._w_scale,
                 self.in_features, self.out_features, torch.float32,
+                grouped_decode=True,
             ).to(x.dtype)
         else:
             y = F.linear(self._quantize_act(x2), self._w_dq)
@@ -1289,6 +1341,7 @@ class BitLinear(nn.Module):
                 w_packed_t,
                 row_scale,
                 _ternary_backend == "add_sub",
+                _ternary_backend == "dot",
                 (self.out_features,),
                 self.weight,
             )
@@ -1500,6 +1553,7 @@ class BitLinearGroup(nn.Module):
                 w_packed_t,
                 row_scale,
                 _ternary_backend == "add_sub",
+                _ternary_backend == "dot",
                 self.out_splits,
                 *weights,
             )
