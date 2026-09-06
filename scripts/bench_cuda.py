@@ -64,7 +64,6 @@ def main() -> None:
         choices=[
             "dot",
             "dot_current",
-            "add_sub",
             "tl_dot",
             "tensor_core",
             "optimized",

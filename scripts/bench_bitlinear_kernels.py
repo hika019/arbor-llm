@@ -4,8 +4,7 @@ Measures the decode question directly:
 
   A. unpacked INT8 W + Triton tl.dot
   B. packed2 W + current logical-K decode + tl.dot
-  C. packed2 W + grouped 4-way decode + tl.dot
-  D. packed2 W + ADD/SUB/SKIP
+  C. packed2 W + grouped 4-way decode + tl.dot (A/B only)
 
 Example:
   python -m scripts.bench_bitlinear_kernels --shape 1024,2048,2048
@@ -111,7 +110,6 @@ def _bench_shape(
             k,
             n,
             dtype,
-            add_sub=False,
             grouped_decode=False,
         ),
         "packed_dot": lambda: _packed_linear(
@@ -122,19 +120,7 @@ def _bench_shape(
             k,
             n,
             dtype,
-            add_sub=False,
             grouped_decode=True,
-        ),
-        "packed_add_sub": lambda: _packed_linear(
-            x_int8,
-            inv_sx,
-            w_packed,
-            row_scale,
-            k,
-            n,
-            dtype,
-            add_sub=True,
-            grouped_decode=False,
         ),
     }
     if check:

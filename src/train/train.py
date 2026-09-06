@@ -555,7 +555,7 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             "(choices: auto | int_mm | triton)"
         )
     ternary_backend = str(
-        speed_cfg.get("bitlinear_ternary_backend", "dot")
+        speed_cfg.get("bitlinear_ternary_backend", "dot_current")
     ).lower().replace("-", "_")
     if ternary_backend in {"tl_dot", "tensor_core", "optimized"}:
         ternary_backend = "dot"
@@ -563,10 +563,10 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     if ternary_backend in {"current", "legacy"}:
         ternary_backend = "dot_current"
         speed_cfg["bitlinear_ternary_backend"] = "dot_current"
-    if ternary_backend not in {"dot", "dot_current", "add_sub"}:
+    if ternary_backend not in {"dot", "dot_current"}:
         raise ValueError(
             f"unknown speed.bitlinear_ternary_backend: {ternary_backend!r} "
-            "(choices: dot | dot_current | add_sub)"
+            "(choices: dot | dot_current)"
         )
     compile_mode = str(speed_cfg.get("compile_mode", "default"))
     grad_accum = int(speed_cfg.get("grad_accum_steps", 1))

@@ -177,7 +177,7 @@ speed:
                                 # ternary=packed 2bit forward/dX + INT8 dW (要A/B benchmark)。
                                 # bwd=forward BF16 維持で backward のみ FP8。fullは追加丸めが乗る。
   bitlinear_int8_backend: auto  # choices: auto | int_mm | triton。5090では両者をA/Bする。
-  bitlinear_ternary_backend: dot # choices: dot | dot_current | add_sub。dotは4-way decode後にtl.dot。
+  bitlinear_ternary_backend: dot_current # choices: dot_current | dot。dot_currentは旧vectorized decode、dotは4-way grouped decode。
   bitnet_weight_cache: full     # int8/ternary は全 BitLinear の low-bit cache が必須
   bitnet_weight_cache_gib: 3.25 # INT8 ternary + FP8(N×K/K×N)両layout用
   bitnet_weight_cache_min_numel: 0

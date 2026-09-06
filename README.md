@@ -234,10 +234,9 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   FP8化する`full`は追加丸めと速度低下があり得るため既定では使わない。
 - `speed.bitlinear_fp8: ternary` は実験的な学習経路。optimizer step後に
   forward用とdX用のternary weightをそれぞれ2bit（4 weights/byte）へpackし、
-  Triton kernel内でdecodeする。既定の `speed.bitlinear_ternary_backend: dot` は
-  packed byteを4 weight単位でload/decodeして `tl.dot` でINT8 Tensor Coreを使う。
-  `dot_current` は旧decode比較用、`add_sub` はADD/SUB/SKIP方式の診断用backendで、
-  実測で `dot` を上回る場合だけ採用候補にする。dWは
+  Triton kernel内でdecodeする。既定の `speed.bitlinear_ternary_backend: dot_current` は
+  旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
+  `dot` は4-way grouped decode比較用。dWは
   `Q(dY)^T Q(X)` のINT8 dense GEMMで計算する。既定値にはしていない。
 - `model.global_attn_impl: flex` は CUDA + `torch.compile` 必須。条件を満たさない
   場合はエラーになり、SDPAへ暗黙フォールバックしない。
