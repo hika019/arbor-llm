@@ -429,9 +429,10 @@ if triton is not None:
 def _packed_linear_tile(
     m: int, n: int, k: int, *, grouped_decode: bool
 ) -> tuple[int, int, int, int]:
-    del k
     if grouped_decode:
         return 32, 64, 128, 4
+    if m >= 16384 and ((k == 768 and n == 4096) or (k == 4096 and n == 768)):
+        return 128, 64, 64, 4
     if m >= 32 and n >= 64:
         return 32, 64, 32, 4
     return 16, 32, 32, 4

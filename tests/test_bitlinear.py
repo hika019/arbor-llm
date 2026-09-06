@@ -263,6 +263,15 @@ def test_lowbit_tile_presets_cover_small_and_arbor_shapes():
     ) == (
         32, 64, 32, 4
     )
+    assert _packed_linear_tile(
+        16384, 4096, 768, grouped_decode=False
+    ) == (128, 64, 64, 4)
+    assert _packed_linear_tile(
+        16384, 768, 4096, grouped_decode=False
+    ) == (128, 64, 64, 4)
+    assert _packed_linear_tile(
+        1024, 11264, 2048, grouped_decode=False
+    ) == (32, 64, 32, 4)
     assert _wgrad_tile(7, 17, 33) == (32, 32, 32, 4)
     assert _wgrad_tile(1024, 2048, 2048) == (64, 64, 64, 8)
 

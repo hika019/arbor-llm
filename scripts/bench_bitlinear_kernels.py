@@ -8,15 +8,17 @@ Measures the decode question directly:
   D. packed2 W + grouped 4-way decode + tl.dot (A/B only)
 
 Example:
-  python -m scripts.bench_bitlinear_kernels --shape 1024,2048,2048
+  python -m scripts.bench_bitlinear_kernels --shape 1024,2048,11264
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import statistics
 
 import torch
 
+import src.model.bitlinear as bitlinear_mod
 from src.model.bitlinear import (
     _FP8_E4M3,
     _int8_wgrad_kernel,
@@ -43,9 +45,10 @@ except Exception:  # pragma: no cover - CUDA stack dependent
 
 
 DEFAULT_SHAPES = (
-    "1024,2048,2048",
-    "1024,2048,5632",
+    "1024,2048,11264",
     "1024,5632,2048",
+    "1024,2048,3072",
+    "1024,2048,2048",
 )
 
 
@@ -59,6 +62,37 @@ def _parse_shape(spec: str) -> tuple[int, int, int]:
     if min(m, k, n) <= 0:
         raise argparse.ArgumentTypeError(f"shape values must be positive: {spec!r}")
     return m, k, n
+
+
+def _parse_tile(spec: str) -> tuple[int, int, int, int]:
+    try:
+        bm, bn, bk, warps = (int(part) for part in spec.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"tile must be BM,BN,BK,WARPS, got {spec!r}"
+        ) from exc
+    if min(bm, bn, bk, warps) <= 0:
+        raise argparse.ArgumentTypeError(f"tile values must be positive: {spec!r}")
+    return bm, bn, bk, warps
+
+
+@contextlib.contextmanager
+def _override_dot_current_tile(tile: tuple[int, int, int, int] | None):
+    if tile is None:
+        yield
+        return
+    original = bitlinear_mod._packed_linear_tile
+
+    def forced_tile(m: int, n: int, k: int, *, grouped_decode: bool):
+        if grouped_decode:
+            return original(m, n, k, grouped_decode=grouped_decode)
+        return tile
+
+    bitlinear_mod._packed_linear_tile = forced_tile
+    try:
+        yield
+    finally:
+        bitlinear_mod._packed_linear_tile = original
 
 
 def _sync() -> None:
@@ -393,6 +427,12 @@ def main() -> None:
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument("--wgrad", action="store_true")
     parser.add_argument(
+        "--packed-tile",
+        type=_parse_tile,
+        default=None,
+        help="Override dot_current packed tile as BM,BN,BK,WARPS for experiments.",
+    )
+    parser.add_argument(
         "--breakdown",
         action="store_true",
         help="Also measure fwd/dX/dW quantization and GEMM components.",
@@ -406,16 +446,20 @@ def main() -> None:
     shapes = args.shape or [_parse_shape(spec) for spec in DEFAULT_SHAPES]
     dtype = getattr(torch, args.dtype)
     torch.manual_seed(0)
-    for shape in shapes:
-        _bench_shape(
-            shape,
-            dtype=dtype,
-            warmup=args.warmup,
-            iters=args.iters,
-            check=not args.no_check,
-            include_wgrad=args.wgrad,
-            breakdown=args.breakdown,
-        )
+    if args.packed_tile is not None:
+        bm, bn, bk, warps = args.packed_tile
+        print(f"[override] dot_current tile BM={bm} BN={bn} BK={bk} warps={warps}")
+    with _override_dot_current_tile(args.packed_tile):
+        for shape in shapes:
+            _bench_shape(
+                shape,
+                dtype=dtype,
+                warmup=args.warmup,
+                iters=args.iters,
+                check=not args.no_check,
+                include_wgrad=args.wgrad,
+                breakdown=args.breakdown,
+            )
 
 
 if __name__ == "__main__":
