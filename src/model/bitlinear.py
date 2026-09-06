@@ -669,8 +669,10 @@ _FP8_MAX = 448.0  # e4m3fn の最大有限値
 _FP8_MODES = ("off", "bwd", "full", "int8", "ternary")
 _INT8_BACKENDS = ("auto", "int_mm", "triton")
 _TERNARY_BACKENDS = ("dot", "dot_current")
+_TERNARY_WGRAD_BACKENDS = ("int8", "fp8", "auto")
 _int8_backend = "auto"
 _ternary_backend = "dot_current"
+_ternary_wgrad_backend = "int8"
 
 
 def set_bitlinear_int8_backend(backend: str) -> str:
@@ -702,6 +704,26 @@ def set_bitlinear_ternary_backend(backend: str) -> str:
             f"(choices: {_TERNARY_BACKENDS})"
         )
     _ternary_backend = normalized
+    return normalized
+
+
+def set_bitlinear_ternary_wgrad_backend(backend: str) -> str:
+    """packed ternary dW backendを選ぶ (process-global, compile前に設定)."""
+    global _ternary_wgrad_backend
+    normalized = str(backend).lower().replace("-", "_")
+    if normalized in {"hybrid", "shape_auto"}:
+        normalized = "auto"
+    if normalized not in _TERNARY_WGRAD_BACKENDS:
+        raise ValueError(
+            f"unknown bitlinear ternary wgrad backend: {backend!r} "
+            f"(choices: {_TERNARY_WGRAD_BACKENDS})"
+        )
+    if normalized == "fp8" and not fp8_gemm_supported():
+        raise RuntimeError(
+            "bitlinear ternary wgrad backend=fp8 には "
+            "compute capability 8.9 以上の CUDA GPU が必要です"
+        )
+    _ternary_wgrad_backend = normalized
     return normalized
 
 
@@ -774,6 +796,53 @@ def _scaled_mm_tensorwise(
         scale_b=scale_b,
         out_dtype=out_dtype,
     )
+
+
+def _fp8_wgrad(
+    grad_output: torch.Tensor,
+    x_q: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """tensorwise FP8 dYᵀ@X。ternary/int8両training経路で共有可能."""
+    gt_f8, sg = _cast_fp8_tensorwise_transposed(grad_output)
+    x_km, sx = _cast_fp8_tensorwise_transposed(x_q)
+    return _scaled_mm_tensorwise(
+        gt_f8,
+        x_km.t(),
+        sg,
+        sx,
+        out_dtype,
+    )
+
+
+def _ternary_wgrad(
+    grad_output: torch.Tensor,
+    x_q: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """configured backendでpacked ternary trainingのshadow-weight dWを計算."""
+    m, n = grad_output.shape
+    k = x_q.size(1)
+    dims_ok = _fp8_dims_ok(m, k, n)
+    use_fp8 = _ternary_wgrad_backend == "fp8" or (
+        _ternary_wgrad_backend == "auto"
+        and n >= k
+        and fp8_gemm_supported()
+        and dims_ok
+    )
+    if use_fp8:
+        if not fp8_gemm_supported():
+            raise RuntimeError(
+                "bitlinear ternary wgrad backend=fp8 には "
+                "compute capability 8.9 以上の CUDA GPU が必要です"
+            )
+        if not dims_ok:
+            raise RuntimeError(
+                "bitlinear ternary wgrad backend=fp8 requires "
+                f"M/K/N multiples of 16, got M={m} K={k} N={n}"
+            )
+        return _fp8_wgrad(grad_output, x_q, out_dtype)
+    return _lowbit_wgrad(grad_output, x_q, out_dtype)
 
 
 class _Fp8BitLinearSTE(torch.autograd.Function):
@@ -967,7 +1036,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
             x_q = x_int8.to(grad_output.dtype) * inv_sx.to(
                 grad_output.dtype
             ).unsqueeze(1)
-            grad_w = _lowbit_wgrad(g2, x_q, grad_output.dtype)
+            grad_w = _ternary_wgrad(g2, x_q, grad_output.dtype)
             raw = grad_w.split(ctx.out_sizes, dim=0)
             grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
         else:

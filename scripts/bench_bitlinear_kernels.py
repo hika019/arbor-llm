@@ -18,14 +18,19 @@ import statistics
 import torch
 
 from src.model.bitlinear import (
+    _FP8_E4M3,
     _int8_wgrad_kernel,
     _int8_linear,
+    _cast_fp8_tensorwise,
+    _cast_fp8_tensorwise_transposed,
     _lowbit_wgrad,
     _packed_linear,
     _quantize_a8_rows,
     _quantize_a8_rows_scaled,
     _quantize_int8_tensorwise,
+    _scaled_mm_tensorwise,
     _wgrad_tile,
+    fp8_gemm_supported,
     pack_ternary_weight,
     set_bitlinear_int8_backend,
     ternary_quantize_int8,
@@ -119,6 +124,68 @@ def _wgrad_gemm_from_quantized(
         num_warps=num_warps,
     )
     return out
+
+
+def _int8_fp8_dx(
+    grad: torch.Tensor,
+    row_scale: torch.Tensor,
+    w_fp8_t: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Replicate _Int8BitLinearSTE.backward dX: cast(g*w_scale)->FP8 scaled_mm."""
+    n = row_scale.numel()
+    g2 = grad.reshape(-1, n)
+    one = row_scale.new_ones(())
+    gs_f8, sgs = _cast_fp8_tensorwise(g2 * row_scale.to(g2.dtype))
+    return _scaled_mm_tensorwise(gs_f8, w_fp8_t.t(), sgs, one, out_dtype)
+
+
+def _int8_fp8_wgrad(
+    grad: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Replicate the full _Int8BitLinearSTE.backward dW path."""
+    n = grad.size(-1)
+    g2 = grad.reshape(-1, n)
+    x_q = x_int8.to(out_dtype) * inv_sx.to(out_dtype).unsqueeze(1)
+    gt_f8, sg = _cast_fp8_tensorwise_transposed(g2)
+    x_km, sx = _cast_fp8_tensorwise_transposed(x_q)
+    return _scaled_mm_tensorwise(gt_f8, x_km.t(), sg, sx, out_dtype)
+
+
+def _ternary_dx(
+    grad: torch.Tensor,
+    row_scale: torch.Tensor,
+    w_packed_t: torch.Tensor,
+    k: int,
+    n: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Replicate the full TernaryBitLinearSTE.backward dX path."""
+    g_int8, inv_sg = _quantize_a8_rows_scaled(grad, row_scale)
+    return _packed_linear(
+        g_int8,
+        inv_sg,
+        w_packed_t,
+        row_scale.new_ones(()),
+        n,
+        k,
+        out_dtype,
+        grouped_decode=False,
+    )
+
+
+def _ternary_wgrad(
+    grad: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Replicate the full TernaryBitLinearSTE.backward dW path."""
+    x_q = x_int8.to(out_dtype) * inv_sx.to(out_dtype).unsqueeze(1)
+    return _lowbit_wgrad(grad, x_q, out_dtype)
 
 
 def _print_results(
@@ -233,6 +300,17 @@ def _bench_shape(
                 dtype,
                 grouped_decode=False,
             ),
+            "ternary_dx_total": lambda: _ternary_dx(
+                grad,
+                row_scale,
+                w_packed_t,
+                k,
+                n,
+                dtype,
+            ),
+            "x_reconstruct": lambda: (
+                x_int8.to(dtype) * inv_sx.to(dtype).unsqueeze(1)
+            ),
             "wgrad_quant": lambda: (
                 _quantize_int8_tensorwise(grad),
                 _quantize_int8_tensorwise(x_q),
@@ -244,14 +322,59 @@ def _bench_shape(
                 wx_sx,
                 dtype,
             ),
-            "wgrad_total": lambda: _lowbit_wgrad(grad, x_q, dtype),
+            "wgrad_core": lambda: _lowbit_wgrad(grad, x_q, dtype),
+            "ternary_wgrad_total": lambda: _ternary_wgrad(
+                grad,
+                x_int8,
+                inv_sx,
+                dtype,
+            ),
         }
+        # INT8 training mode の実運用 backward (FP8 dX / FP8 dW) を同一 shape で
+        # 比較対象へ追加する。full-training 差の主犯 (dX か dW か) を切り分ける。
+        fp8_ok = (
+            fp8_gemm_supported()
+            and m % 16 == 0
+            and k % 16 == 0
+            and n % 16 == 0
+        )
+        if fp8_ok:
+            w_fp8 = w_int8.to(_FP8_E4M3).contiguous()
+            w_fp8_t = w_fp8.t().contiguous()
+            breakdown_kernels["int8_fp8_dx"] = (
+                lambda: _int8_fp8_dx(grad, row_scale, w_fp8_t, dtype)
+            )
+            breakdown_kernels["int8_fp8_wgrad"] = (
+                lambda: _int8_fp8_wgrad(grad, x_int8, inv_sx, dtype)
+            )
+        else:
+            print(
+                "  [info] FP8 backward skipped "
+                f"(fp8_supported={fp8_gemm_supported()}, dims_ok="
+                f"{m % 16 == 0 and k % 16 == 0 and n % 16 == 0})"
+            )
         print("\n[breakdown]")
         breakdown_results = {
             name: _measure(fn, warmup=warmup, iters=iters)
             for name, fn in breakdown_kernels.items()
         }
         _print_results(breakdown_results, baseline_name="fwd_int8_int_mm")
+        if fp8_ok:
+            ternary_dx_ms = breakdown_results["ternary_dx_total"]["median"]
+            fp8_dx_ms = breakdown_results["int8_fp8_dx"]["median"]
+            ternary_dw_ms = breakdown_results["ternary_wgrad_total"]["median"]
+            fp8_dw_ms = breakdown_results["int8_fp8_wgrad"]["median"]
+            print("\n[backward comparison]")
+            print(
+                "  dX  ternary/FP8: "
+                f"{ternary_dx_ms:.3f} / {fp8_dx_ms:.3f} ms  "
+                f"x{ternary_dx_ms / fp8_dx_ms:.2f}"
+            )
+            print(
+                "  dW  ternary/FP8: "
+                f"{ternary_dw_ms:.3f} / {fp8_dw_ms:.3f} ms  "
+                f"x{ternary_dw_ms / fp8_dw_ms:.2f}"
+            )
 
 
 def main() -> None:

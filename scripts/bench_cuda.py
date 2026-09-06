@@ -73,6 +73,13 @@ def main() -> None:
         help="packed ternary forward/dX backend。既定は config speed.bitlinear_ternary_backend",
     )
     ap.add_argument(
+        "--ternary-wgrad-backend",
+        default=None,
+        choices=["int8", "fp8", "auto"],
+        help="packed ternary dW backend。既定は config "
+        "speed.bitlinear_ternary_wgrad_backend",
+    )
+    ap.add_argument(
         "--weight-cache",
         default=None,
         choices=["off", "fused", "full", "auto"],
@@ -136,6 +143,7 @@ def main() -> None:
         set_bitlinear_fp8_mode,
         set_bitlinear_int8_backend,
         set_bitlinear_ternary_backend,
+        set_bitlinear_ternary_wgrad_backend,
     )
 
     int8_backend = set_bitlinear_int8_backend(
@@ -145,6 +153,10 @@ def main() -> None:
     ternary_backend = set_bitlinear_ternary_backend(
         args.ternary_backend
         or str(speed_cfg.get("bitlinear_ternary_backend", "dot"))
+    )
+    ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
+        args.ternary_wgrad_backend
+        or str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
     )
     fp8_mode = args.bitlinear_fp8
     if fp8_mode is None:
@@ -178,7 +190,8 @@ def main() -> None:
         f"cache={cache_info['cache_gib']:.2f}GiB "
         f"format={cache_info['cache_format']} "
         f"fp8={fp8_info['mode']} int8_backend={int8_backend} "
-        f"ternary_backend={ternary_backend}"
+        f"ternary_backend={ternary_backend} "
+        f"ternary_wgrad_backend={ternary_wgrad_backend}"
     )
 
     run = model

@@ -14,6 +14,7 @@ from src.model.bitlinear import (
     configure_bitlinear_training_cache,
     fp8_gemm_supported,
     set_bitlinear_ternary_backend,
+    set_bitlinear_ternary_wgrad_backend,
     set_bitlinear_fp8_mode,
     set_bitlinear_int8_backend,
     weight_quant,
@@ -217,6 +218,42 @@ def test_ternary_backend_aliases_and_unknown_backend():
         set_bitlinear_ternary_backend("multiply_free")
 
 
+def test_ternary_wgrad_backend_aliases_and_unknown_backend():
+    assert set_bitlinear_ternary_wgrad_backend("hybrid") == "auto"
+    assert set_bitlinear_ternary_wgrad_backend("shape-auto") == "auto"
+    assert set_bitlinear_ternary_wgrad_backend("int8") == "int8"
+    with pytest.raises(ValueError, match="ternary wgrad backend"):
+        set_bitlinear_ternary_wgrad_backend("bf16")
+
+
+def test_ternary_wgrad_auto_selects_backend_by_shape(monkeypatch):
+    import src.model.bitlinear as bitlinear
+
+    monkeypatch.setattr(bitlinear, "fp8_gemm_supported", lambda: True)
+    monkeypatch.setattr(
+        bitlinear,
+        "_fp8_wgrad",
+        lambda grad, x, dtype: torch.full((grad.size(1), x.size(1)), 8.0),
+    )
+    monkeypatch.setattr(
+        bitlinear,
+        "_lowbit_wgrad",
+        lambda grad, x, dtype: torch.full((grad.size(1), x.size(1)), 1.0),
+    )
+    set_bitlinear_ternary_wgrad_backend("auto")
+    try:
+        fp8_result = bitlinear._ternary_wgrad(
+            torch.empty(16, 32), torch.empty(16, 16), torch.float32
+        )
+        int8_result = bitlinear._ternary_wgrad(
+            torch.empty(16, 16), torch.empty(16, 32), torch.float32
+        )
+    finally:
+        set_bitlinear_ternary_wgrad_backend("int8")
+    assert torch.all(fp8_result == 8)
+    assert torch.all(int8_result == 1)
+
+
 def test_lowbit_tile_presets_cover_small_and_arbor_shapes():
     assert _packed_linear_tile(
         1024, 2048, 2048, grouped_decode=True
@@ -337,6 +374,44 @@ def test_packed_ternary_forward_dgrad_and_wgrad_cuda(ternary_backend):
         packed.weight.grad.float().flatten(), ref.weight.grad.float().flatten(), dim=0
     ) > 0.98
     set_bitlinear_ternary_backend("dot")
+
+
+@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
+def test_packed_ternary_auto_fp8_wgrad_cuda():
+    torch.manual_seed(3)
+    set_bitlinear_ternary_backend("dot_current")
+    set_bitlinear_ternary_wgrad_backend("auto")
+    try:
+        ref = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16)
+        packed = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16)
+        packed.load_state_dict(ref.state_dict())
+        set_bitlinear_fp8_mode(packed, "ternary")
+        packed.enable_training_weight_cache(True)
+
+        x_ref = torch.randn(
+            32, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        x_packed = x_ref.detach().clone().requires_grad_(True)
+        y_ref = ref(x_ref)
+        y_packed = packed(x_packed)
+        torch.testing.assert_close(
+            y_packed.float(), y_ref.float(), atol=4e-3, rtol=4e-3
+        )
+
+        y_ref.square().mean().backward()
+        y_packed.square().mean().backward()
+        assert torch.isfinite(x_packed.grad).all()
+        assert torch.isfinite(packed.weight.grad).all()
+        assert torch.nn.functional.cosine_similarity(
+            x_packed.grad.float().flatten(), x_ref.grad.float().flatten(), dim=0
+        ) > 0.98
+        assert torch.nn.functional.cosine_similarity(
+            packed.weight.grad.float().flatten(),
+            ref.weight.grad.float().flatten(),
+            dim=0,
+        ) > 0.98
+    finally:
+        set_bitlinear_ternary_wgrad_backend("int8")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

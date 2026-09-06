@@ -568,6 +568,17 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             f"unknown speed.bitlinear_ternary_backend: {ternary_backend!r} "
             "(choices: dot | dot_current)"
         )
+    ternary_wgrad_backend = str(
+        speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8")
+    ).lower().replace("-", "_")
+    if ternary_wgrad_backend in {"hybrid", "shape_auto"}:
+        ternary_wgrad_backend = "auto"
+        speed_cfg["bitlinear_ternary_wgrad_backend"] = "auto"
+    if ternary_wgrad_backend not in {"int8", "fp8", "auto"}:
+        raise ValueError(
+            "unknown speed.bitlinear_ternary_wgrad_backend: "
+            f"{ternary_wgrad_backend!r} (choices: int8 | fp8 | auto)"
+        )
     compile_mode = str(speed_cfg.get("compile_mode", "default"))
     grad_accum = int(speed_cfg.get("grad_accum_steps", 1))
     if (
@@ -850,6 +861,7 @@ def main() -> int:
             set_bitlinear_fp8_mode,
             set_bitlinear_int8_backend,
             set_bitlinear_ternary_backend,
+            set_bitlinear_ternary_wgrad_backend,
         )
     except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
         refresh_bitlinear_training_cache = None
@@ -865,6 +877,9 @@ def main() -> int:
         )
         ternary_backend = set_bitlinear_ternary_backend(
             str(speed_cfg.get("bitlinear_ternary_backend", "dot"))
+        )
+        ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
+            str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
         )
         fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
         bitnet_cache_info = configure_bitlinear_training_cache(
@@ -888,7 +903,9 @@ def main() -> int:
         print(
             f"[train] bitlinear_fp8={fp8_info['mode']} "
             f"int8_backend={int8_backend} "
-            f"ternary_backend={ternary_backend} layers={fp8_info['layers']}"
+            f"ternary_backend={ternary_backend} "
+            f"ternary_wgrad_backend={ternary_wgrad_backend} "
+            f"layers={fp8_info['layers']}"
         )
 
     model = apply_compile_settings(model, cfg["speed"], device)

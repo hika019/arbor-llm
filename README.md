@@ -237,7 +237,10 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   Triton kernel内でdecodeする。既定の `speed.bitlinear_ternary_backend: dot_current` は
   旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
   `dot` は4-way grouped decode比較用。dWは
-  `Q(dY)^T Q(X)` のINT8 dense GEMMで計算する。既定値にはしていない。
+  `speed.bitlinear_ternary_wgrad_backend: int8|fp8|auto` で選択できる。
+  `int8` は `Q(dY)^T Q(X)` のdense INT8 GEMM、`fp8` はtensorwise FP8 GEMM、
+  `auto` は現在の代表shape測定に基づき `N>=K` でFP8、それ以外でINT8を使う。
+  end-to-end検証前のため既定は従来通り `int8`。ternary自体も既定値にはしていない。
 - `model.global_attn_impl: flex` は CUDA + `torch.compile` 必須。条件を満たさない
   場合はエラーになり、SDPAへ暗黙フォールバックしない。
 - `optim.state_precision: fp32` が既定。実データ1000-stepでloss 1.89まで安定して低下。

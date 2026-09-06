@@ -133,6 +133,15 @@ def test_unknown_ternary_backend_is_error():
         adapt_config_for_device(cfg, torch.device("cuda"))
 
 
+def test_unknown_ternary_wgrad_backend_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_wgrad_backend": "bf16"},
+    }
+    with pytest.raises(ValueError, match="bitlinear_ternary_wgrad_backend"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
 @pytest.mark.parametrize("compile_mode", ["reduce-overhead", "max-autotune"])
 def test_cuda_graph_compile_modes_reject_gradient_accumulation(compile_mode):
     cfg = {
