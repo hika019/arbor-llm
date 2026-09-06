@@ -30,6 +30,8 @@ from pathlib import Path
 
 # torch import / CUDA 初期化より前に効かせる必要がある env (env.sh と二重で保険).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "2")
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 import torch
 import torch._dynamo
@@ -705,7 +707,10 @@ def apply_compile_settings(
             "(torch 2.5 で backward が NaN になる実測バグ)。compile を切るか "
             "micro_batch_size を下げて gradient_checkpointing を外すこと"
         )
-    print(f"[train] torch_compile=ON mode={mode}")
+    print(
+        f"[train] torch_compile=ON mode={mode} "
+        f"compile_threads={os.environ.get('TORCHINDUCTOR_COMPILE_THREADS')}"
+    )
     return torch.compile(model, mode=mode)
 
 
@@ -1498,7 +1503,7 @@ def main() -> int:
 
             if cfg["optim"].get("grad_clip"):
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), cfg["optim"]["grad_clip"], foreach=True
+                    model.parameters(), cfg["optim"]["grad_clip"]
                 )
             opt_start = start_gpu_section("optimizer")
             optimizer.step()
