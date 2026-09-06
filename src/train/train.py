@@ -554,6 +554,17 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             f"unknown speed.bitlinear_int8_backend: {int8_backend!r} "
             "(choices: auto | int_mm | triton)"
         )
+    ternary_backend = str(
+        speed_cfg.get("bitlinear_ternary_backend", "dot")
+    ).lower().replace("-", "_")
+    if ternary_backend in {"tl_dot", "tensor_core"}:
+        ternary_backend = "dot"
+        speed_cfg["bitlinear_ternary_backend"] = "dot"
+    if ternary_backend not in {"dot", "add_sub"}:
+        raise ValueError(
+            f"unknown speed.bitlinear_ternary_backend: {ternary_backend!r} "
+            "(choices: dot | add_sub)"
+        )
     compile_mode = str(speed_cfg.get("compile_mode", "default"))
     grad_accum = int(speed_cfg.get("grad_accum_steps", 1))
     if (
@@ -835,6 +846,7 @@ def main() -> int:
             refresh_bitlinear_training_cache,
             set_bitlinear_fp8_mode,
             set_bitlinear_int8_backend,
+            set_bitlinear_ternary_backend,
         )
     except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
         refresh_bitlinear_training_cache = None
@@ -847,6 +859,9 @@ def main() -> int:
             fp8_raw = "off"
         int8_backend = set_bitlinear_int8_backend(
             str(speed_cfg.get("bitlinear_int8_backend", "auto"))
+        )
+        ternary_backend = set_bitlinear_ternary_backend(
+            str(speed_cfg.get("bitlinear_ternary_backend", "dot"))
         )
         fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
         bitnet_cache_info = configure_bitlinear_training_cache(
@@ -869,7 +884,8 @@ def main() -> int:
         )
         print(
             f"[train] bitlinear_fp8={fp8_info['mode']} "
-            f"int8_backend={int8_backend} layers={fp8_info['layers']}"
+            f"int8_backend={int8_backend} "
+            f"ternary_backend={ternary_backend} layers={fp8_info['layers']}"
         )
 
     model = apply_compile_settings(model, cfg["speed"], device)

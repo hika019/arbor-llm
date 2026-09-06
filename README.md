@@ -234,9 +234,10 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   FP8化する`full`は追加丸めと速度低下があり得るため既定では使わない。
 - `speed.bitlinear_fp8: ternary` は実験的な学習経路。optimizer step後に
   forward用とdX用のternary weightをそれぞれ2bit（4 weights/byte）へpackし、
-  Triton kernel内でINT8へ展開せずADD/SUB/SKIPする。dWは
-  `Q(dY)^T Q(X)` のINT8 dense GEMMで計算する。RTX 4090の初期microbenchmarkでは
-  既存BF16/INT8経路より遅いため、既定値にはしていない。
+  Triton kernel内でdecodeする。既定の `speed.bitlinear_ternary_backend: dot` は
+  decode後に `tl.dot` でINT8 Tensor Coreを使う。`add_sub` はADD/SUB/SKIP方式の
+  診断用backendで、実測で `dot` を上回る場合だけ採用候補にする。dWは
+  `Q(dY)^T Q(X)` のINT8 dense GEMMで計算する。既定値にはしていない。
 - `model.global_attn_impl: flex` は CUDA + `torch.compile` 必須。条件を満たさない
   場合はエラーになり、SDPAへ暗黙フォールバックしない。
 - `optim.state_precision: fp32` が既定。実データ1000-stepでloss 1.89まで安定して低下。

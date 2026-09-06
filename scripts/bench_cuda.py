@@ -59,6 +59,12 @@ def main() -> None:
         help="native INT8 forward backend。既定は config speed.bitlinear_int8_backend",
     )
     ap.add_argument(
+        "--ternary-backend",
+        default=None,
+        choices=["dot", "add_sub", "tl_dot", "tensor_core"],
+        help="packed ternary forward/dX backend。既定は config speed.bitlinear_ternary_backend",
+    )
+    ap.add_argument(
         "--weight-cache",
         default=None,
         choices=["off", "fused", "full", "auto"],
@@ -121,11 +127,16 @@ def main() -> None:
         refresh_bitlinear_training_cache,
         set_bitlinear_fp8_mode,
         set_bitlinear_int8_backend,
+        set_bitlinear_ternary_backend,
     )
 
     int8_backend = set_bitlinear_int8_backend(
         args.int8_backend
         or str(speed_cfg.get("bitlinear_int8_backend", "auto"))
+    )
+    ternary_backend = set_bitlinear_ternary_backend(
+        args.ternary_backend
+        or str(speed_cfg.get("bitlinear_ternary_backend", "dot"))
     )
     fp8_mode = args.bitlinear_fp8
     if fp8_mode is None:
@@ -158,7 +169,8 @@ def main() -> None:
         f"weight_cache={cache_info['mode']} cached_layers={cache_info['cached_layers']} "
         f"cache={cache_info['cache_gib']:.2f}GiB "
         f"format={cache_info['cache_format']} "
-        f"fp8={fp8_info['mode']} int8_backend={int8_backend}"
+        f"fp8={fp8_info['mode']} int8_backend={int8_backend} "
+        f"ternary_backend={ternary_backend}"
     )
 
     run = model

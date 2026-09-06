@@ -13,9 +13,12 @@ from src.model.bitlinear import (
     quantize_activation,
     configure_bitlinear_training_cache,
     fp8_gemm_supported,
+    set_bitlinear_ternary_backend,
     set_bitlinear_fp8_mode,
     set_bitlinear_int8_backend,
     weight_quant,
+    _packed_linear_tile,
+    _wgrad_tile,
 )
 
 
@@ -205,6 +208,24 @@ def test_unknown_int8_backend_is_error():
     assert set_bitlinear_int8_backend("auto") == "auto"
 
 
+def test_ternary_backend_aliases_and_unknown_backend():
+    assert set_bitlinear_ternary_backend("tensor-core") == "dot"
+    assert set_bitlinear_ternary_backend("tl_dot") == "dot"
+    assert set_bitlinear_ternary_backend("add-sub") == "add_sub"
+    assert set_bitlinear_ternary_backend("dot") == "dot"
+    with pytest.raises(ValueError, match="ternary backend"):
+        set_bitlinear_ternary_backend("multiply_free")
+
+
+def test_lowbit_tile_presets_cover_small_and_arbor_shapes():
+    assert _packed_linear_tile(7, 17, 33, add_sub=True) == (16, 32, 32, 4)
+    assert _packed_linear_tile(1024, 2048, 2048, add_sub=False) == (
+        32, 64, 32, 4
+    )
+    assert _wgrad_tile(7, 17, 33) == (32, 32, 32, 4)
+    assert _wgrad_tile(1024, 2048, 2048) == (64, 64, 64, 8)
+
+
 @pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
 def test_fp8_bwd_preserves_forward_and_produces_finite_gradients_cuda():
     torch.manual_seed(0)
@@ -277,9 +298,11 @@ def test_native_int8_forward_and_fp8_backward_cuda():
     ) > 0.98
 
 
+@pytest.mark.parametrize("ternary_backend", ["dot", "add_sub"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_packed_ternary_forward_dgrad_and_wgrad_cuda():
+def test_packed_ternary_forward_dgrad_and_wgrad_cuda(ternary_backend):
     torch.manual_seed(0)
+    set_bitlinear_ternary_backend(ternary_backend)
     # packed kernelはFP8/cuBLASの16要素alignment制約を持たない。
     ref = BitLinear(33, 17).to(device="cuda", dtype=torch.bfloat16)
     packed = BitLinear(33, 17).to(device="cuda", dtype=torch.bfloat16)
@@ -309,6 +332,7 @@ def test_packed_ternary_forward_dgrad_and_wgrad_cuda():
     assert torch.nn.functional.cosine_similarity(
         packed.weight.grad.float().flatten(), ref.weight.grad.float().flatten(), dim=0
     ) > 0.98
+    set_bitlinear_ternary_backend("dot")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
