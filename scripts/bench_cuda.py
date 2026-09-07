@@ -99,6 +99,11 @@ def main() -> None:
         help="N stepごとに全parameterのfiniteを検査。0で無効",
     )
     ap.add_argument("--fwd-only", action="store_true")
+    ap.add_argument(
+        "--section-timing",
+        action="store_true",
+        help="forward/backward/optimizer/batch/h2d の per-step 内訳を出す",
+    )
     args = ap.parse_args()
     if args.log_every <= 0:
         raise SystemExit("--log-every must be positive")
@@ -219,18 +224,68 @@ def main() -> None:
     def rand_batch() -> torch.Tensor:
         return torch.randint(4, 260, (args.micro_batch, seq), device=device)
 
-    def one_opt_step() -> tuple[torch.Tensor, torch.Tensor | None]:
-        opt.zero_grad(set_to_none=True)
+    cuda_records: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+        "forward": [],
+        "backward": [],
+        "optimizer": [],
+    }
+    cpu_records_ms = {"forward": 0.0, "backward": 0.0, "optimizer": 0.0}
+
+    def start_gpu_section(name: str):
+        if not args.section_timing:
+            return None
+        if device.type != "cuda":
+            return time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start
+
+    def end_gpu_section(name: str, start) -> None:
+        if not args.section_timing or start is None:
+            return
+        if device.type != "cuda":
+            cpu_records_ms[name] += (time.perf_counter() - start) * 1000.0
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        cuda_records[name].append((start, end))
+
+    def collect_section_ms() -> dict[str, float]:
+        if not args.section_timing:
+            return {}
+        if device.type != "cuda":
+            values = dict(cpu_records_ms)
+            for key in cpu_records_ms:
+                cpu_records_ms[key] = 0.0
+            return values
+        values = {
+            name: sum(start.elapsed_time(end) for start, end in records)
+            for name, records in cuda_records.items()
+        }
+        for records in cuda_records.values():
+            records.clear()
+        return values
+
+    opt.zero_grad(set_to_none=True)
+
+    def one_opt_step() -> tuple[torch.Tensor, torch.Tensor | None, dict[str, float]]:
+        cpu_sections = {"batch_ms": 0.0, "h2d_ms": 0.0}
         total: torch.Tensor | None = None
         grad_norm: torch.Tensor | None = None
         for _ in range(args.grad_accum):
+            t0 = time.perf_counter()
             x = rand_batch()
+            cpu_sections["batch_ms"] += (time.perf_counter() - t0) * 1000.0
+            fwd_start = start_gpu_section("forward")
             logits = run(x).logits
+            end_gpu_section("forward", fwd_start)
             loss = torch.nn.functional.cross_entropy(
                 logits[:, :-1].reshape(-1, logits.size(-1)).float(), x[:, 1:].reshape(-1)
             ) / args.grad_accum
             if not args.fwd_only:
+                bwd_start = start_gpu_section("backward")
                 loss.backward()
+                end_gpu_section("backward", bwd_start)
             detached = loss.detach()
             total = detached if total is None else total + detached
         if not args.fwd_only:
@@ -238,26 +293,40 @@ def main() -> None:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg["optim"]["grad_clip"], foreach=True
                 )
+            opt_start = start_gpu_section("optimizer")
             opt.step()
             refresh_bitlinear_training_cache(model)
             if scheduler is not None:
                 scheduler.step()
+            opt.zero_grad(set_to_none=True)
+            end_gpu_section("optimizer", opt_start)
         assert total is not None
-        return total, grad_norm
+        return total, grad_norm, cpu_sections
 
     for _ in range(args.warmup):
         one_opt_step()
     _sync(device)
+    collect_section_ms()
 
     bytes_per_step = args.micro_batch * seq * args.grad_accum
     times = []
+    section_times: list[dict[str, float]] = []
     losses = []
     for i in range(args.iters):
         _sync(device)
         t0 = time.perf_counter()
-        loss_tensor, grad_norm_tensor = one_opt_step()
+        loss_tensor, grad_norm_tensor, cpu_sections = one_opt_step()
         _sync(device)
         dt = time.perf_counter() - t0
+        gpu_sections = collect_section_ms()
+        sections = {
+            "fwd_ms": gpu_sections.get("forward", 0.0),
+            "bwd_ms": gpu_sections.get("backward", 0.0),
+            "opt_ms": gpu_sections.get("optimizer", 0.0),
+            "batch_ms": cpu_sections["batch_ms"],
+            "h2d_ms": cpu_sections["h2d_ms"],
+            "step_ms": dt * 1000.0,
+        }
         loss = float(loss_tensor)
         grad_norm = (
             None if grad_norm_tensor is None else float(grad_norm_tensor)
@@ -282,17 +351,43 @@ def main() -> None:
             if not bool(finite.item()):
                 raise RuntimeError(f"non-finite parameter at iter={i}")
         times.append(dt)
+        if args.section_timing:
+            section_times.append(sections)
         losses.append(loss)
         if i == 0 or (i + 1) % args.log_every == 0 or i + 1 == args.iters:
             lr = float(opt.param_groups[0]["lr"])
             grad_text = "" if grad_norm is None else f" grad_norm={grad_norm:.4f}"
+            section_text = ""
+            if args.section_timing:
+                section_text = (
+                    f" fwd_ms={sections['fwd_ms']:.1f}"
+                    f" bwd_ms={sections['bwd_ms']:.1f}"
+                    f" opt_ms={sections['opt_ms']:.1f}"
+                    f" batch_ms={sections['batch_ms']:.1f}"
+                    f" h2d_ms={sections['h2d_ms']:.1f}"
+                    f" step_ms={sections['step_ms']:.1f}"
+                )
             print(
                 f"  iter {i + 1}/{args.iters}: {dt*1000:.0f} ms "
-                f"loss={loss:.4f}{grad_text} lr={lr:.3e}"
+                f"loss={loss:.4f}{grad_text} lr={lr:.3e}{section_text}"
             )
 
     times.sort()
     med = times[len(times) // 2]
+    if section_times:
+        med_sections = {
+            key: sorted(item[key] for item in section_times)[len(section_times) // 2]
+            for key in section_times[0]
+        }
+        print(
+            "[bench] section median: "
+            f"fwd_ms={med_sections['fwd_ms']:.1f} "
+            f"bwd_ms={med_sections['bwd_ms']:.1f} "
+            f"opt_ms={med_sections['opt_ms']:.1f} "
+            f"batch_ms={med_sections['batch_ms']:.1f} "
+            f"h2d_ms={med_sections['h2d_ms']:.1f} "
+            f"step_ms={med_sections['step_ms']:.1f}"
+        )
     print(f"[bench] per opt-step median={med*1000:.0f} ms  "
           f"{bytes_per_step/med:.0f} bytes/s  "
           f"=> 1000 steps ~= {med*1000/3600:.2f} h")

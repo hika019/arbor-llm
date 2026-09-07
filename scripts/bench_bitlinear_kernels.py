@@ -298,6 +298,28 @@ def _ternary_dx(
     )
 
 
+def _ternary_forward(
+    x: torch.Tensor,
+    w_packed: torch.Tensor,
+    row_scale: torch.Tensor,
+    k: int,
+    n: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Replicate the full TernaryBitLinearSTE.forward quantize + packed GEMM path."""
+    x_int8, inv_sx = _quantize_a8_rows(x)
+    return _packed_linear(
+        x_int8,
+        inv_sx,
+        w_packed,
+        row_scale,
+        k,
+        n,
+        out_dtype,
+        grouped_decode=False,
+    )
+
+
 def _ternary_wgrad(
     grad: torch.Tensor,
     x_int8: torch.Tensor,
@@ -453,6 +475,14 @@ def _bench_shape(
                 n,
                 dtype,
                 grouped_decode=False,
+            ),
+            "ternary_forward_total": lambda: _ternary_forward(
+                x,
+                w_packed,
+                row_scale,
+                k,
+                n,
+                dtype,
             ),
             "dx_quant_scaled": lambda: _quantize_a8_rows_scaled(grad, row_scale),
             "dx_packed_current": lambda: _packed_linear(

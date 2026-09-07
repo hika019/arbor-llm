@@ -457,6 +457,23 @@ def _packed_linear_tile(
 ) -> tuple[int, int, int, int]:
     if grouped_decode:
         return 32, 64, 128, 4
+    # Global BitLinear / MB4 fast paths observed on RTX 4090.  Keep these
+    # narrow to avoid applying a tile that wins in forward but regresses in dX.
+    if m == 2048:
+        if k == 2048 and n == 11264:
+            return 128, 64, 128, 4
+        if k == 11264 and n == 2048:
+            return 128, 128, 32, 4
+        if k == 5632 and n == 2048:
+            return 128, 128, 32, 4
+        if k == 2048 and n == 5632:
+            return 128, 64, 64, 4
+        if k == 2048 and n == 3072:
+            return 128, 64, 128, 4
+        if k == 3072 and n == 2048:
+            return 128, 64, 64, 4
+        if k == 2048 and n == 2048:
+            return 128, 128, 64, 8
     if k == 4096 and n == 768 and m >= 32768:
         return 128, 128, 64, 4
     if k == 768 and n == 4096 and m >= 131072:
