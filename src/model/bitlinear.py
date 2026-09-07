@@ -425,6 +425,32 @@ if triton is not None:
             mask=mask,
         )
 
+    @triton.jit
+    def _a8_dequant_fp8_cast_transpose_kernel(
+        x_ptr, inv_sx_ptr, out_ptr, scale_ptr,
+        rows: tl.constexpr, cols: tl.constexpr,
+        BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr,
+    ):
+        """A8 row-scaled INT8 activation を dW 用 FP8 transposed layout へ直接書く."""
+        pid_r = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mask = (r[:, None] < rows) & (c[None, :] < cols)
+        x_i8 = tl.load(
+            x_ptr + r[:, None] * cols + c[None, :],
+            mask=mask,
+            other=0,
+        ).to(tl.float32)
+        inv_sx = tl.load(inv_sx_ptr + r, mask=r < rows, other=0.0).to(tl.float32)
+        scale = tl.load(scale_ptr)
+        q = tl.maximum(-448.0, tl.minimum(448.0, x_i8 * inv_sx[:, None] / scale))
+        tl.store(
+            out_ptr + c[None, :] * rows + r[:, None],
+            q,
+            mask=mask,
+        )
+
 
 def _packed_linear_tile(
     m: int, n: int, k: int, *, grouped_decode: bool
@@ -776,6 +802,51 @@ def _cast_fp8_tensorwise_transposed(
     return out, scale
 
 
+def _cast_a8_dequant_fp8_transposed(
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A8 INT8 activation を BF16 再構築なしで tensorwise FP8 transpose する."""
+    if x_int8.dtype != torch.int8:
+        raise TypeError(f"x_int8 must be torch.int8, got {x_int8.dtype}")
+    x2 = x_int8.contiguous()
+    sx = inv_sx.contiguous()
+    if sx.numel() != x2.size(0):
+        raise ValueError(f"inv_sx must have M={x2.size(0)} values")
+    sx_max = sx.float().amax()
+    min_inv_sx = 1.0e-5 / 127.0
+    if sx_max > min_inv_sx:
+        scale = (sx_max * (127.0 / _FP8_MAX)).clamp_min(1e-12)
+    else:
+        row_qmax = torch.maximum(
+            x2.amax(dim=1).to(torch.int16),
+            -x2.amin(dim=1).to(torch.int16),
+        ).to(torch.float32)
+        scale = ((row_qmax * sx.float()).amax() / _FP8_MAX).clamp_min(1e-12)
+    if triton is None or not x2.is_cuda:
+        x_q = x2.to(torch.float32) * sx.float().unsqueeze(1)
+        return (
+            (x_q / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_E4M3).t().contiguous(),
+            scale,
+        )
+    rows, cols = x2.shape
+    out = torch.empty((cols, rows), device=x2.device, dtype=_FP8_E4M3)
+    block_r, block_c = 32, 32
+    grid = (triton.cdiv(rows, block_r), triton.cdiv(cols, block_c))
+    _a8_dequant_fp8_cast_transpose_kernel[grid](
+        x2,
+        sx,
+        out,
+        scale,
+        rows,
+        cols,
+        BLOCK_R=block_r,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+    return out, scale
+
+
 def _scaled_mm_tensorwise(
     a: torch.Tensor,
     b_col_major: torch.Tensor,
@@ -820,6 +891,33 @@ def _fp8_wgrad(
     )
 
 
+def _fp8_wgrad_from_a8(
+    grad_output: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """FP8 dW using saved A8 activations without materializing BF16 x_q."""
+    gt_f8, sg = _cast_fp8_tensorwise_transposed(grad_output)
+    x_km, sx = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+    return _scaled_mm_tensorwise(
+        gt_f8,
+        x_km.t(),
+        sg,
+        sx,
+        out_dtype,
+    )
+
+
+def _ternary_wgrad_uses_fp8(m: int, k: int, n: int) -> bool:
+    return _ternary_wgrad_backend == "fp8" or (
+        _ternary_wgrad_backend == "auto"
+        and n >= k
+        and fp8_gemm_supported()
+        and _fp8_dims_ok(m, k, n)
+    )
+
+
 def _ternary_wgrad(
     grad_output: torch.Tensor,
     x_q: torch.Tensor,
@@ -829,12 +927,7 @@ def _ternary_wgrad(
     m, n = grad_output.shape
     k = x_q.size(1)
     dims_ok = _fp8_dims_ok(m, k, n)
-    use_fp8 = _ternary_wgrad_backend == "fp8" or (
-        _ternary_wgrad_backend == "auto"
-        and n >= k
-        and fp8_gemm_supported()
-        and dims_ok
-    )
+    use_fp8 = _ternary_wgrad_uses_fp8(m, k, n)
     if use_fp8:
         if not fp8_gemm_supported():
             raise RuntimeError(
@@ -847,6 +940,33 @@ def _ternary_wgrad(
                 f"M/K/N multiples of 16, got M={m} K={k} N={n}"
             )
         return _fp8_wgrad(grad_output, x_q, out_dtype)
+    return _lowbit_wgrad(grad_output, x_q, out_dtype)
+
+
+def _ternary_wgrad_from_a8(
+    grad_output: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """configured packed-ternary dW using saved A8 activation when FP8 is selected."""
+    m, n = grad_output.shape
+    k = x_int8.size(1)
+    dims_ok = _fp8_dims_ok(m, k, n)
+    use_fp8 = _ternary_wgrad_uses_fp8(m, k, n)
+    if use_fp8:
+        if not fp8_gemm_supported():
+            raise RuntimeError(
+                "bitlinear ternary wgrad backend=fp8 には "
+                "compute capability 8.9 以上の CUDA GPU が必要です"
+            )
+        if not dims_ok:
+            raise RuntimeError(
+                "bitlinear ternary wgrad backend=fp8 requires "
+                f"M/K/N multiples of 16, got M={m} K={k} N={n}"
+            )
+        return _fp8_wgrad_from_a8(grad_output, x_int8, inv_sx, out_dtype)
+    x_q = x_int8.to(out_dtype) * inv_sx.to(out_dtype).unsqueeze(1)
     return _lowbit_wgrad(grad_output, x_q, out_dtype)
 
 
@@ -962,19 +1082,9 @@ class _Int8BitLinearSTE(torch.autograd.Function):
 
         needs_w = ctx.needs_input_grad[6:]
         if any(needs_w):
-            # A8 dequantized activation を再構築し、転置済みFP8へ直接castする。
-            x_q = x_int8.to(grad_output.dtype) * inv_sx.to(
-                grad_output.dtype
-            ).unsqueeze(1)
-            gt_f8, sg = _cast_fp8_tensorwise_transposed(g2)
-            x_km, sx = _cast_fp8_tensorwise_transposed(x_q)
-            grad_w = _scaled_mm_tensorwise(
-                gt_f8,
-                x_km.t(),
-                sg,
-                sx,
-                grad_output.dtype,
-            )
+            # A8保存activationから直接FP8 transposed layoutを作り、BF16の
+            # x_q materializeを避ける。
+            grad_w = _fp8_wgrad_from_a8(g2, x_int8, inv_sx, grad_output.dtype)
             raw = grad_w.split(ctx.out_sizes, dim=0)
             grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
         else:
@@ -1038,10 +1148,12 @@ class TernaryBitLinearSTE(torch.autograd.Function):
 
         needs_w = ctx.needs_input_grad[6:]
         if any(needs_w):
-            x_q = x_int8.to(grad_output.dtype) * inv_sx.to(
-                grad_output.dtype
-            ).unsqueeze(1)
-            grad_w = _ternary_wgrad(g2, x_q, grad_output.dtype)
+            grad_w = _ternary_wgrad_from_a8(
+                g2,
+                x_int8,
+                inv_sx,
+                grad_output.dtype,
+            )
             raw = grad_w.split(ctx.out_sizes, dim=0)
             grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
         else:

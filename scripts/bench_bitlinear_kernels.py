@@ -8,7 +8,7 @@ Measures the decode question directly:
   D. packed2 W + grouped 4-way decode + tl.dot (A/B only)
 
 Example:
-  python -m scripts.bench_bitlinear_kernels --shape 1024,2048,11264
+  python -m scripts.bench_bitlinear_kernels --breakdown --no-check
 """
 from __future__ import annotations
 
@@ -21,10 +21,13 @@ import torch
 import src.model.bitlinear as bitlinear_mod
 from src.model.bitlinear import (
     _FP8_E4M3,
+    _FP8_MAX,
     _int8_wgrad_kernel,
     _int8_linear,
+    _cast_a8_dequant_fp8_transposed,
     _cast_fp8_tensorwise,
     _cast_fp8_tensorwise_transposed,
+    _fp8_wgrad_from_a8,
     _lowbit_wgrad,
     _packed_linear,
     _quantize_a8_rows,
@@ -45,10 +48,30 @@ except Exception:  # pragma: no cover - CUDA stack dependent
 
 
 DEFAULT_SHAPES = (
-    "1024,2048,11264",
-    "1024,5632,2048",
-    "1024,2048,3072",
-    "1024,2048,2048",
+    "2048,2048,11264",
+    "2048,5632,2048",
+    "2048,2048,3072",
+    "2048,2048,2048",
+)
+
+DEFAULT_CALLS_PER_STEP = {
+    (2048, 2048, 11264): 320,
+    (2048, 5632, 2048): 320,
+    (2048, 2048, 2048): 320,
+    (2048, 2048, 3072): 320,
+    (32768, 768, 4096): 48,
+    (32768, 768, 2304): 48,
+    (32768, 2048, 768): 48,
+    (32768, 768, 768): 48,
+}
+
+PACKED_TILE_SWEEP = (
+    (32, 64, 32, 4),
+    (64, 64, 32, 4),
+    (64, 128, 32, 4),
+    (64, 128, 64, 4),
+    (128, 64, 64, 4),
+    (128, 128, 64, 4),
 )
 
 
@@ -129,6 +152,39 @@ def _fmt(result: dict[str, float], baseline_ms: float) -> str:
     )
 
 
+def _dense_equiv_tflops(m: int, k: int, n: int, ms: float) -> float:
+    return (2.0 * m * k * n) / (ms * 1.0e9)
+
+
+def _grid_size(m: int, n: int, tile: tuple[int, int, int, int]) -> tuple[int, int]:
+    if triton is None:
+        return 0, 0
+    bm, bn, _bk, _warps = tile
+    return triton.cdiv(m, bm), triton.cdiv(n, bn)
+
+
+def _print_dense_efficiency(
+    title: str,
+    results: dict[str, dict[str, float]],
+    rows: tuple[tuple[str, str], ...],
+    *,
+    m: int,
+    k: int,
+    n: int,
+    calls_per_step: int,
+) -> None:
+    print(f"\n[{title}]")
+    for label, key in rows:
+        if key not in results:
+            continue
+        ms = results[key]["median"]
+        print(
+            f"  {label:22s} {ms:8.3f} ms  "
+            f"{_dense_equiv_tflops(m, k, n, ms):8.3f} dense-eq TF/s  "
+            f"step={ms * calls_per_step:8.1f} ms @ calls={calls_per_step}"
+        )
+
+
 def _wgrad_gemm_from_quantized(
     g_int8: torch.Tensor,
     sg: torch.Tensor,
@@ -189,6 +245,37 @@ def _int8_fp8_wgrad(
     return _scaled_mm_tensorwise(gt_f8, x_km.t(), sg, sx, out_dtype)
 
 
+def _fp8_tensorwise_scale(t: torch.Tensor) -> torch.Tensor:
+    return (t.detach().abs().amax().float() / _FP8_MAX).clamp_min(1e-12)
+
+
+def _fp8_cast_transposed_with_scale(
+    t: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Measure the production FP8 cast+transpose kernel without scale reduction."""
+    t = t.contiguous()
+    if triton is None or not t.is_cuda:
+        return (
+            (t / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_E4M3).t().contiguous()
+        )
+    rows, cols = t.shape
+    out = torch.empty((cols, rows), device=t.device, dtype=_FP8_E4M3)
+    block_r, block_c = 32, 32
+    grid = (triton.cdiv(rows, block_r), triton.cdiv(cols, block_c))
+    bitlinear_mod._fp8_cast_transpose_kernel[grid](
+        t,
+        out,
+        scale,
+        rows,
+        cols,
+        BLOCK_R=block_r,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+    return out
+
+
 def _ternary_dx(
     grad: torch.Tensor,
     row_scale: torch.Tensor,
@@ -241,6 +328,8 @@ def _bench_shape(
     check: bool,
     include_wgrad: bool,
     breakdown: bool,
+    tile_sweep: bool,
+    calls_per_step: int,
 ) -> None:
     m, k, n = shape
     x = torch.randn((m, k), device="cuda", dtype=dtype)
@@ -291,6 +380,47 @@ def _bench_shape(
     for name, fn in kernels.items():
         results[name] = _measure(fn, warmup=warmup, iters=iters)
     _print_results(results, baseline_name="int8_int_mm")
+    _print_dense_efficiency(
+        "forward dense-equivalent throughput",
+        results,
+        (
+            ("torch._int_mm", "int8_int_mm"),
+            ("triton int8", "int8_triton"),
+            ("packed current", "packed_dot_current"),
+            ("packed grouped", "packed_dot"),
+        ),
+        m=m,
+        k=k,
+        n=n,
+        calls_per_step=calls_per_step,
+    )
+
+    if tile_sweep:
+        print("\n[packed tile sweep]")
+        for tile in PACKED_TILE_SWEEP:
+            with _override_dot_current_tile(tile):
+                fwd = _measure(
+                    lambda: _packed_linear(
+                        x_int8,
+                        inv_sx,
+                        w_packed,
+                        row_scale,
+                        k,
+                        n,
+                        dtype,
+                        grouped_decode=False,
+                    ),
+                    warmup=warmup,
+                    iters=iters,
+                )
+                grid_m, grid_n = _grid_size(m, n, tile)
+                bm, bn, bk, warps = tile
+                print(
+                    f"  fwd BM={bm:3d} BN={bn:3d} BK={bk:3d} W={warps} "
+                    f"grid={grid_m:4d}x{grid_n:<4d} "
+                    f"{fwd['median']:8.3f} ms  "
+                    f"{_dense_equiv_tflops(m, k, n, fwd['median']):8.3f} TF/s"
+                )
 
     if include_wgrad:
         grad = torch.randn((m, n), device="cuda", dtype=dtype)
@@ -305,6 +435,7 @@ def _bench_shape(
 
     if breakdown:
         grad = torch.randn((m, n), device="cuda", dtype=dtype)
+        g2 = grad.reshape(-1, n)
         g_int8, inv_sg = _quantize_a8_rows_scaled(grad, row_scale)
         one = row_scale.new_ones(())
         x_q = x_int8.to(dtype) * inv_sx.to(dtype).unsqueeze(1)
@@ -375,11 +506,55 @@ def _bench_shape(
         if fp8_ok:
             w_fp8 = w_int8.to(_FP8_E4M3).contiguous()
             w_fp8_t = w_fp8.t().contiguous()
+            fp8_dw_sg = _fp8_tensorwise_scale(g2)
+            fp8_dw_sx = _fp8_tensorwise_scale(x_q)
+            fp8_dw_gt = _fp8_cast_transposed_with_scale(g2, fp8_dw_sg)
+            fp8_dw_x = _fp8_cast_transposed_with_scale(x_q, fp8_dw_sx)
+            torch.cuda.synchronize()
             breakdown_kernels["int8_fp8_dx"] = (
                 lambda: _int8_fp8_dx(grad, row_scale, w_fp8_t, dtype)
             )
-            breakdown_kernels["int8_fp8_wgrad"] = (
+            breakdown_kernels["fp8_dw_reconstruct_x"] = (
+                lambda: x_int8.to(dtype) * inv_sx.to(dtype).unsqueeze(1)
+            )
+            breakdown_kernels["fp8_dw_scale_grad"] = (
+                lambda: _fp8_tensorwise_scale(g2)
+            )
+            breakdown_kernels["fp8_dw_scale_x"] = (
+                lambda: _fp8_tensorwise_scale(x_q)
+            )
+            breakdown_kernels["fp8_dw_scale_both"] = (
+                lambda: (_fp8_tensorwise_scale(g2), _fp8_tensorwise_scale(x_q))
+            )
+            breakdown_kernels["fp8_dw_cast_grad_t"] = (
+                lambda: _fp8_cast_transposed_with_scale(g2, fp8_dw_sg)
+            )
+            breakdown_kernels["fp8_dw_cast_x_t"] = (
+                lambda: _fp8_cast_transposed_with_scale(x_q, fp8_dw_sx)
+            )
+            breakdown_kernels["fp8_dw_direct_cast_x_t"] = (
+                lambda: _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+            )
+            breakdown_kernels["fp8_dw_cast_both"] = (
+                lambda: (
+                    _fp8_cast_transposed_with_scale(g2, fp8_dw_sg),
+                    _fp8_cast_transposed_with_scale(x_q, fp8_dw_sx),
+                )
+            )
+            breakdown_kernels["fp8_dw_gemm_only"] = (
+                lambda: _scaled_mm_tensorwise(
+                    fp8_dw_gt,
+                    fp8_dw_x.t(),
+                    fp8_dw_sg,
+                    fp8_dw_sx,
+                    dtype,
+                )
+            )
+            breakdown_kernels["fp8_dw_old_total"] = (
                 lambda: _int8_fp8_wgrad(grad, x_int8, inv_sx, dtype)
+            )
+            breakdown_kernels["fp8_dw_direct_total"] = (
+                lambda: _fp8_wgrad_from_a8(g2, x_int8, inv_sx, dtype)
             )
         else:
             print(
@@ -397,7 +572,27 @@ def _bench_shape(
             ternary_dx_ms = breakdown_results["ternary_dx_total"]["median"]
             fp8_dx_ms = breakdown_results["int8_fp8_dx"]["median"]
             ternary_dw_ms = breakdown_results["ternary_wgrad_total"]["median"]
-            fp8_dw_ms = breakdown_results["int8_fp8_wgrad"]["median"]
+            fp8_dw_old_ms = breakdown_results["fp8_dw_old_total"]["median"]
+            fp8_dw_ms = breakdown_results["fp8_dw_direct_total"]["median"]
+            fp8_grad_scale_ms = breakdown_results["fp8_dw_scale_grad"]["median"]
+            fp8_grad_cast_ms = breakdown_results["fp8_dw_cast_grad_t"]["median"]
+            fp8_gemm_ms = breakdown_results["fp8_dw_gemm_only"]["median"]
+            fp8_direct_x_ms = breakdown_results["fp8_dw_direct_cast_x_t"]["median"]
+            fp8_other_ms = fp8_dw_ms - (
+                fp8_grad_scale_ms
+                + fp8_grad_cast_ms
+                + fp8_direct_x_ms
+                + fp8_gemm_ms
+            )
+            print("\n[fp8 dW split]")
+            print(
+                "  old_total / direct_total / grad_scale / grad_cast / "
+                "direct_x_scale_cast / gemm_only / other: "
+                f"{fp8_dw_old_ms:.3f} / {fp8_dw_ms:.3f} / "
+                f"{fp8_grad_scale_ms:.3f} / {fp8_grad_cast_ms:.3f} / "
+                f"{fp8_direct_x_ms:.3f} / {fp8_gemm_ms:.3f} / "
+                f"{fp8_other_ms:.3f} ms"
+            )
             print("\n[backward comparison]")
             print(
                 "  dX  ternary/FP8: "
@@ -409,6 +604,51 @@ def _bench_shape(
                 f"{ternary_dw_ms:.3f} / {fp8_dw_ms:.3f} ms  "
                 f"x{ternary_dw_ms / fp8_dw_ms:.2f}"
             )
+        _print_dense_efficiency(
+            "backward dense-equivalent throughput",
+            breakdown_results,
+            (
+                ("dX packed gemm", "dx_packed_current"),
+                ("dX ternary total", "ternary_dx_total"),
+                ("dX FP8 total", "int8_fp8_dx"),
+                ("dW INT8 gemm", "wgrad_gemm"),
+                ("dW INT8 total", "ternary_wgrad_total"),
+                ("dW FP8 gemm", "fp8_dw_gemm_only"),
+                ("dW FP8 old total", "fp8_dw_old_total"),
+                ("dW FP8 direct total", "fp8_dw_direct_total"),
+            ),
+            m=m,
+            k=k,
+            n=n,
+            calls_per_step=calls_per_step,
+        )
+
+        if tile_sweep:
+            print("\n[packed dX tile sweep]")
+            for tile in PACKED_TILE_SWEEP:
+                with _override_dot_current_tile(tile):
+                    dx = _measure(
+                        lambda: _packed_linear(
+                            g_int8,
+                            inv_sg,
+                            w_packed_t,
+                            one,
+                            n,
+                            k,
+                            dtype,
+                            grouped_decode=False,
+                        ),
+                        warmup=warmup,
+                        iters=iters,
+                    )
+                    grid_m, grid_n = _grid_size(m, k, tile)
+                    bm, bn, bk, warps = tile
+                    print(
+                        f"  dX  BM={bm:3d} BN={bn:3d} BK={bk:3d} W={warps} "
+                        f"grid={grid_m:4d}x{grid_n:<4d} "
+                        f"{dx['median']:8.3f} ms  "
+                        f"{_dense_equiv_tflops(m, k, n, dx['median']):8.3f} TF/s"
+                    )
 
 
 def main() -> None:
@@ -437,6 +677,17 @@ def main() -> None:
         action="store_true",
         help="Also measure fwd/dX/dW quantization and GEMM components.",
     )
+    parser.add_argument(
+        "--tile-sweep",
+        action="store_true",
+        help="Sweep candidate dot_current packed tiles for forward and, with --breakdown, dX.",
+    )
+    parser.add_argument(
+        "--calls-per-step",
+        type=int,
+        default=None,
+        help="Override MB4 profiler calls/step used for step contribution reporting.",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
@@ -451,6 +702,11 @@ def main() -> None:
         print(f"[override] dot_current tile BM={bm} BN={bn} BK={bk} warps={warps}")
     with _override_dot_current_tile(args.packed_tile):
         for shape in shapes:
+            calls_per_step = (
+                args.calls_per_step
+                if args.calls_per_step is not None
+                else DEFAULT_CALLS_PER_STEP.get(shape, 1)
+            )
             _bench_shape(
                 shape,
                 dtype=dtype,
@@ -459,6 +715,8 @@ def main() -> None:
                 check=not args.no_check,
                 include_wgrad=args.wgrad,
                 breakdown=args.breakdown,
+                tile_sweep=args.tile_sweep,
+                calls_per_step=calls_per_step,
             )
 
 

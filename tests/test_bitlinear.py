@@ -18,6 +18,8 @@ from src.model.bitlinear import (
     set_bitlinear_fp8_mode,
     set_bitlinear_int8_backend,
     weight_quant,
+    _cast_a8_dequant_fp8_transposed,
+    _cast_fp8_tensorwise_transposed,
     _packed_linear_tile,
     _wgrad_tile,
 )
@@ -252,6 +254,34 @@ def test_ternary_wgrad_auto_selects_backend_by_shape(monkeypatch):
         set_bitlinear_ternary_wgrad_backend("int8")
     assert torch.all(fp8_result == 8)
     assert torch.all(int8_result == 1)
+
+
+def test_a8_dequant_fp8_transposed_matches_materialized_xq_cpu():
+    cases = [
+        (
+            torch.tensor(
+                [
+                    [0, 0, 0, 0],
+                    [1, -2, 3, -4],
+                    [127, -126, 0, 64],
+                    [-128, 0, 5, -7],
+                ],
+                dtype=torch.int8,
+            ),
+            torch.tensor([1e-5 / 127.0, 1e-5 / 127.0, 0.25, 0.125]),
+        ),
+        (
+            torch.tensor([[0, 0, 0, 0], [1, -2, 0, 3]], dtype=torch.int8),
+            torch.full((2,), 1e-5 / 127.0),
+        ),
+    ]
+    for x_int8, inv_sx in cases:
+        x_q = x_int8.to(torch.float32) * inv_sx.unsqueeze(1)
+        actual, actual_scale = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+        expected, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
+
+        torch.testing.assert_close(actual_scale, expected_scale)
+        torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
 
 
 def test_lowbit_tile_presets_cover_small_and_arbor_shapes():
