@@ -563,10 +563,27 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     if ternary_backend in {"current", "legacy"}:
         ternary_backend = "dot_current"
         speed_cfg["bitlinear_ternary_backend"] = "dot_current"
-    if ternary_backend not in {"dot", "dot_current"}:
+    if ternary_backend in {"kmajor", "k_major", "packed_kmajor_current"}:
+        ternary_backend = "kmajor_current"
+        speed_cfg["bitlinear_ternary_backend"] = "kmajor_current"
+    if ternary_backend in {
+        "kmajor_single",
+        "k_major_single_dot",
+        "single_dot",
+        "decode_v2",
+        "packed_kmajor_single_dot",
+    }:
+        ternary_backend = "kmajor_single_dot"
+        speed_cfg["bitlinear_ternary_backend"] = "kmajor_single_dot"
+    if ternary_backend not in {
+        "dot",
+        "dot_current",
+        "kmajor_current",
+        "kmajor_single_dot",
+    }:
         raise ValueError(
             f"unknown speed.bitlinear_ternary_backend: {ternary_backend!r} "
-            "(choices: dot | dot_current)"
+            "(choices: dot | dot_current | kmajor_current | kmajor_single_dot)"
         )
     ternary_wgrad_backend = str(
         speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8")

@@ -234,9 +234,12 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   FP8化する`full`は追加丸めと速度低下があり得るため既定では使わない。
 - `speed.bitlinear_fp8: ternary` は実験的な学習経路。optimizer step後に
   forward用とdX用のternary weightをそれぞれ2bit（4 weights/byte）へpackし、
-  Triton kernel内でdecodeする。既定の `speed.bitlinear_ternary_backend: dot_current` は
+  Triton kernel内でdecodeする。`kmajor_single_dot` は packed weight を
+  `[K/4,N]` のGEMM向けlayoutから1回loadし、4 weightへregister内decode後、
+  dense INT8 fragmentへinterleaveして `tl.dot` を1回だけ呼ぶ。既定の
+  `speed.bitlinear_ternary_backend: dot_current` は
   旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
-  `dot` は4-way grouped decode比較用。dWは
+  `kmajor_current` はlayout単独比較、`dot` は4-way grouped decode比較用。dWは
   `speed.bitlinear_ternary_wgrad_backend: int8|fp8|auto` で選択できる。
   `int8` は `Q(dY)^T Q(X)` のdense INT8 GEMM、`fp8` はtensorwise FP8 GEMM、
   `auto` は現在の代表shape測定に基づき `N>=K` でFP8、それ以外でINT8を使う。

@@ -64,6 +64,11 @@ def main() -> None:
         choices=[
             "dot",
             "dot_current",
+            "kmajor_current",
+            "kmajor",
+            "kmajor_single_dot",
+            "single_dot",
+            "decode_v2",
             "tl_dot",
             "tensor_core",
             "optimized",

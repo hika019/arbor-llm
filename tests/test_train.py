@@ -133,6 +133,24 @@ def test_unknown_ternary_backend_is_error():
         adapt_config_for_device(cfg, torch.device("cuda"))
 
 
+def test_kmajor_ternary_backend_alias_is_normalized():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_backend": "kmajor"},
+    }
+    resolved = adapt_config_for_device(cfg, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_backend"] == "kmajor_current"
+
+
+def test_decode_v2_ternary_backend_alias_is_normalized():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_backend": "decode_v2"},
+    }
+    resolved = adapt_config_for_device(cfg, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_backend"] == "kmajor_single_dot"
+
+
 def test_unknown_ternary_wgrad_backend_is_error():
     cfg = {
         "model": {"global_attn_impl": "sdpa"},

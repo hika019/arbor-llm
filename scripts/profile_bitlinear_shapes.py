@@ -90,7 +90,17 @@ def _install_shape_counter():
             return orig_backward(ctx, *args, **kwargs)
 
     def counted_packed(
-        x_int8, inv_sx, w_packed, row_scale, k, n, out_dtype, *, grouped_decode
+        x_int8,
+        inv_sx,
+        w_packed,
+        row_scale,
+        k,
+        n,
+        out_dtype,
+        *,
+        grouped_decode,
+        kmajor_layout=False,
+        decode_v2=False,
     ):
         if _PHASE == "fwd":
             # Forward: [M,K] @ W[N,K]^T -> [M,N]
@@ -107,6 +117,8 @@ def _install_shape_counter():
             n,
             out_dtype,
             grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
         )
 
     def counted_wgrad(grad_output, x_q, out_dtype):
@@ -151,15 +163,22 @@ def _measure(fn, *, warmup: int, iters: int) -> Timing:
     )
 
 
-def _bench_ternary_shape(shape: Shape, *, dtype, grouped_decode, warmup, iters):
+def _bench_ternary_shape(
+    shape, *, dtype, grouped_decode, kmajor_layout, decode_v2, warmup, iters
+):
     m, k, n = shape.m, shape.k, shape.n
     x = torch.randn((m, k), device="cuda", dtype=dtype)
     grad = torch.randn((m, n), device="cuda", dtype=dtype)
     w_int8 = torch.randint(-1, 2, (n, k), device="cuda", dtype=torch.int8)
     row_scale = torch.ones((n,), device="cuda", dtype=torch.float32)
     one = torch.ones((), device="cuda", dtype=torch.float32)
-    w_packed = bl.pack_ternary_weight(w_int8)
-    w_packed_t = bl.pack_ternary_weight(w_int8.t().contiguous())
+    pack = (
+        bl.pack_ternary_weight_kmajor
+        if kmajor_layout
+        else bl.pack_ternary_weight
+    )
+    w_packed = pack(w_int8)
+    w_packed_t = pack(w_int8.t().contiguous())
     x_int8_saved, inv_sx_saved = bl._quantize_a8_rows(x)
 
     def fwd_total():
@@ -167,6 +186,8 @@ def _bench_ternary_shape(shape: Shape, *, dtype, grouped_decode, warmup, iters):
         return bl._packed_linear(
             x_int8, inv_sx, w_packed, row_scale, k, n, dtype,
             grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
         )
 
     def dx_total():
@@ -174,6 +195,8 @@ def _bench_ternary_shape(shape: Shape, *, dtype, grouped_decode, warmup, iters):
         return bl._packed_linear(
             g_int8, inv_sg, w_packed_t, one, n, k, dtype,
             grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
         )
 
     def dw_total():
@@ -321,7 +344,11 @@ def main():
     ap.add_argument("--grad-accum", type=int, default=32)
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--iters", type=int, default=500)
-    ap.add_argument("--ternary-backend", default="dot_current", choices=["dot_current", "dot"])
+    ap.add_argument(
+        "--ternary-backend",
+        default="dot_current",
+        choices=["dot_current", "kmajor_current", "kmajor_single_dot", "dot"],
+    )
     ap.add_argument("--wgrad-backend", default="fp8", choices=["int8", "fp8", "auto"])
     ap.add_argument("--compare-int8", action="store_true")
     ap.add_argument("--int8-backend", default="auto", choices=["auto", "int_mm", "triton"])
@@ -346,6 +373,8 @@ def main():
     bl.set_bitlinear_ternary_wgrad_backend(args.wgrad_backend)
     bl.set_bitlinear_int8_backend(args.int8_backend)
     grouped = args.ternary_backend == "dot"
+    kmajor = args.ternary_backend in ("kmajor_current", "kmajor_single_dot")
+    decode_v2 = args.ternary_backend == "kmajor_single_dot"
 
     rows = []
     extra_rows = []
@@ -355,6 +384,8 @@ def main():
             shape,
             dtype=torch.bfloat16,
             grouped_decode=grouped,
+            kmajor_layout=kmajor,
+            decode_v2=decode_v2,
             warmup=args.warmup,
             iters=args.iters,
         )

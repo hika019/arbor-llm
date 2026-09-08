@@ -5,7 +5,9 @@ Measures the decode question directly:
   A. unpacked INT8 W + torch._int_mm
   B. unpacked INT8 W + Triton tl.dot
   C. packed2 W + current logical-K decode + tl.dot
-  D. packed2 W + grouped 4-way decode + tl.dot (A/B only)
+  D. K-major packed2 W + current logical-K decode + tl.dot
+  E. K-major packed2 W + single-load decode + dense fragment + tl.dot x1
+  F. packed2 W + grouped 4-way decode + tl.dot (A/B only)
 
 Example:
   python -m scripts.bench_bitlinear_kernels --breakdown --no-check
@@ -37,6 +39,7 @@ from src.model.bitlinear import (
     _wgrad_tile,
     fp8_gemm_supported,
     pack_ternary_weight,
+    pack_ternary_weight_kmajor,
     set_bitlinear_int8_backend,
     ternary_quantize_int8,
 )
@@ -361,6 +364,8 @@ def _bench_shape(
     row_scale = scale.expand(n).contiguous()
     w_packed = pack_ternary_weight(w_int8)
     w_packed_t = pack_ternary_weight(w_int8.t().contiguous())
+    w_packed_kmajor = pack_ternary_weight_kmajor(w_int8)
+    w_packed_t_kmajor = pack_ternary_weight_kmajor(w_int8.t().contiguous())
 
     def int8_linear_backend(backend: str) -> torch.Tensor:
         set_bitlinear_int8_backend(backend)
@@ -378,6 +383,29 @@ def _bench_shape(
             n,
             dtype,
             grouped_decode=False,
+        ),
+        "packed_kmajor_current": lambda: _packed_linear(
+            x_int8,
+            inv_sx,
+            w_packed_kmajor,
+            row_scale,
+            k,
+            n,
+            dtype,
+            grouped_decode=False,
+            kmajor_layout=True,
+        ),
+        "packed_kmajor_single_dot": lambda: _packed_linear(
+            x_int8,
+            inv_sx,
+            w_packed_kmajor,
+            row_scale,
+            k,
+            n,
+            dtype,
+            grouped_decode=False,
+            kmajor_layout=True,
+            decode_v2=True,
         ),
         "packed_dot": lambda: _packed_linear(
             x_int8,
@@ -409,6 +437,8 @@ def _bench_shape(
             ("torch._int_mm", "int8_int_mm"),
             ("triton int8", "int8_triton"),
             ("packed current", "packed_dot_current"),
+            ("packed K-major", "packed_kmajor_current"),
+            ("packed K-major v2", "packed_kmajor_single_dot"),
             ("packed grouped", "packed_dot"),
         ),
         m=m,
@@ -476,6 +506,29 @@ def _bench_shape(
                 dtype,
                 grouped_decode=False,
             ),
+            "fwd_packed_kmajor_current": lambda: _packed_linear(
+                x_int8,
+                inv_sx,
+                w_packed_kmajor,
+                row_scale,
+                k,
+                n,
+                dtype,
+                grouped_decode=False,
+                kmajor_layout=True,
+            ),
+            "fwd_packed_kmajor_single_dot": lambda: _packed_linear(
+                x_int8,
+                inv_sx,
+                w_packed_kmajor,
+                row_scale,
+                k,
+                n,
+                dtype,
+                grouped_decode=False,
+                kmajor_layout=True,
+                decode_v2=True,
+            ),
             "ternary_forward_total": lambda: _ternary_forward(
                 x,
                 w_packed,
@@ -494,6 +547,29 @@ def _bench_shape(
                 k,
                 dtype,
                 grouped_decode=False,
+            ),
+            "dx_packed_kmajor_current": lambda: _packed_linear(
+                g_int8,
+                inv_sg,
+                w_packed_t_kmajor,
+                one,
+                n,
+                k,
+                dtype,
+                grouped_decode=False,
+                kmajor_layout=True,
+            ),
+            "dx_packed_kmajor_single_dot": lambda: _packed_linear(
+                g_int8,
+                inv_sg,
+                w_packed_t_kmajor,
+                one,
+                n,
+                k,
+                dtype,
+                grouped_decode=False,
+                kmajor_layout=True,
+                decode_v2=True,
             ),
             "ternary_dx_total": lambda: _ternary_dx(
                 grad,
@@ -639,6 +715,8 @@ def _bench_shape(
             breakdown_results,
             (
                 ("dX packed gemm", "dx_packed_current"),
+                ("dX packed K-major", "dx_packed_kmajor_current"),
+                ("dX packed K-major v2", "dx_packed_kmajor_single_dot"),
                 ("dX ternary total", "ternary_dx_total"),
                 ("dX FP8 total", "int8_fp8_dx"),
                 ("dW INT8 gemm", "wgrad_gemm"),

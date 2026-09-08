@@ -132,18 +132,22 @@ def test_training_weight_cache_matches_uncached_forward_and_grad():
 
 
 def test_ternary_training_cache_uses_two_packed_layouts():
-    layer = BitLinear(33, 17)
-    layer._fp8_mode = "ternary"
-    layer.enable_training_weight_cache(True)
+    set_bitlinear_ternary_backend("kmajor_current")
+    try:
+        layer = BitLinear(33, 17)
+        layer._fp8_mode = "ternary"
+        layer.enable_training_weight_cache(True)
 
-    assert layer._train_w_int8 is None
-    assert layer._train_w_fp8 is None
-    assert layer._train_w_fp8_t is None
-    assert layer._train_w_packed.dtype == torch.uint8
-    assert layer._train_w_packed.shape == (17, 9)
-    assert layer._train_w_packed_t.shape == (33, 5)
-    assert layer.training_cache_bytes == layer.cache_cost_bytes
-    assert layer.training_cache_bytes < layer.weight.numel()
+        assert layer._train_w_int8 is None
+        assert layer._train_w_fp8 is None
+        assert layer._train_w_fp8_t is None
+        assert layer._train_w_packed.dtype == torch.uint8
+        assert layer._train_w_packed.shape == (9, 17)
+        assert layer._train_w_packed_t.shape == (5, 33)
+        assert layer.training_cache_bytes == layer.cache_cost_bytes
+        assert layer.training_cache_bytes < layer.weight.numel()
+    finally:
+        set_bitlinear_ternary_backend("dot_current")
 
 
 def test_bitlinear_group_matches_individual_projections():
@@ -215,6 +219,10 @@ def test_ternary_backend_aliases_and_unknown_backend():
     assert set_bitlinear_ternary_backend("tensor-core") == "dot"
     assert set_bitlinear_ternary_backend("tl_dot") == "dot"
     assert set_bitlinear_ternary_backend("current") == "dot_current"
+    assert set_bitlinear_ternary_backend("kmajor") == "kmajor_current"
+    assert set_bitlinear_ternary_backend("packed-kmajor-current") == "kmajor_current"
+    assert set_bitlinear_ternary_backend("kmajor_single") == "kmajor_single_dot"
+    assert set_bitlinear_ternary_backend("decode_v2") == "kmajor_single_dot"
     assert set_bitlinear_ternary_backend("dot") == "dot"
     with pytest.raises(ValueError, match="ternary backend"):
         set_bitlinear_ternary_backend("multiply_free")
@@ -405,7 +413,9 @@ def test_native_int8_forward_and_fp8_backward_cuda():
     ) > 0.98
 
 
-@pytest.mark.parametrize("ternary_backend", ["dot", "dot_current"])
+@pytest.mark.parametrize(
+    "ternary_backend", ["dot", "dot_current", "kmajor_current", "kmajor_single_dot"]
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_ternary_forward_dgrad_and_wgrad_cuda(ternary_backend):
     torch.manual_seed(0)
@@ -504,16 +514,20 @@ def test_packed_ternary_group_supports_distinct_weight_scales_cuda():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_ternary_bitlinear_torch_compile_cuda():
-    layer = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16).train()
-    set_bitlinear_fp8_mode(layer, "ternary")
-    layer.enable_training_weight_cache(True)
-    compiled = torch.compile(layer)
-    x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    loss = compiled(x).float().square().mean()
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert torch.isfinite(x.grad).all()
-    assert torch.isfinite(layer.weight.grad).all()
+    set_bitlinear_ternary_backend("kmajor_single_dot")
+    try:
+        layer = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16).train()
+        set_bitlinear_fp8_mode(layer, "ternary")
+        layer.enable_training_weight_cache(True)
+        compiled = torch.compile(layer)
+        x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        loss = compiled(x).float().square().mean()
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert torch.isfinite(x.grad).all()
+        assert torch.isfinite(layer.weight.grad).all()
+    finally:
+        set_bitlinear_ternary_backend("dot_current")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -630,13 +644,21 @@ def test_bias_is_rejected():
 
 
 def test_pack_unpack_roundtrip():
-    from src.model.bitlinear import pack_ternary_weight, unpack_ternary_weight
+    from src.model.bitlinear import (
+        pack_ternary_weight,
+        pack_ternary_weight_kmajor,
+        unpack_ternary_weight,
+        unpack_ternary_weight_kmajor,
+    )
 
     torch.manual_seed(0)
     w = torch.randint(-1, 2, (7, 13), dtype=torch.int8)  # 4 で割れない K
     packed = pack_ternary_weight(w)
     assert packed.dtype == torch.uint8 and packed.shape == (7, 4)
     assert torch.equal(unpack_ternary_weight(packed, 13), w)
+    packed_kmajor = pack_ternary_weight_kmajor(w)
+    assert packed_kmajor.dtype == torch.uint8 and packed_kmajor.shape == (4, 7)
+    assert torch.equal(unpack_ternary_weight_kmajor(packed_kmajor, 13), w)
 
 
 def test_frozen_inference_matches_eval_forward():
