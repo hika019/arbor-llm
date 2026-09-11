@@ -127,6 +127,7 @@ if $is_wsl; then
         local_target="/tmp/arbor-nsys-${windows_version}-root/target-linux-x64"
         if [[ ! -x "$local_target/nsys" ]]; then
             echo "Copying Nsight Systems $windows_version Linux target to $local_target"
+            mkdir -p "$(dirname "$local_target")"
             cp -a "$(dirname "$windows_nsys")" "$local_target"
         fi
         # The target CLI rejects direct execution from its installation
