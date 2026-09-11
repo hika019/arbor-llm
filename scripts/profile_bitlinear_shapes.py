@@ -79,7 +79,7 @@ def _install_shape_counter():
     orig_forward = bl.TernaryBitLinearSTE.forward
     orig_backward = bl.TernaryBitLinearSTE.backward
     orig_packed = bl._packed_linear
-    orig_wgrad = bl._ternary_wgrad
+    orig_wgrad_from_a8 = bl._ternary_wgrad_from_a8
 
     def counted_forward(ctx, *args, **kwargs):
         with _phase("fwd"):
@@ -101,6 +101,8 @@ def _install_shape_counter():
         grouped_decode,
         kmajor_layout=False,
         decode_v2=False,
+        backend=None,
+        launch_config=None,
     ):
         if _PHASE == "fwd":
             # Forward: [M,K] @ W[N,K]^T -> [M,N]
@@ -119,25 +121,31 @@ def _install_shape_counter():
             grouped_decode=grouped_decode,
             kmajor_layout=kmajor_layout,
             decode_v2=decode_v2,
+            backend=backend,
+            launch_config=launch_config,
         )
 
-    def counted_wgrad(grad_output, x_q, out_dtype):
+    def counted_wgrad_from_a8(grad_output, x_int8, inv_sx, out_dtype):
         # dW = dY^T [N,M] @ X [M,K] -> [N,K]
         _COUNTS["dw"][
-            Shape(int(grad_output.size(0)), int(x_q.size(1)), int(grad_output.size(1)))
+            Shape(
+                int(grad_output.size(0)),
+                int(x_int8.size(1)),
+                int(grad_output.size(1)),
+            )
         ] += 1
-        return orig_wgrad(grad_output, x_q, out_dtype)
+        return orig_wgrad_from_a8(grad_output, x_int8, inv_sx, out_dtype)
 
     bl.TernaryBitLinearSTE.forward = staticmethod(counted_forward)
     bl.TernaryBitLinearSTE.backward = staticmethod(counted_backward)
     bl._packed_linear = counted_packed
-    bl._ternary_wgrad = counted_wgrad
+    bl._ternary_wgrad_from_a8 = counted_wgrad_from_a8
 
     def restore():
         bl.TernaryBitLinearSTE.forward = orig_forward
         bl.TernaryBitLinearSTE.backward = orig_backward
         bl._packed_linear = orig_packed
-        bl._ternary_wgrad = orig_wgrad
+        bl._ternary_wgrad_from_a8 = orig_wgrad_from_a8
 
     return restore
 
@@ -200,8 +208,9 @@ def _bench_ternary_shape(
         )
 
     def dw_total():
-        x_q = x_int8_saved.to(dtype) * inv_sx_saved.to(dtype).unsqueeze(1)
-        return bl._ternary_wgrad(grad, x_q, dtype)
+        return bl._ternary_wgrad_from_a8(
+            grad, x_int8_saved, inv_sx_saved, dtype
+        )
 
     return PhaseTimings(
         fwd=_measure(fwd_total, warmup=warmup, iters=iters),
@@ -257,6 +266,12 @@ def _build_and_count(args):
 
     bl.set_bitlinear_int8_backend("auto")
     bl.set_bitlinear_ternary_backend(args.ternary_backend)
+    bl.set_bitlinear_ternary_execution_path(args.execution_path)
+    bl.configure_bitlinear_ternary_tuning(
+        mode="auto" if args.execution_path == "raw_plan" else "off",
+        cache_enabled=True,
+        cache_path=args.tune_cache_path,
+    )
     bl.set_bitlinear_ternary_wgrad_backend(args.wgrad_backend)
     bl.install_arbor_projection_fusions(model)
     bl.set_bitlinear_fp8_mode(model, "ternary")
@@ -350,6 +365,12 @@ def main():
         choices=["dot_current", "kmajor_current", "kmajor_single_dot", "dot"],
     )
     ap.add_argument("--wgrad-backend", default="fp8", choices=["int8", "fp8", "auto"])
+    ap.add_argument(
+        "--execution-path",
+        default="legacy_raw",
+        choices=["legacy_raw", "legacy_custom_op", "custom_op", "raw_plan"],
+    )
+    ap.add_argument("--tune-cache-path", default="auto")
     ap.add_argument("--compare-int8", action="store_true")
     ap.add_argument("--int8-backend", default="auto", choices=["auto", "int_mm", "triton"])
     ap.add_argument("--weight-cache-gib", type=float, default=None)
@@ -360,6 +381,14 @@ def main():
         raise SystemExit("CUDA is required")
     if args.warmup < 0 or args.iters <= 0:
         raise SystemExit("--warmup must be >=0 and --iters must be >0")
+    if (
+        args.execution_path in {"legacy_raw", "legacy_custom_op"}
+        and args.ternary_backend != "dot_current"
+    ):
+        raise SystemExit(
+            f"--execution-path {args.execution_path} requires "
+            "--ternary-backend dot_current"
+        )
 
     torch.manual_seed(1234)
     counts = _build_and_count(args)
@@ -370,6 +399,12 @@ def main():
         raise SystemExit("No TernaryBitLinearSTE calls were observed")
 
     bl.set_bitlinear_ternary_backend(args.ternary_backend)
+    bl.set_bitlinear_ternary_execution_path(args.execution_path)
+    bl.configure_bitlinear_ternary_tuning(
+        mode="auto" if args.execution_path == "raw_plan" else "off",
+        cache_enabled=True,
+        cache_path=args.tune_cache_path,
+    )
     bl.set_bitlinear_ternary_wgrad_backend(args.wgrad_backend)
     bl.set_bitlinear_int8_backend(args.int8_backend)
     grouped = args.ternary_backend == "dot"

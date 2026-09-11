@@ -10,17 +10,19 @@ from src.model.bitlinear import (
     BitLinearGroup,
     activation_quant,
     check_activation_precision,
+    configure_bitlinear_ternary_tuning,
     quantize_activation,
     configure_bitlinear_training_cache,
     fp8_gemm_supported,
     set_bitlinear_ternary_backend,
+    set_bitlinear_ternary_execution_path,
     set_bitlinear_ternary_wgrad_backend,
     set_bitlinear_fp8_mode,
     set_bitlinear_int8_backend,
     weight_quant,
     _cast_a8_dequant_fp8_transposed,
     _cast_fp8_tensorwise_transposed,
-    _packed_linear_tile,
+    _legacy_packed_launch_spec,
     _wgrad_tile,
 )
 
@@ -68,6 +70,26 @@ def test_unknown_activation_precision_is_error():
         check_activation_precision("int4")
     with pytest.raises(ValueError, match="activation_precision"):
         BitLinear(8, 8, activation_precision="fp8")
+
+
+def test_unknown_ternary_execution_path_is_error():
+    with pytest.raises(ValueError, match="execution path"):
+        set_bitlinear_ternary_execution_path("unknown")
+
+
+def test_legacy_packed_launch_policy_matches_pre_autotune_tiles():
+    assert _legacy_packed_launch_spec(
+        2048, 11264, 2048, grouped_decode=False
+    ) == (128, 64, 128, 4, 3)
+    assert _legacy_packed_launch_spec(
+        2048, 2048, 11264, grouped_decode=False
+    ) == (128, 128, 32, 4, 3)
+    assert _legacy_packed_launch_spec(
+        32, 64, 32, grouped_decode=False
+    ) == (32, 64, 32, 4, 3)
+    assert _legacy_packed_launch_spec(
+        2048, 11264, 2048, grouped_decode=True
+    ) == (32, 64, 128, 4, 3)
 
 
 def test_activation_quant_per_token_grid():
@@ -292,51 +314,7 @@ def test_a8_dequant_fp8_transposed_matches_materialized_xq_cpu():
         torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
 
 
-def test_lowbit_tile_presets_cover_small_and_arbor_shapes():
-    assert _packed_linear_tile(
-        1024, 2048, 2048, grouped_decode=True
-    ) == (32, 64, 128, 4)
-    assert _packed_linear_tile(
-        1024, 2048, 2048, grouped_decode=False
-    ) == (
-        32, 64, 32, 4
-    )
-    assert _packed_linear_tile(
-        16384, 4096, 768, grouped_decode=False
-    ) == (128, 64, 64, 4)
-    assert _packed_linear_tile(
-        32768, 768, 4096, grouped_decode=False
-    ) == (128, 128, 64, 4)
-    assert _packed_linear_tile(
-        16384, 768, 4096, grouped_decode=False
-    ) == (128, 64, 64, 4)
-    assert _packed_linear_tile(
-        131072, 4096, 768, grouped_decode=False
-    ) == (128, 128, 64, 4)
-    assert _packed_linear_tile(
-        1024, 11264, 2048, grouped_decode=False
-    ) == (32, 64, 32, 4)
-    assert _packed_linear_tile(
-        2048, 11264, 2048, grouped_decode=False
-    ) == (128, 64, 128, 4)
-    assert _packed_linear_tile(
-        2048, 2048, 11264, grouped_decode=False
-    ) == (128, 128, 32, 4)
-    assert _packed_linear_tile(
-        2048, 2048, 5632, grouped_decode=False
-    ) == (128, 128, 32, 4)
-    assert _packed_linear_tile(
-        2048, 5632, 2048, grouped_decode=False
-    ) == (128, 64, 64, 4)
-    assert _packed_linear_tile(
-        2048, 3072, 2048, grouped_decode=False
-    ) == (128, 64, 128, 4)
-    assert _packed_linear_tile(
-        2048, 2048, 3072, grouped_decode=False
-    ) == (128, 64, 64, 4)
-    assert _packed_linear_tile(
-        2048, 2048, 2048, grouped_decode=False
-    ) == (128, 128, 64, 8)
+def test_lowbit_wgrad_tile_presets_cover_small_and_arbor_shapes():
     assert _wgrad_tile(7, 17, 33) == (32, 32, 32, 4)
     assert _wgrad_tile(1024, 2048, 2048) == (64, 64, 64, 8)
 
@@ -513,20 +491,105 @@ def test_packed_ternary_group_supports_distinct_weight_scales_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_packed_ternary_bitlinear_torch_compile_cuda():
+def test_packed_ternary_bitlinear_torch_compile_cuda(tmp_path):
     set_bitlinear_ternary_backend("kmajor_single_dot")
+    set_bitlinear_ternary_execution_path("custom_op")
+    configure_bitlinear_ternary_tuning(
+        mode="auto",
+        cache_path=tmp_path / "packed_tune.json",
+        warmup=1,
+        iterations=2,
+    )
     try:
+        reference = BitLinear(32, 64).to(
+            device="cuda", dtype=torch.bfloat16
+        ).train()
         layer = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16).train()
+        layer.load_state_dict(reference.state_dict())
         set_bitlinear_fp8_mode(layer, "ternary")
         layer.enable_training_weight_cache(True)
         compiled = torch.compile(layer)
         x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        loss = compiled(x).float().square().mean()
+        expected = reference(x.detach()).float()
+        actual = compiled(x)
+        torch.testing.assert_close(
+            actual.float(), expected, atol=4e-3, rtol=4e-3
+        )
+        loss = actual.float().square().mean()
         loss.backward()
         assert torch.isfinite(loss)
         assert torch.isfinite(x.grad).all()
         assert torch.isfinite(layer.weight.grad).all()
+
+        # The measured cache must be sufficient for a resolver-free raw graph.
+        set_bitlinear_ternary_execution_path("raw_plan")
+        plan = configure_bitlinear_ternary_tuning(
+            mode="auto",
+            cache_path=tmp_path / "packed_tune.json",
+        )
+        assert plan["plan_entries"] >= 2
+        raw_layer = BitLinear(32, 64).to(
+            device="cuda", dtype=torch.bfloat16
+        ).train()
+        raw_layer.load_state_dict(reference.state_dict())
+        set_bitlinear_fp8_mode(raw_layer, "ternary")
+        raw_layer.enable_training_weight_cache(True)
+        raw_compiled = torch.compile(raw_layer, fullgraph=True)
+        raw_x = x.detach().clone().requires_grad_(True)
+        raw_actual = raw_compiled(raw_x)
+        torch.testing.assert_close(
+            raw_actual.float(), expected, atol=4e-3, rtol=4e-3
+        )
+        raw_actual.float().square().mean().backward()
+        assert torch.isfinite(raw_x.grad).all()
+        assert torch.isfinite(raw_layer.weight.grad).all()
     finally:
+        set_bitlinear_ternary_execution_path("legacy_raw")
+        configure_bitlinear_ternary_tuning(mode="off")
+        set_bitlinear_ternary_backend("dot_current")
+
+
+@pytest.mark.parametrize(
+    ("execution_path", "backend"),
+    [
+        ("custom_op", "kmajor_single_dot"),
+        ("raw", "kmajor_single_dot"),
+        ("legacy_raw", "dot_current"),
+        ("legacy_custom_op", "dot_current"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_ternary_fixed_execution_torch_compile_cuda(execution_path, backend):
+    set_bitlinear_ternary_backend(backend)
+    set_bitlinear_ternary_execution_path(execution_path)
+    configure_bitlinear_ternary_tuning(
+        mode="fixed",
+        fixed_tile="32,64,32,4,2",
+    )
+    try:
+        reference = BitLinear(32, 64).to(
+            device="cuda", dtype=torch.bfloat16
+        ).train()
+        layer = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16).train()
+        layer.load_state_dict(reference.state_dict())
+        set_bitlinear_fp8_mode(layer, "ternary")
+        layer.enable_training_weight_cache(True)
+        compiled = torch.compile(layer, fullgraph=True)
+        x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+        x_compiled = x.detach().clone().requires_grad_(True)
+        expected = reference(x).float()
+        actual = compiled(x_compiled)
+        torch.testing.assert_close(
+            actual.float(), expected, atol=4e-3, rtol=4e-3
+        )
+        loss = actual.float().square().mean()
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert torch.isfinite(x_compiled.grad).all()
+        assert torch.isfinite(layer.weight.grad).all()
+    finally:
+        set_bitlinear_ternary_execution_path("legacy_raw")
+        configure_bitlinear_ternary_tuning(mode="off")
         set_bitlinear_ternary_backend("dot_current")
 
 

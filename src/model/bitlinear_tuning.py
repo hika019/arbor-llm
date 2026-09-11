@@ -1,0 +1,815 @@
+"""Runtime launch-config tuning for packed ternary BitLinear kernels.
+
+This module owns hardware/runtime policy only.  The Triton kernel and its
+numerical semantics stay in :mod:`src.model.bitlinear`; callers provide a
+launcher that executes one candidate against the real tensors.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import statistics
+import threading
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+import torch
+
+try:
+    import triton
+except Exception:  # pragma: no cover - CUDA stack dependent
+    triton = None
+
+
+PACKED_TUNE_CACHE_SCHEMA = 1
+PACKED_TERNARY_KERNEL_VERSION = "packed_ternary_v3_runtime_tuning"
+PACKED_BACKENDS = ("dot", "dot_current", "kmajor_current", "kmajor_single_dot")
+_TUNING_MODES = ("auto", "fixed", "off")
+
+
+@dataclass(frozen=True, order=True)
+class PackedLaunchConfig:
+    block_m: int
+    block_n: int
+    block_k: int
+    num_warps: int
+    num_stages: int = 2
+
+    def __post_init__(self) -> None:
+        values = (
+            self.block_m,
+            self.block_n,
+            self.block_k,
+            self.num_warps,
+            self.num_stages,
+        )
+        if min(values) <= 0:
+            raise ValueError(f"packed launch config values must be positive: {values}")
+        if any(value & (value - 1) for value in values[:3]):
+            raise ValueError(
+                "packed launch block sizes must be powers of two: "
+                f"{values[:3]}"
+            )
+        if self.num_warps not in (1, 2, 4, 8):
+            raise ValueError(
+                "packed launch num_warps must be one of 1, 2, 4, 8: "
+                f"{self.num_warps}"
+            )
+
+    @property
+    def tile_string(self) -> str:
+        return f"{self.block_m}x{self.block_n}x{self.block_k}"
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> PackedLaunchConfig:
+        try:
+            return cls(
+                block_m=int(value["block_m"]),
+                block_n=int(value["block_n"]),
+                block_k=int(value["block_k"]),
+                num_warps=int(value["num_warps"]),
+                num_stages=int(value.get("num_stages", 2)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "packed launch config requires integer block_m, block_n, "
+                "block_k, num_warps, and optional num_stages"
+            ) from exc
+
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    device_index: int
+    name: str
+    compute_capability: tuple[int, int]
+    total_memory: int
+    multi_processor_count: int
+    max_threads_per_multi_processor: int
+    shared_memory_per_block: int
+    warp_size: int
+
+    @classmethod
+    def from_cuda_device(cls, device: torch.device | int | str) -> DeviceInfo:
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            raise ValueError(f"packed ternary tuning requires CUDA, got {resolved}")
+        index = resolved.index
+        if index is None:
+            index = torch.cuda.current_device()
+        return _device_info_for_index(index)
+
+    def fingerprint_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "compute_capability": list(self.compute_capability),
+            "total_memory": self.total_memory,
+            "multi_processor_count": self.multi_processor_count,
+            "warp_size": self.warp_size,
+        }
+
+
+@dataclass(frozen=True)
+class SoftwareInfo:
+    torch_version: str
+    cuda_version: str | None
+    triton_version: str | None
+
+    @classmethod
+    def current(cls) -> SoftwareInfo:
+        return cls(
+            torch_version=torch.__version__,
+            cuda_version=torch.version.cuda,
+            triton_version=getattr(triton, "__version__", None),
+        )
+
+
+@dataclass(frozen=True)
+class TuneKey:
+    backend: str
+    m: int
+    k: int
+    n: int
+    dtype: str
+    scale_per_output: bool
+
+    def __post_init__(self) -> None:
+        if self.backend not in PACKED_BACKENDS:
+            raise ValueError(
+                f"unknown packed ternary backend: {self.backend!r} "
+                f"(choices: {PACKED_BACKENDS})"
+            )
+        if min(self.m, self.k, self.n) <= 0:
+            raise ValueError(f"packed tune shape must be positive: {(self.m, self.k, self.n)}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TuneFingerprint:
+    key: TuneKey
+    device: DeviceInfo
+    software: SoftwareInfo
+    kernel_version: str = PACKED_TERNARY_KERNEL_VERSION
+    schema: int = PACKED_TUNE_CACHE_SCHEMA
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "kernel_version": self.kernel_version,
+            "key": self.key.to_dict(),
+            "gpu": self.device.fingerprint_dict(),
+            "software": asdict(self.software),
+        }
+
+    @property
+    def cache_id(self) -> str:
+        encoded = json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class TuneSelection:
+    config: PackedLaunchConfig
+    source: str
+    median_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class PackedTuningOptions:
+    mode: str = "auto"
+    cache_enabled: bool = True
+    cache_path: Path | None = None
+    fixed_config: PackedLaunchConfig | None = None
+    warmup: int = 10
+    iterations: int = 30
+    verbose: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in _TUNING_MODES:
+            raise ValueError(
+                f"unknown packed ternary tuning mode: {self.mode!r} "
+                f"(choices: {_TUNING_MODES})"
+            )
+        if self.mode == "fixed" and self.fixed_config is None:
+            raise ValueError("packed ternary tuning=fixed requires fixed_config")
+        if self.warmup < 0 or self.iterations <= 0:
+            raise ValueError("packed tuning warmup must be >=0 and iterations must be >0")
+
+
+def default_packed_tune_cache_path() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return root / "arbor" / "packed_ternary_autotune.json"
+
+
+def parse_packed_launch_config(
+    value: PackedLaunchConfig | str | Sequence[int] | dict[str, Any] | None,
+) -> PackedLaunchConfig | None:
+    if value is None:
+        return None
+    if isinstance(value, PackedLaunchConfig):
+        return value
+    if isinstance(value, dict):
+        return PackedLaunchConfig.from_dict(value)
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) not in (4, 5):
+            raise ValueError(
+                "fixed packed tile must be BM,BN,BK,WARPS[,STAGES], "
+                f"got {value!r}"
+            )
+        parsed = tuple(int(part) for part in parts)
+    else:
+        parsed = tuple(int(part) for part in value)
+        if len(parsed) not in (4, 5):
+            raise ValueError(
+                "fixed packed tile must contain BM,BN,BK,WARPS[,STAGES], "
+                f"got {parsed!r}"
+            )
+    if len(parsed) == 4:
+        parsed = (*parsed, 2)
+    return PackedLaunchConfig(*parsed)
+
+
+def conservative_packed_launch_config(
+    backend: str,
+    *,
+    m: int | None = None,
+    n: int | None = None,
+    k: int | None = None,
+) -> PackedLaunchConfig:
+    """Return a broad, compile-friendly default, not a hardware winner."""
+    if backend not in PACKED_BACKENDS:
+        raise ValueError(
+            f"unknown packed ternary backend: {backend!r} "
+            f"(choices: {PACKED_BACKENDS})"
+        )
+    del k
+    if backend == "dot":
+        return PackedLaunchConfig(32, 64, 128, 4, 3)
+    if m is not None and n is not None and (m < 32 or n < 64):
+        return PackedLaunchConfig(16, 32, 32, 4, 3)
+    return PackedLaunchConfig(32, 64, 32, 4, 3)
+
+
+def _candidate_is_legal(
+    config: PackedLaunchConfig,
+    *,
+    m: int,
+    n: int,
+    k: int,
+    backend: str,
+    device: DeviceInfo,
+) -> bool:
+    if config.block_k % 4 != 0:
+        return False
+    if backend == "kmajor_single_dot" and config.block_k < 16:
+        return False
+    if config.num_warps * device.warp_size > 1024:
+        return False
+    # Avoid extreme boundary-only tiles.  This is shape/resource pruning, not
+    # a shape-to-winner mapping.
+    if m < 64 and config.block_m > 64:
+        return False
+    if n < 64 and config.block_n > 64:
+        return False
+    if k < 64 and config.block_k > 32:
+        return False
+    return True
+
+
+def packed_launch_candidates(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    backend: str,
+    device: DeviceInfo,
+) -> tuple[PackedLaunchConfig, ...]:
+    """Generate a bounded, GPU-SKU-independent launch search space."""
+    if min(m, n, k) <= 0:
+        raise ValueError(f"packed candidate shape must be positive: {(m, k, n)}")
+
+    # Deliberately not a full Cartesian product.  These structural samples
+    # cover M/N/K tile tradeoffs while limiting first-use JIT latency.  The
+    # largest output tile compares both warp counts; no template encodes a
+    # winner for a model shape or GPU SKU.
+    templates = (
+        (64, 64, 32, 4),
+        (64, 64, 64, 4),
+        (64, 128, 32, 4),
+        (64, 128, 64, 4),
+        (128, 64, 32, 4),
+        (128, 64, 64, 4),
+        (128, 128, 32, 4),
+        (128, 128, 64, 4),
+        (128, 128, 32, 8),
+        (128, 128, 64, 8),
+    )
+    candidates = {
+        PackedLaunchConfig(bm, bn, bk, warps, stages)
+        for bm, bn, bk, warps in templates
+        for stages in (2, 3)
+    }
+    candidates.add(
+        conservative_packed_launch_config(backend, m=m, n=n, k=k)
+    )
+    return tuple(
+        sorted(
+            config
+            for config in candidates
+            if _candidate_is_legal(
+                config, m=m, n=n, k=k, backend=backend, device=device
+            )
+        )
+    )
+
+
+class PersistentTuneCache:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._loaded = False
+        self._entries: dict[str, Any] = {}
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("cache root must be an object")
+            if payload.get("schema") != PACKED_TUNE_CACHE_SCHEMA:
+                return
+            entries = payload.get("entries", {})
+            if not isinstance(entries, dict):
+                raise ValueError("entries must be an object")
+            self._entries = entries
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            warnings.warn(
+                f"ignoring malformed packed ternary tune cache {self.path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._entries = {}
+
+    def get(self, fingerprint: TuneFingerprint) -> TuneSelection | None:
+        self._load()
+        raw = self._entries.get(fingerprint.cache_id)
+        if not isinstance(raw, dict):
+            return None
+        if raw.get("fingerprint") != fingerprint.to_dict():
+            return None
+        try:
+            return TuneSelection(
+                config=PackedLaunchConfig.from_dict(raw["config"]),
+                source="cache",
+                median_ms=(
+                    None if raw.get("median_ms") is None else float(raw["median_ms"])
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def entries(self) -> tuple[tuple[str, Any], ...]:
+        """Return loaded cache records for frozen-plan construction."""
+        self._load()
+        return tuple(self._entries.items())
+
+    def put(self, fingerprint: TuneFingerprint, selection: TuneSelection) -> None:
+        self._load()
+        self._entries[fingerprint.cache_id] = {
+            "fingerprint": fingerprint.to_dict(),
+            "config": selection.config.to_dict(),
+            "median_ms": selection.median_ms,
+        }
+        payload = {
+            "schema": PACKED_TUNE_CACHE_SCHEMA,
+            "entries": self._entries,
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(self.path)
+        except OSError as exc:
+            warnings.warn(
+                f"could not write packed ternary tune cache {self.path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def clear(self) -> None:
+        self._entries = {}
+        self._loaded = True
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError as exc:
+            warnings.warn(
+                f"could not clear packed ternary tune cache {self.path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+
+class PackedTernaryTuner:
+    def __init__(self, options: PackedTuningOptions | None = None) -> None:
+        self._options = options or PackedTuningOptions(
+            cache_path=default_packed_tune_cache_path()
+        )
+        self._memory: dict[tuple[Any, ...], TuneSelection] = {}
+        self._persistent: PersistentTuneCache | None = None
+        self._logged_static: set[tuple[Any, ...]] = set()
+        self._lock = threading.RLock()
+
+    @property
+    def options(self) -> PackedTuningOptions:
+        return self._options
+
+    def configure(self, options: PackedTuningOptions) -> None:
+        with self._lock:
+            self._options = options
+            self._memory.clear()
+            self._persistent = None
+            self._logged_static.clear()
+
+    def clear(self, *, persistent: bool = False) -> None:
+        with self._lock:
+            self._memory.clear()
+            self._logged_static.clear()
+            if persistent:
+                cache = self._persistent_cache()
+                if cache is not None:
+                    cache.clear()
+
+    def _persistent_cache(self) -> PersistentTuneCache | None:
+        if not self._options.cache_enabled or self._options.cache_path is None:
+            return None
+        if self._persistent is None:
+            self._persistent = PersistentTuneCache(self._options.cache_path)
+        return self._persistent
+
+    def resolve(
+        self,
+        *,
+        key: TuneKey,
+        device: DeviceInfo,
+        launcher: Callable[[PackedLaunchConfig], Any],
+        software: SoftwareInfo | None = None,
+    ) -> TuneSelection:
+        options = self._options
+        if options.mode == "fixed":
+            assert options.fixed_config is not None
+            selection = TuneSelection(options.fixed_config, source="fixed")
+            self._log_static_once(key, device, selection)
+            return selection
+        if options.mode == "off":
+            selection = TuneSelection(
+                conservative_packed_launch_config(
+                    key.backend, m=key.m, n=key.n, k=key.k
+                ),
+                source="off",
+            )
+            self._log_static_once(key, device, selection)
+            return selection
+
+        fingerprint = TuneFingerprint(
+            key=key,
+            device=device,
+            software=software or SoftwareInfo.current(),
+        )
+        memory_key = (
+            key,
+            device.name,
+            device.compute_capability,
+            device.total_memory,
+            device.multi_processor_count,
+            fingerprint.software,
+            fingerprint.kernel_version,
+            fingerprint.schema,
+        )
+        memory_hit = self._memory.get(memory_key)
+        if memory_hit is not None:
+            return TuneSelection(
+                memory_hit.config, source="memory", median_ms=memory_hit.median_ms
+            )
+        with self._lock:
+            memory_hit = self._memory.get(memory_key)
+            if memory_hit is not None:
+                return TuneSelection(
+                    memory_hit.config, source="memory", median_ms=memory_hit.median_ms
+                )
+
+            candidates = packed_launch_candidates(
+                m=key.m,
+                n=key.n,
+                k=key.k,
+                backend=key.backend,
+                device=device,
+            )
+            persistent = self._persistent_cache()
+            disk_hit = persistent.get(fingerprint) if persistent is not None else None
+            # A syntactically valid but manually edited/stale cache entry must
+            # not bypass the current launch policy.
+            if disk_hit is not None and disk_hit.config not in candidates:
+                disk_hit = None
+            if disk_hit is not None:
+                self._memory[memory_key] = disk_hit
+                self._log_selection(key, device, disk_hit)
+                return disk_hit
+
+            prepared: list[PackedLaunchConfig] = []
+            failures: list[tuple[PackedLaunchConfig, str]] = []
+            # First pass compiles every candidate and warms the device before
+            # any winner decision.  Choosing from this pass biases later
+            # configs when GPU clocks/JIT caches are still settling.
+            for candidate in candidates:
+                try:
+                    self._measure(
+                        launcher,
+                        candidate,
+                        device.device_index,
+                        warmup=options.warmup,
+                        iterations=1,
+                    )
+                    prepared.append(candidate)
+                except Exception as exc:  # candidate compile/runtime failure
+                    failures.append((candidate, f"{type(exc).__name__}: {exc}"))
+                    if options.verbose:
+                        print(
+                            "[bitlinear-tune] rejected "
+                            f"shape={key.m}x{key.k}x{key.n} backend={key.backend} "
+                            f"config={candidate} reason={failures[-1][1]}"
+                        )
+
+            if not prepared:
+                attempted = "\n".join(
+                    f"  {config}: {reason}" for config, reason in failures
+                )
+                raise RuntimeError(
+                    "all packed ternary autotune candidates failed\n"
+                    f"backend={key.backend} shape={key.m}x{key.k}x{key.n} "
+                    f"dtype={key.dtype} gpu={device.name!r} "
+                    f"cc={device.compute_capability}\n{attempted}"
+                )
+
+            # Re-measure all successfully compiled candidates on the now-warm
+            # device.  The candidate set is intentionally small, so this is
+            # more robust than allowing first-use/JIT order to pick a winner.
+            timings: list[tuple[float, PackedLaunchConfig]] = []
+            for candidate in prepared:
+                try:
+                    median_ms = self._measure(
+                        launcher,
+                        candidate,
+                        device.device_index,
+                        warmup=min(3, options.warmup),
+                        iterations=options.iterations,
+                    )
+                    timings.append((median_ms, candidate))
+                    if options.verbose:
+                        print(
+                            "[bitlinear-tune] candidate "
+                            f"shape={key.m}x{key.k}x{key.n} "
+                            f"backend={key.backend} BM={candidate.block_m} "
+                            f"BN={candidate.block_n} BK={candidate.block_k} "
+                            f"warps={candidate.num_warps} stages={candidate.num_stages} "
+                            f"median={median_ms:.4f}ms"
+                        )
+                except Exception as exc:
+                    failures.append((candidate, f"{type(exc).__name__}: {exc}"))
+                    if options.verbose:
+                        print(
+                            "[bitlinear-tune] rejected-final "
+                            f"shape={key.m}x{key.k}x{key.n} backend={key.backend} "
+                            f"config={candidate} reason={failures[-1][1]}"
+                        )
+            if not timings:
+                attempted = "\n".join(
+                    f"  {config}: {reason}" for config, reason in failures
+                )
+                raise RuntimeError(
+                    "all packed ternary autotune candidates failed final measurement\n"
+                    f"backend={key.backend} shape={key.m}x{key.k}x{key.n} "
+                    f"dtype={key.dtype} gpu={device.name!r} "
+                    f"cc={device.compute_capability}\n{attempted}"
+                )
+
+            median_ms, winner = min(timings, key=lambda item: item[0])
+            selection = TuneSelection(
+                config=winner, source="measured", median_ms=median_ms
+            )
+            self._memory[memory_key] = selection
+            if persistent is not None:
+                persistent.put(fingerprint, selection)
+            self._log_selection(
+                key, device, selection, candidate_count=len(candidates)
+            )
+            return selection
+
+    def _log_static_once(
+        self,
+        key: TuneKey,
+        device: DeviceInfo,
+        selection: TuneSelection,
+    ) -> None:
+        log_key = (
+            key,
+            device.device_index,
+            selection.config,
+            selection.source,
+        )
+        with self._lock:
+            if log_key in self._logged_static:
+                return
+            self._logged_static.add(log_key)
+        self._log_selection(key, device, selection)
+
+    def _measure(
+        self,
+        launcher: Callable[[PackedLaunchConfig], Any],
+        candidate: PackedLaunchConfig,
+        device_index: int,
+        *,
+        warmup: int,
+        iterations: int,
+    ) -> float:
+        with torch.cuda.device(device_index):
+            for _ in range(warmup):
+                launcher(candidate)
+            torch.cuda.synchronize(device_index)
+            starts = [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(iterations)
+            ]
+            ends = [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(iterations)
+            ]
+            for start, end in zip(starts, ends):
+                start.record()
+                launcher(candidate)
+                end.record()
+            ends[-1].synchronize()
+            return statistics.median(
+                start.elapsed_time(end) for start, end in zip(starts, ends)
+            )
+
+    @staticmethod
+    def _log_selection(
+        key: TuneKey,
+        device: DeviceInfo,
+        selection: TuneSelection,
+        *,
+        candidate_count: int | None = None,
+    ) -> None:
+        config = selection.config
+        details = (
+            f"[bitlinear-tune] backend={key.backend} "
+            f"shape={key.m}x{key.k}x{key.n} "
+            f"dtype={key.dtype} "
+            f"scale={'per_output' if key.scale_per_output else 'tensorwise'} "
+            f"tile={config.tile_string} warps={config.num_warps} "
+            f"stages={config.num_stages} source={selection.source}"
+        )
+        if candidate_count is not None:
+            details += f" candidates={candidate_count}"
+        if selection.median_ms is not None:
+            details += f" median={selection.median_ms:.4f}ms"
+        details += (
+            f" gpu={device.name!r} "
+            f"cc={device.compute_capability[0]}.{device.compute_capability[1]}"
+        )
+        print(details)
+
+
+_DEVICE_INFO_CACHE: dict[int, DeviceInfo] = {}
+
+
+def _device_info_for_index(index: int) -> DeviceInfo:
+    cached = _DEVICE_INFO_CACHE.get(index)
+    if cached is not None:
+        return cached
+    props = torch.cuda.get_device_properties(index)
+    info = DeviceInfo(
+        device_index=index,
+        name=props.name,
+        compute_capability=(props.major, props.minor),
+        total_memory=props.total_memory,
+        multi_processor_count=props.multi_processor_count,
+        max_threads_per_multi_processor=props.max_threads_per_multi_processor,
+        shared_memory_per_block=props.shared_memory_per_block,
+        warp_size=props.warp_size,
+    )
+    _DEVICE_INFO_CACHE[index] = info
+    return info
+
+
+_GLOBAL_TUNER = PackedTernaryTuner(PackedTuningOptions(mode="off"))
+
+
+def configure_packed_ternary_tuning(
+    *,
+    mode: str = "auto",
+    cache_enabled: bool = True,
+    cache_path: str | os.PathLike[str] | None = None,
+    fixed_config: PackedLaunchConfig | str | Sequence[int] | dict[str, Any] | None = None,
+    warmup: int = 10,
+    iterations: int = 30,
+    verbose: bool = False,
+) -> PackedTuningOptions:
+    normalized_mode = str(mode).lower().replace("-", "_")
+    parsed_fixed = parse_packed_launch_config(fixed_config)
+    resolved_path = (
+        default_packed_tune_cache_path()
+        if cache_path is None or str(cache_path).lower() == "auto"
+        else Path(cache_path).expanduser()
+    )
+    options = PackedTuningOptions(
+        mode=normalized_mode,
+        cache_enabled=bool(cache_enabled),
+        cache_path=resolved_path,
+        fixed_config=parsed_fixed,
+        warmup=int(warmup),
+        iterations=int(iterations),
+        verbose=bool(verbose),
+    )
+    _GLOBAL_TUNER.configure(options)
+    return options
+
+
+def resolve_packed_launch_config(
+    *,
+    key: TuneKey,
+    device: DeviceInfo | torch.device | int | str,
+    launcher: Callable[[PackedLaunchConfig], Any],
+) -> TuneSelection:
+    device_info = (
+        device if isinstance(device, DeviceInfo) else DeviceInfo.from_cuda_device(device)
+    )
+    return _GLOBAL_TUNER.resolve(key=key, device=device_info, launcher=launcher)
+
+
+def clear_packed_tuning_cache(*, persistent: bool = False) -> None:
+    _GLOBAL_TUNER.clear(persistent=persistent)
+
+
+def load_packed_tuning_plan(
+    cache_path: str | os.PathLike[str] | None = None,
+    *,
+    device: DeviceInfo | torch.device | int | str = "cuda",
+    software: SoftwareInfo | None = None,
+) -> dict[TuneKey, PackedLaunchConfig]:
+    """Load fingerprint-matching cache entries for traceable raw execution."""
+    resolved_path = (
+        default_packed_tune_cache_path()
+        if cache_path is None or str(cache_path).lower() == "auto"
+        else Path(cache_path).expanduser()
+    )
+    device_info = (
+        device if isinstance(device, DeviceInfo) else DeviceInfo.from_cuda_device(device)
+    )
+    software_info = software or SoftwareInfo.current()
+    cache = PersistentTuneCache(resolved_path)
+    plan: dict[TuneKey, PackedLaunchConfig] = {}
+    for cache_id, raw in cache.entries():
+        if not isinstance(raw, dict):
+            continue
+        fingerprint = raw.get("fingerprint")
+        if not isinstance(fingerprint, dict):
+            continue
+        try:
+            key = TuneKey(**fingerprint["key"])
+            expected = TuneFingerprint(key, device_info, software_info)
+            if cache_id != expected.cache_id or fingerprint != expected.to_dict():
+                continue
+            config = PackedLaunchConfig.from_dict(raw["config"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if config not in packed_launch_candidates(
+            m=key.m,
+            n=key.n,
+            k=key.k,
+            backend=key.backend,
+            device=device_info,
+        ):
+            continue
+        plan[key] = config
+    return plan
+
+
+def current_packed_tuning_options() -> PackedTuningOptions:
+    return _GLOBAL_TUNER.options

@@ -36,6 +36,8 @@ __pycache__/
 Thumbs.db
 
 *.md
+!arbor_packed_ternary_runtime_tuning_design.md
+!arbor_packed_ternary_runtime_tuning_findings.md
 
 # logs
 *.log

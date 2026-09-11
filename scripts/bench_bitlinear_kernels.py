@@ -15,7 +15,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import statistics
 
 import torch
@@ -32,16 +31,28 @@ from src.model.bitlinear import (
     _fp8_wgrad_from_a8,
     _lowbit_wgrad,
     _packed_linear,
+    _packed_linear_custom_op,
+    _packed_linear_execute,
     _quantize_a8_rows,
     _quantize_a8_rows_scaled,
     _quantize_int8_tensorwise,
     _scaled_mm_tensorwise,
+    _ternary_backend_flags,
     _wgrad_tile,
+    configure_bitlinear_ternary_tuning,
     fp8_gemm_supported,
     pack_ternary_weight,
     pack_ternary_weight_kmajor,
     set_bitlinear_int8_backend,
+    set_bitlinear_ternary_execution_path,
     ternary_quantize_int8,
+)
+from src.model.bitlinear_tuning import (
+    DeviceInfo,
+    PackedLaunchConfig,
+    clear_packed_tuning_cache,
+    conservative_packed_launch_config,
+    packed_launch_candidates,
 )
 
 try:
@@ -68,16 +79,6 @@ DEFAULT_CALLS_PER_STEP = {
     (32768, 768, 768): 48,
 }
 
-PACKED_TILE_SWEEP = (
-    (32, 64, 32, 4),
-    (64, 64, 32, 4),
-    (64, 128, 32, 4),
-    (64, 128, 64, 4),
-    (128, 64, 64, 4),
-    (128, 128, 64, 4),
-)
-
-
 def _parse_shape(spec: str) -> tuple[int, int, int]:
     try:
         m, k, n = (int(part) for part in spec.split(","))
@@ -90,35 +91,22 @@ def _parse_shape(spec: str) -> tuple[int, int, int]:
     return m, k, n
 
 
-def _parse_tile(spec: str) -> tuple[int, int, int, int]:
+def _parse_tile(spec: str) -> PackedLaunchConfig:
     try:
-        bm, bn, bk, warps = (int(part) for part in spec.split(","))
+        values = tuple(int(part) for part in spec.split(","))
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            f"tile must be BM,BN,BK,WARPS, got {spec!r}"
+            f"tile must be BM,BN,BK,WARPS[,STAGES], got {spec!r}"
         ) from exc
-    if min(bm, bn, bk, warps) <= 0:
+    if len(values) not in (4, 5):
+        raise argparse.ArgumentTypeError(
+            f"tile must be BM,BN,BK,WARPS[,STAGES], got {spec!r}"
+        )
+    if min(values) <= 0:
         raise argparse.ArgumentTypeError(f"tile values must be positive: {spec!r}")
-    return bm, bn, bk, warps
-
-
-@contextlib.contextmanager
-def _override_dot_current_tile(tile: tuple[int, int, int, int] | None):
-    if tile is None:
-        yield
-        return
-    original = bitlinear_mod._packed_linear_tile
-
-    def forced_tile(m: int, n: int, k: int, *, grouped_decode: bool):
-        if grouped_decode:
-            return original(m, n, k, grouped_decode=grouped_decode)
-        return tile
-
-    bitlinear_mod._packed_linear_tile = forced_tile
-    try:
-        yield
-    finally:
-        bitlinear_mod._packed_linear_tile = original
+    if len(values) == 4:
+        values = (*values, 2)
+    return PackedLaunchConfig(*values)
 
 
 def _sync() -> None:
@@ -159,11 +147,10 @@ def _dense_equiv_tflops(m: int, k: int, n: int, ms: float) -> float:
     return (2.0 * m * k * n) / (ms * 1.0e9)
 
 
-def _grid_size(m: int, n: int, tile: tuple[int, int, int, int]) -> tuple[int, int]:
+def _grid_size(m: int, n: int, tile: PackedLaunchConfig) -> tuple[int, int]:
     if triton is None:
         return 0, 0
-    bm, bn, _bk, _warps = tile
-    return triton.cdiv(m, bm), triton.cdiv(n, bn)
+    return triton.cdiv(m, tile.block_m), triton.cdiv(n, tile.block_n)
 
 
 def _print_dense_efficiency(
@@ -298,6 +285,8 @@ def _ternary_dx(
         k,
         out_dtype,
         grouped_decode=False,
+        backend="dot_current",
+        launch_config=conservative_packed_launch_config("dot_current"),
     )
 
 
@@ -320,6 +309,8 @@ def _ternary_forward(
         n,
         out_dtype,
         grouped_decode=False,
+        backend="dot_current",
+        launch_config=conservative_packed_launch_config("dot_current"),
     )
 
 
@@ -354,6 +345,10 @@ def _bench_shape(
     include_wgrad: bool,
     breakdown: bool,
     tile_sweep: bool,
+    show_candidates: bool,
+    tuning_backend: str,
+    boundary_ab_config: PackedLaunchConfig | None,
+    compile_boundary_ab: bool,
     calls_per_step: int,
 ) -> None:
     m, k, n = shape
@@ -366,10 +361,40 @@ def _bench_shape(
     w_packed_t = pack_ternary_weight(w_int8.t().contiguous())
     w_packed_kmajor = pack_ternary_weight_kmajor(w_int8)
     w_packed_t_kmajor = pack_ternary_weight_kmajor(w_int8.t().contiguous())
+    tuning_flags = _ternary_backend_flags(tuning_backend)
+    tuning_w_packed = (
+        w_packed_kmajor if tuning_flags["kmajor_layout"] else w_packed
+    )
+    tuning_w_packed_t = (
+        w_packed_t_kmajor if tuning_flags["kmajor_layout"] else w_packed_t
+    )
+    tuning_candidates = packed_launch_candidates(
+        m=m,
+        n=n,
+        k=k,
+        backend=tuning_backend,
+        device=DeviceInfo.from_cuda_device(x.device),
+    )
+    if show_candidates:
+        print(
+            f"[candidates] shape={m},{k},{n} backend={tuning_backend} "
+            f"count={len(tuning_candidates)}"
+        )
+        for config in tuning_candidates:
+            print(
+                f"  BM={config.block_m:3d} BN={config.block_n:3d} "
+                f"BK={config.block_k:3d} W={config.num_warps} "
+                f"S={config.num_stages}"
+            )
 
     def int8_linear_backend(backend: str) -> torch.Tensor:
         set_bitlinear_int8_backend(backend)
         return _int8_linear(x_int8, inv_sx, w_int8, row_scale, dtype)
+
+    def comparison_config(backend: str) -> PackedLaunchConfig | None:
+        if backend == tuning_backend:
+            return None
+        return conservative_packed_launch_config(backend)
 
     kernels = {
         "int8_int_mm": lambda: int8_linear_backend("int_mm"),
@@ -383,6 +408,8 @@ def _bench_shape(
             n,
             dtype,
             grouped_decode=False,
+            backend="dot_current",
+            launch_config=comparison_config("dot_current"),
         ),
         "packed_kmajor_current": lambda: _packed_linear(
             x_int8,
@@ -394,6 +421,8 @@ def _bench_shape(
             dtype,
             grouped_decode=False,
             kmajor_layout=True,
+            backend="kmajor_current",
+            launch_config=comparison_config("kmajor_current"),
         ),
         "packed_kmajor_single_dot": lambda: _packed_linear(
             x_int8,
@@ -406,6 +435,8 @@ def _bench_shape(
             grouped_decode=False,
             kmajor_layout=True,
             decode_v2=True,
+            backend="kmajor_single_dot",
+            launch_config=comparison_config("kmajor_single_dot"),
         ),
         "packed_dot": lambda: _packed_linear(
             x_int8,
@@ -416,8 +447,43 @@ def _bench_shape(
             n,
             dtype,
             grouped_decode=True,
+            backend="dot",
+            launch_config=comparison_config("dot"),
         ),
     }
+    if boundary_ab_config is not None:
+        launch_spec = (
+            boundary_ab_config.block_m,
+            boundary_ab_config.block_n,
+            boundary_ab_config.block_k,
+            boundary_ab_config.num_warps,
+            boundary_ab_config.num_stages,
+        )
+        kernels["boundary_raw"] = lambda: _packed_linear_execute(
+            x_int8,
+            inv_sx,
+            tuning_w_packed,
+            row_scale,
+            k,
+            n,
+            dtype,
+            **tuning_flags,
+            backend=tuning_backend,
+            launch_spec=launch_spec,
+        )
+        kernels["boundary_custom_op"] = lambda: _packed_linear_custom_op(
+            x_int8,
+            inv_sx,
+            tuning_w_packed,
+            row_scale,
+            k,
+            n,
+            dtype,
+            tuning_flags["grouped_decode"],
+            tuning_flags["kmajor_layout"],
+            tuning_flags["decode_v2"],
+            tuning_backend,
+        )
     set_bitlinear_int8_backend("triton")
     if check:
         reference = kernels["int8_int_mm"]().float()
@@ -446,33 +512,94 @@ def _bench_shape(
         n=n,
         calls_per_step=calls_per_step,
     )
+    if compile_boundary_ab:
+        assert boundary_ab_config is not None
+
+        def compiled_raw(
+            x_arg: torch.Tensor,
+            inv_sx_arg: torch.Tensor,
+            w_arg: torch.Tensor,
+            sw_arg: torch.Tensor,
+        ) -> torch.Tensor:
+            return _packed_linear_execute(
+                x_arg,
+                inv_sx_arg,
+                w_arg,
+                sw_arg,
+                k,
+                n,
+                dtype,
+                **tuning_flags,
+                backend=tuning_backend,
+                launch_spec=launch_spec,
+            )
+
+        def compiled_custom_op(
+            x_arg: torch.Tensor,
+            inv_sx_arg: torch.Tensor,
+            w_arg: torch.Tensor,
+            sw_arg: torch.Tensor,
+        ) -> torch.Tensor:
+            return _packed_linear_custom_op(
+                x_arg,
+                inv_sx_arg,
+                w_arg,
+                sw_arg,
+                k,
+                n,
+                dtype,
+                tuning_flags["grouped_decode"],
+                tuning_flags["kmajor_layout"],
+                tuning_flags["decode_v2"],
+                tuning_backend,
+            )
+
+        compiled_kernels = {
+            "compiled_boundary_raw": torch.compile(compiled_raw, fullgraph=True),
+            "compiled_boundary_custom_op": torch.compile(
+                compiled_custom_op, fullgraph=True
+            ),
+        }
+        compiled_results = {
+            name: _measure(
+                lambda fn=fn: fn(
+                    x_int8, inv_sx, tuning_w_packed, row_scale
+                ),
+                warmup=warmup,
+                iters=iters,
+            )
+            for name, fn in compiled_kernels.items()
+        }
+        print("\n[torch.compile boundary A/B]")
+        _print_results(compiled_results, baseline_name="compiled_boundary_raw")
 
     if tile_sweep:
-        print("\n[packed tile sweep]")
-        for tile in PACKED_TILE_SWEEP:
-            with _override_dot_current_tile(tile):
-                fwd = _measure(
-                    lambda: _packed_linear(
-                        x_int8,
-                        inv_sx,
-                        w_packed,
-                        row_scale,
-                        k,
-                        n,
-                        dtype,
-                        grouped_decode=False,
-                    ),
-                    warmup=warmup,
-                    iters=iters,
-                )
-                grid_m, grid_n = _grid_size(m, n, tile)
-                bm, bn, bk, warps = tile
-                print(
-                    f"  fwd BM={bm:3d} BN={bn:3d} BK={bk:3d} W={warps} "
-                    f"grid={grid_m:4d}x{grid_n:<4d} "
-                    f"{fwd['median']:8.3f} ms  "
-                    f"{_dense_equiv_tflops(m, k, n, fwd['median']):8.3f} TF/s"
-                )
+        print(f"\n[packed tile sweep backend={tuning_backend}]")
+        for config in tuning_candidates:
+            fwd = _measure(
+                lambda config=config: _packed_linear(
+                    x_int8,
+                    inv_sx,
+                    tuning_w_packed,
+                    row_scale,
+                    k,
+                    n,
+                    dtype,
+                    backend=tuning_backend,
+                    launch_config=config,
+                    **tuning_flags,
+                ),
+                warmup=warmup,
+                iters=iters,
+            )
+            grid_m, grid_n = _grid_size(m, n, config)
+            print(
+                f"  fwd BM={config.block_m:3d} BN={config.block_n:3d} "
+                f"BK={config.block_k:3d} W={config.num_warps} "
+                f"S={config.num_stages} grid={grid_m:4d}x{grid_n:<4d} "
+                f"{fwd['median']:8.3f} ms  "
+                f"{_dense_equiv_tflops(m, k, n, fwd['median']):8.3f} TF/s"
+            )
 
     if include_wgrad:
         grad = torch.randn((m, n), device="cuda", dtype=dtype)
@@ -505,6 +632,8 @@ def _bench_shape(
                 n,
                 dtype,
                 grouped_decode=False,
+                backend="dot_current",
+                launch_config=comparison_config("dot_current"),
             ),
             "fwd_packed_kmajor_current": lambda: _packed_linear(
                 x_int8,
@@ -516,6 +645,8 @@ def _bench_shape(
                 dtype,
                 grouped_decode=False,
                 kmajor_layout=True,
+                backend="kmajor_current",
+                launch_config=comparison_config("kmajor_current"),
             ),
             "fwd_packed_kmajor_single_dot": lambda: _packed_linear(
                 x_int8,
@@ -528,6 +659,8 @@ def _bench_shape(
                 grouped_decode=False,
                 kmajor_layout=True,
                 decode_v2=True,
+                backend="kmajor_single_dot",
+                launch_config=comparison_config("kmajor_single_dot"),
             ),
             "ternary_forward_total": lambda: _ternary_forward(
                 x,
@@ -547,6 +680,8 @@ def _bench_shape(
                 k,
                 dtype,
                 grouped_decode=False,
+                backend="dot_current",
+                launch_config=comparison_config("dot_current"),
             ),
             "dx_packed_kmajor_current": lambda: _packed_linear(
                 g_int8,
@@ -558,6 +693,8 @@ def _bench_shape(
                 dtype,
                 grouped_decode=False,
                 kmajor_layout=True,
+                backend="kmajor_current",
+                launch_config=comparison_config("kmajor_current"),
             ),
             "dx_packed_kmajor_single_dot": lambda: _packed_linear(
                 g_int8,
@@ -570,6 +707,8 @@ def _bench_shape(
                 grouped_decode=False,
                 kmajor_layout=True,
                 decode_v2=True,
+                backend="kmajor_single_dot",
+                launch_config=comparison_config("kmajor_single_dot"),
             ),
             "ternary_dx_total": lambda: _ternary_dx(
                 grad,
@@ -732,31 +871,39 @@ def _bench_shape(
         )
 
         if tile_sweep:
-            print("\n[packed dX tile sweep]")
-            for tile in PACKED_TILE_SWEEP:
-                with _override_dot_current_tile(tile):
-                    dx = _measure(
-                        lambda: _packed_linear(
-                            g_int8,
-                            inv_sg,
-                            w_packed_t,
-                            one,
-                            n,
-                            k,
-                            dtype,
-                            grouped_decode=False,
-                        ),
-                        warmup=warmup,
-                        iters=iters,
-                    )
-                    grid_m, grid_n = _grid_size(m, k, tile)
-                    bm, bn, bk, warps = tile
-                    print(
-                        f"  dX  BM={bm:3d} BN={bn:3d} BK={bk:3d} W={warps} "
-                        f"grid={grid_m:4d}x{grid_n:<4d} "
-                        f"{dx['median']:8.3f} ms  "
-                        f"{_dense_equiv_tflops(m, k, n, dx['median']):8.3f} TF/s"
-                    )
+            dx_candidates = packed_launch_candidates(
+                m=m,
+                n=k,
+                k=n,
+                backend=tuning_backend,
+                device=DeviceInfo.from_cuda_device(g_int8.device),
+            )
+            print(f"\n[packed dX tile sweep backend={tuning_backend}]")
+            for config in dx_candidates:
+                dx = _measure(
+                    lambda config=config: _packed_linear(
+                        g_int8,
+                        inv_sg,
+                        tuning_w_packed_t,
+                        one,
+                        n,
+                        k,
+                        dtype,
+                        backend=tuning_backend,
+                        launch_config=config,
+                        **tuning_flags,
+                    ),
+                    warmup=warmup,
+                    iters=iters,
+                )
+                grid_m, grid_n = _grid_size(m, k, config)
+                print(
+                    f"  dX  BM={config.block_m:3d} BN={config.block_n:3d} "
+                    f"BK={config.block_k:3d} W={config.num_warps} "
+                    f"S={config.num_stages} grid={grid_m:4d}x{grid_n:<4d} "
+                    f"{dx['median']:8.3f} ms  "
+                    f"{_dense_equiv_tflops(m, k, n, dx['median']):8.3f} TF/s"
+                )
 
 
 def main() -> None:
@@ -778,7 +925,61 @@ def main() -> None:
         "--packed-tile",
         type=_parse_tile,
         default=None,
-        help="Override dot_current packed tile as BM,BN,BK,WARPS for experiments.",
+        help="Deprecated alias for --fixed-tile.",
+    )
+    parser.add_argument(
+        "--fixed-tile",
+        type=_parse_tile,
+        default=None,
+        help="Use BM,BN,BK,WARPS[,STAGES] through the production fixed resolver.",
+    )
+    parser.add_argument(
+        "--backend",
+        default="kmajor_single_dot",
+        choices=["dot", "dot_current", "kmajor_current", "kmajor_single_dot"],
+        help="Backend targeted by autotune/candidate/tile-sweep options.",
+    )
+    parser.add_argument(
+        "--execution-path",
+        default="custom_op",
+        choices=[
+            "custom_op",
+            "raw",
+            "raw_plan",
+            "legacy_raw",
+            "legacy_custom_op",
+        ],
+        help="Packed launch boundary. raw requires --fixed-tile; legacy_raw is rollback.",
+    )
+    parser.add_argument(
+        "--boundary-ab",
+        action="store_true",
+        help="Measure raw and custom_op boundaries in one process; requires --fixed-tile.",
+    )
+    parser.add_argument(
+        "--compile-boundary-ab",
+        action="store_true",
+        help="Also compare both boundaries under torch.compile(fullgraph=True).",
+    )
+    parser.add_argument(
+        "--autotune",
+        action="store_true",
+        help="Use the production runtime autotuner (cache -> measure -> cache).",
+    )
+    parser.add_argument(
+        "--show-candidates",
+        action="store_true",
+        help="Print production candidate configs for every requested shape.",
+    )
+    parser.add_argument(
+        "--clear-tune-cache",
+        action="store_true",
+        help="Clear the configured persistent packed ternary tune cache first.",
+    )
+    parser.add_argument(
+        "--tune-cache-path",
+        default="auto",
+        help="Persistent tune cache path (default: XDG cache).",
     )
     parser.add_argument(
         "--breakdown",
@@ -788,7 +989,7 @@ def main() -> None:
     parser.add_argument(
         "--tile-sweep",
         action="store_true",
-        help="Sweep candidate dot_current packed tiles for forward and, with --breakdown, dX.",
+        help="Sweep production candidates for --backend and, with --breakdown, dX.",
     )
     parser.add_argument(
         "--calls-per-step",
@@ -801,31 +1002,80 @@ def main() -> None:
         raise SystemExit("CUDA is required")
     if args.warmup < 0 or args.iters <= 0:
         raise SystemExit("--warmup must be >=0 and --iters must be >0")
+    if args.packed_tile is not None and args.fixed_tile is not None:
+        raise SystemExit("--packed-tile and --fixed-tile are aliases; pass only one")
 
     shapes = args.shape or [_parse_shape(spec) for spec in DEFAULT_SHAPES]
     dtype = getattr(torch, args.dtype)
     torch.manual_seed(0)
-    if args.packed_tile is not None:
-        bm, bn, bk, warps = args.packed_tile
-        print(f"[override] dot_current tile BM={bm} BN={bn} BK={bk} warps={warps}")
-    with _override_dot_current_tile(args.packed_tile):
-        for shape in shapes:
-            calls_per_step = (
-                args.calls_per_step
-                if args.calls_per_step is not None
-                else DEFAULT_CALLS_PER_STEP.get(shape, 1)
-            )
-            _bench_shape(
-                shape,
-                dtype=dtype,
-                warmup=args.warmup,
-                iters=args.iters,
-                check=not args.no_check,
-                include_wgrad=args.wgrad,
-                breakdown=args.breakdown,
-                tile_sweep=args.tile_sweep,
-                calls_per_step=calls_per_step,
-            )
+    fixed_tile = args.fixed_tile or args.packed_tile
+    if args.execution_path == "raw" and fixed_tile is None:
+        raise SystemExit("--execution-path raw requires --fixed-tile")
+    if args.execution_path == "raw_plan" and fixed_tile is not None:
+        raise SystemExit("--execution-path raw_plan reads cache; omit --fixed-tile")
+    if (
+        args.execution_path in {"legacy_raw", "legacy_custom_op"}
+        and args.backend != "dot_current"
+    ):
+        raise SystemExit(
+            f"--execution-path {args.execution_path} requires --backend dot_current"
+        )
+    if args.boundary_ab and fixed_tile is None:
+        raise SystemExit("--boundary-ab requires --fixed-tile")
+    if args.compile_boundary_ab and not args.boundary_ab:
+        raise SystemExit("--compile-boundary-ab requires --boundary-ab")
+    tuning_mode = (
+        "fixed"
+        if fixed_tile is not None
+        else "auto"
+        if args.autotune or args.execution_path == "raw_plan"
+        else "off"
+    )
+    set_bitlinear_ternary_execution_path(args.execution_path)
+    tuning_info = configure_bitlinear_ternary_tuning(
+        mode=tuning_mode,
+        cache_enabled=True,
+        cache_path=args.tune_cache_path,
+        fixed_tile=fixed_tile,
+        warmup=args.warmup,
+        iterations=args.iters,
+        verbose=args.show_candidates,
+    )
+    if args.clear_tune_cache:
+        clear_packed_tuning_cache(persistent=True)
+        print(f"[bitlinear-tune] cleared cache={tuning_info['cache_path']}")
+    print(
+        f"[bitlinear-tune] backend={args.backend} execution={args.execution_path} "
+        f"mode={tuning_mode} "
+        f"cache={tuning_info['cache_path']}"
+    )
+    if fixed_tile is not None:
+        print(
+            f"[fixed] BM={fixed_tile.block_m} BN={fixed_tile.block_n} "
+            f"BK={fixed_tile.block_k} warps={fixed_tile.num_warps} "
+            f"stages={fixed_tile.num_stages}"
+        )
+    for shape in shapes:
+        calls_per_step = (
+            args.calls_per_step
+            if args.calls_per_step is not None
+            else DEFAULT_CALLS_PER_STEP.get(shape, 1)
+        )
+        _bench_shape(
+            shape,
+            dtype=dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+            check=not args.no_check,
+            include_wgrad=args.wgrad,
+            breakdown=args.breakdown,
+            tile_sweep=args.tile_sweep,
+            show_candidates=args.show_candidates,
+            tuning_backend=args.backend,
+            boundary_ab_config=fixed_tile if args.boundary_ab else None,
+            compile_boundary_ab=args.compile_boundary_ab,
+            calls_per_step=calls_per_step,
+        )
 
 
 if __name__ == "__main__":

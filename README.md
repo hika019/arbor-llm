@@ -236,9 +236,22 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   forward用とdX用のternary weightをそれぞれ2bit（4 weights/byte）へpackし、
   Triton kernel内でdecodeする。`kmajor_single_dot` は packed weight を
   `[K/4,N]` のGEMM向けlayoutから1回loadし、4 weightへregister内decode後、
-  dense INT8 fragmentへinterleaveして `tl.dot` を1回だけ呼ぶ。既定の
-  `speed.bitlinear_ternary_backend: dot_current` は
-  旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
+  dense INT8 fragmentへinterleaveして `tl.dot` を1回だけ呼ぶ。
+  `speed.bitlinear_ternary_backend` は計算backendだけを固定し、
+  `speed.bitlinear_ternary_tuning: auto` が実行GPU上でlaunch tileを測定する。
+  結果はGPU/torch/CUDA/Triton/kernel-versionを含むfingerprintで
+  `${XDG_CACHE_HOME:-~/.cache}/arbor/packed_ternary_autotune.json` に保存される。
+  `fixed`（`bitlinear_ternary_fixed_tile: BM,BN,BK,WARPS,STAGES` 必須）と
+  conservative configを使う`off`もdebug/reproduction用に選べる。
+  runtime autotune経路は実学習A/Bでlegacy比の低下が確認されているため、現在の
+  既定は`dot_current + legacy_raw + tuning: off`である。`legacy_raw`は旧shape
+  heuristicをraw Tritonで再現するrollback経路で、`raw`は固定tileの境界A/B用、
+  `custom_op + auto`はautotunerとcache生成用である。cache生成後は`raw_plan`を
+  選ぶと、fingerprintが一致する全shapeの固定launch planをcompile前に読み込み、
+  hot path内のcustom opとresolverを外せる。plan missは暗黙fallbackせずエラーにする。
+  設定契約は`legacy_* = dot_current + off`、`raw = fixed`、
+  `raw_plan = auto + cache`である。
+  `dot_current` は旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
   `kmajor_current` はlayout単独比較、`dot` は4-way grouped decode比較用。dWは
   `speed.bitlinear_ternary_wgrad_backend: int8|fp8|auto` で選択できる。
   `int8` は `Q(dY)^T Q(X)` のdense INT8 GEMM、`fp8` はtensorwise FP8 GEMM、

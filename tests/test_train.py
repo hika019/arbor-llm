@@ -151,6 +151,130 @@ def test_decode_v2_ternary_backend_alias_is_normalized():
     assert resolved["speed"]["bitlinear_ternary_backend"] == "kmajor_single_dot"
 
 
+def test_unknown_ternary_tuning_mode_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_tuning": "guess"},
+    }
+    with pytest.raises(ValueError, match="bitlinear_ternary_tuning"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+def test_fixed_ternary_tuning_requires_and_validates_tile():
+    missing = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_tuning": "fixed"},
+    }
+    with pytest.raises(ValueError, match="requires.*fixed_tile"):
+        adapt_config_for_device(missing, torch.device("cuda"))
+
+    invalid = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64",
+        },
+    }
+    with pytest.raises(ValueError, match="invalid.*fixed_tile"):
+        adapt_config_for_device(invalid, torch.device("cuda"))
+
+    valid = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64,32,4,3",
+        },
+    }
+    resolved = adapt_config_for_device(valid, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_tuning"] == "fixed"
+
+
+def test_ternary_execution_path_is_validated_against_tuning_mode():
+    invalid = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_execution": "graph_break"},
+    }
+    with pytest.raises(ValueError, match="bitlinear_ternary_execution"):
+        adapt_config_for_device(invalid, torch.device("cuda"))
+
+    raw_auto = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw",
+            "bitlinear_ternary_tuning": "auto",
+        },
+    }
+    with pytest.raises(ValueError, match="execution=raw.*tuning=fixed"):
+        adapt_config_for_device(raw_auto, torch.device("cuda"))
+
+    raw_fixed = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw",
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64,32,4,3",
+        },
+    }
+    resolved = adapt_config_for_device(raw_fixed, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_execution"] == "raw"
+
+    legacy_raw = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "legacy_raw",
+            "bitlinear_ternary_tuning": "off",
+        },
+    }
+    resolved = adapt_config_for_device(legacy_raw, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_execution"] == "legacy_raw"
+
+    legacy_raw["speed"]["bitlinear_ternary_tuning"] = False
+    resolved = adapt_config_for_device(legacy_raw, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_tuning"] == "off"
+
+    raw_plan_without_cache = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw_plan",
+            "bitlinear_ternary_tuning_cache": False,
+        },
+    }
+    with pytest.raises(ValueError, match="raw_plan requires cache"):
+        adapt_config_for_device(raw_plan_without_cache, torch.device("cuda"))
+
+    raw_plan_without_auto = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw_plan",
+            "bitlinear_ternary_tuning": "off",
+        },
+    }
+    with pytest.raises(ValueError, match="raw_plan requires.*tuning=auto"):
+        adapt_config_for_device(raw_plan_without_auto, torch.device("cuda"))
+
+    wrong_legacy_backend = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_backend": "kmajor_single_dot",
+            "bitlinear_ternary_execution": "legacy_custom_op",
+        },
+    }
+    with pytest.raises(ValueError, match="legacy_custom_op requires"):
+        adapt_config_for_device(wrong_legacy_backend, torch.device("cuda"))
+
+    wrong_legacy_tuning = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_backend": "dot_current",
+            "bitlinear_ternary_execution": "legacy_raw",
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64,32,4,3",
+        },
+    }
+    with pytest.raises(ValueError, match="legacy_raw requires.*tuning=off"):
+        adapt_config_for_device(wrong_legacy_tuning, torch.device("cuda"))
+
+
 def test_unknown_ternary_wgrad_backend_is_error():
     cfg = {
         "model": {"global_attn_impl": "sdpa"},

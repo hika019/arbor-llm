@@ -585,6 +585,91 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             f"unknown speed.bitlinear_ternary_backend: {ternary_backend!r} "
             "(choices: dot | dot_current | kmajor_current | kmajor_single_dot)"
         )
+    ternary_tuning_raw = speed_cfg.get("bitlinear_ternary_tuning", "off")
+    if ternary_tuning_raw in (None, False):
+        ternary_tuning_raw = "off"
+    ternary_tuning = str(ternary_tuning_raw).lower().replace("-", "_")
+    if ternary_tuning not in {"auto", "fixed", "off"}:
+        raise ValueError(
+            f"unknown speed.bitlinear_ternary_tuning: {ternary_tuning!r} "
+            "(choices: auto | fixed | off)"
+        )
+    if "bitlinear_ternary_tuning" in speed_cfg:
+        speed_cfg["bitlinear_ternary_tuning"] = ternary_tuning
+    fixed_tile = speed_cfg.get("bitlinear_ternary_fixed_tile")
+    if ternary_tuning == "fixed" and fixed_tile is None:
+        raise ValueError(
+            "speed.bitlinear_ternary_tuning=fixed requires "
+            "speed.bitlinear_ternary_fixed_tile"
+        )
+    if fixed_tile is not None:
+        from src.model.bitlinear_tuning import parse_packed_launch_config
+
+        try:
+            parse_packed_launch_config(fixed_tile)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid speed.bitlinear_ternary_fixed_tile: {fixed_tile!r}"
+            ) from exc
+    execution_default = (
+        "legacy_raw"
+        if ternary_backend == "dot_current" and ternary_tuning == "off"
+        else "custom_op"
+    )
+    ternary_execution = str(
+        speed_cfg.get("bitlinear_ternary_execution", execution_default)
+    ).lower().replace("-", "_")
+    if ternary_execution not in {
+        "custom_op",
+        "raw",
+        "raw_plan",
+        "legacy_raw",
+        "legacy_custom_op",
+    }:
+        raise ValueError(
+            f"unknown speed.bitlinear_ternary_execution: {ternary_execution!r} "
+            "(choices: custom_op | raw | raw_plan | legacy_raw | "
+            "legacy_custom_op)"
+        )
+    if ternary_execution == "raw" and ternary_tuning != "fixed":
+        raise ValueError(
+            "speed.bitlinear_ternary_execution=raw currently requires "
+            "speed.bitlinear_ternary_tuning=fixed"
+        )
+    if ternary_execution == "raw_plan" and not bool(
+        speed_cfg.get("bitlinear_ternary_tuning_cache", True)
+    ):
+        raise ValueError("speed.bitlinear_ternary_execution=raw_plan requires cache")
+    if ternary_execution == "raw_plan" and ternary_tuning != "auto":
+        raise ValueError(
+            "speed.bitlinear_ternary_execution=raw_plan requires "
+            "speed.bitlinear_ternary_tuning=auto"
+        )
+    if (
+        ternary_execution in {"legacy_raw", "legacy_custom_op"}
+        and ternary_backend != "dot_current"
+    ):
+        raise ValueError(
+            f"speed.bitlinear_ternary_execution={ternary_execution} requires "
+            "speed.bitlinear_ternary_backend=dot_current"
+        )
+    if (
+        ternary_execution in {"legacy_raw", "legacy_custom_op"}
+        and ternary_tuning != "off"
+    ):
+        raise ValueError(
+            f"speed.bitlinear_ternary_execution={ternary_execution} requires "
+            "speed.bitlinear_ternary_tuning=off"
+        )
+    if "bitlinear_ternary_execution" in speed_cfg:
+        speed_cfg["bitlinear_ternary_execution"] = ternary_execution
+    tuning_warmup = int(speed_cfg.get("bitlinear_ternary_tuning_warmup", 10))
+    tuning_iters = int(speed_cfg.get("bitlinear_ternary_tuning_iters", 30))
+    if tuning_warmup < 0 or tuning_iters <= 0:
+        raise ValueError(
+            "speed.bitlinear_ternary_tuning_warmup must be >=0 and "
+            "speed.bitlinear_ternary_tuning_iters must be >0"
+        )
     ternary_wgrad_backend = str(
         speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8")
     ).lower().replace("-", "_")
@@ -872,12 +957,14 @@ def main() -> int:
     # ---- BitNet 訓練高速化: QKV/gate-up 融合と量子化重みcache ----
     try:
         from src.model.bitlinear import (
+            configure_bitlinear_ternary_tuning,
             configure_bitlinear_training_cache,
             install_arbor_projection_fusions,
             refresh_bitlinear_training_cache,
             set_bitlinear_fp8_mode,
             set_bitlinear_int8_backend,
             set_bitlinear_ternary_backend,
+            set_bitlinear_ternary_execution_path,
             set_bitlinear_ternary_wgrad_backend,
         )
     except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
@@ -893,7 +980,38 @@ def main() -> int:
             str(speed_cfg.get("bitlinear_int8_backend", "auto"))
         )
         ternary_backend = set_bitlinear_ternary_backend(
-            str(speed_cfg.get("bitlinear_ternary_backend", "dot"))
+            str(speed_cfg.get("bitlinear_ternary_backend", "dot_current"))
+        )
+        ternary_tuning_raw = speed_cfg.get("bitlinear_ternary_tuning", "off")
+        if ternary_tuning_raw in (None, False):
+            ternary_tuning_raw = "off"
+        ternary_execution_default = (
+            "legacy_raw"
+            if ternary_backend == "dot_current"
+            and str(ternary_tuning_raw).lower().replace("-", "_") == "off"
+            else "custom_op"
+        )
+        ternary_execution = set_bitlinear_ternary_execution_path(
+            str(
+                speed_cfg.get(
+                    "bitlinear_ternary_execution", ternary_execution_default
+                )
+            )
+        )
+        ternary_tuning = configure_bitlinear_ternary_tuning(
+            mode=str(ternary_tuning_raw),
+            cache_enabled=bool(
+                speed_cfg.get("bitlinear_ternary_tuning_cache", True)
+            ),
+            cache_path=speed_cfg.get(
+                "bitlinear_ternary_tuning_cache_path", "auto"
+            ),
+            fixed_tile=speed_cfg.get("bitlinear_ternary_fixed_tile"),
+            warmup=int(speed_cfg.get("bitlinear_ternary_tuning_warmup", 10)),
+            iterations=int(speed_cfg.get("bitlinear_ternary_tuning_iters", 30)),
+            verbose=bool(
+                speed_cfg.get("bitlinear_ternary_tuning_verbose", False)
+            ),
         )
         ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
             str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
@@ -921,6 +1039,10 @@ def main() -> int:
             f"[train] bitlinear_fp8={fp8_info['mode']} "
             f"int8_backend={int8_backend} "
             f"ternary_backend={ternary_backend} "
+            f"ternary_execution={ternary_execution} "
+            f"ternary_tuning={ternary_tuning['mode']} "
+            f"ternary_tune_cache={ternary_tuning['cache_path']} "
+            f"ternary_plan_entries={ternary_tuning['plan_entries']} "
             f"ternary_wgrad_backend={ternary_wgrad_backend} "
             f"layers={fp8_info['layers']}"
         )
@@ -1419,12 +1541,61 @@ def main() -> int:
             prof_wait = None
     torch_prof = None
     prof_steps_done = 0
+
+    # Nsight Systems capture range (ARBOR_NSYS_PROFILE="wait,active").
+    # nsys側は --capture-range=cudaProfilerApi を指定し、compile後のstepだけ採取する。
+    nsys_spec = os.environ.get("ARBOR_NSYS_PROFILE")
+    nsys_wait: int | None = None
+    nsys_active_steps = 0
+    nsys_capturing = False
+    if nsys_spec:
+        try:
+            nsys_wait, nsys_active_steps = (int(x) for x in nsys_spec.split(","))
+            if nsys_wait < 0 or nsys_active_steps <= 0:
+                raise ValueError
+            if device.type != "cuda":
+                raise RuntimeError("CUDA device is required")
+            print(
+                f"[train] Nsight capture armed: wait={nsys_wait} "
+                f"active={nsys_active_steps}"
+            )
+        except (RuntimeError, ValueError):
+            print(
+                f"[train] WARNING: ARBOR_NSYS_PROFILE='{nsys_spec}' requires "
+                "CUDA and 'wait,active' with wait>=0, active>0; ignoring"
+            )
+            nsys_wait = None
+
+    def nsys_range(name: str):
+        if nsys_capturing:
+            return torch.cuda.nvtx.range(name)
+        return nullcontext()
+
     if sync_each_step:
         print("[train] sync_each_step=ON")
 
     data_iter = make_data_iter()
     while global_step < total_steps:
         try:
+            if (
+                nsys_wait is not None
+                and not nsys_capturing
+                and prof_steps_done == nsys_wait
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStart()
+                    nsys_capturing = True
+                    print(
+                        f"[train] Nsight capture started @ step={global_step}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional diagnostics
+                    print(
+                        f"[train] WARNING: Nsight capture start failed: {exc}",
+                        flush=True,
+                    )
+                    nsys_wait = None
             if prof_wait is not None and torch_prof is None and prof_steps_done == prof_wait:
                 try:
                     torch.cuda.synchronize()
@@ -1440,6 +1611,8 @@ def main() -> int:
                     print(f"[train] WARNING: torch profiler start failed: {exc}", flush=True)
                     torch_prof = None
                     prof_wait = None
+            if nsys_capturing:
+                torch.cuda.nvtx.range_push("arbor.step")
             step_t0 = time.perf_counter()
             bytes_this_step = 0
             for micro in range(grad_accum):
@@ -1492,7 +1665,8 @@ def main() -> int:
                             latest_section_profile = {"profile_error": str(exc)[:200]}
                             print(f"[train] WARNING: section profile failed: {exc}", flush=True)
                     fwd_start = start_gpu_section("forward")
-                    out = model(inputs)
+                    with nsys_range("arbor.forward"):
+                        out = model(inputs)
                     end_gpu_section("forward", fwd_start)
                     if global_step == 0:
                         timing_mark(f"step0_micro{micro}_forward_done", device)
@@ -1533,7 +1707,8 @@ def main() -> int:
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_backward", device)
                 bwd_start = start_gpu_section("backward")
-                loss.backward()
+                with nsys_range("arbor.backward"):
+                    loss.backward()
                 end_gpu_section("backward", bwd_start)
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_backward_done", device)
@@ -1559,12 +1734,15 @@ def main() -> int:
                     model.parameters(), cfg["optim"]["grad_clip"]
                 )
             opt_start = start_gpu_section("optimizer")
-            optimizer.step()
-            if refresh_bitlinear_training_cache is not None:
-                refresh_bitlinear_training_cache(base_model)
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            with nsys_range("arbor.optimizer"):
+                optimizer.step()
+                if refresh_bitlinear_training_cache is not None:
+                    refresh_bitlinear_training_cache(base_model)
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
             end_gpu_section("optimizer", opt_start)
+            if nsys_capturing:
+                torch.cuda.nvtx.range_pop()
 
             global_step += 1
             interval_steps += 1
@@ -1574,6 +1752,26 @@ def main() -> int:
             interval_cpu_ms["step"] += (time.perf_counter() - step_t0) * 1000.0
 
             prof_steps_done += 1
+            if (
+                nsys_capturing
+                and nsys_wait is not None
+                and prof_steps_done >= nsys_wait + nsys_active_steps
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
+                    print(
+                        f"[train] Nsight capture stopped @ step={global_step}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional diagnostics
+                    print(
+                        f"[train] WARNING: Nsight capture stop failed: {exc}",
+                        flush=True,
+                    )
+                finally:
+                    nsys_capturing = False
+                    nsys_wait = None
             if (
                 torch_prof is not None
                 and prof_wait is not None
