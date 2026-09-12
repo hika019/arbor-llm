@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import statistics
+import tempfile
 import threading
 import warnings
 from dataclasses import asdict, dataclass
@@ -496,6 +497,18 @@ def _winner_at_search_boundary(
     return sum(a == b for a, b in zip(winner_values, maxima)) >= 2
 
 
+def _distributed_rank() -> int | None:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+    return torch.distributed.get_rank()
+
+
+def _distributed_world_size() -> int | None:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+    return torch.distributed.get_world_size()
+
+
 class PersistentTuneCache:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -572,12 +585,23 @@ class PersistentTuneCache:
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
-            temporary.write_text(
-                json.dumps(payload, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+            fd, temporary = tempfile.mkstemp(
+                prefix=f"{self.path.name}.",
+                suffix=".tmp",
+                dir=str(self.path.parent),
             )
-            temporary.replace(self.path)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.path)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
         except OSError as exc:
             warnings.warn(
                 f"could not write packed ternary tune cache {self.path}: {exc}",
@@ -634,6 +658,16 @@ class PackedTernaryTuner:
         if self._persistent is None:
             self._persistent = PersistentTuneCache(self._options.cache_path)
         return self._persistent
+
+    def reload_persistent_cache(self) -> None:
+        """Discard in-memory state so the next hit re-reads the cache file.
+
+        Distributed preflight calls this after a barrier so every rank sees the
+        entries written by global rank 0.
+        """
+        with self._lock:
+            self._memory.clear()
+            self._persistent = None
 
     def resolve(
         self,
@@ -717,6 +751,16 @@ class PackedTernaryTuner:
                 self._memory[memory_key] = resolved
                 self._log_selection(key, device, resolved)
                 return resolved
+
+            rank = _distributed_rank()
+            if rank is not None and rank != 0:
+                raise RuntimeError(
+                    "packed ternary autotune cache miss on non-zero rank; "
+                    "distributed preflight must tune and write the cache on "
+                    "global rank 0 before entering the hot path "
+                    f"(backend={key.backend} shape={key.m}x{key.k}x{key.n} "
+                    f"dtype={key.dtype})"
+                )
 
             # Stage 1: compile + coarse-measure every legal candidate.  This
             # pass JIT-compiles each config and gathers a cheap first ranking
@@ -998,6 +1042,62 @@ def resolve_packed_launch_config(
 
 def clear_packed_tuning_cache(*, persistent: bool = False) -> None:
     _GLOBAL_TUNER.clear(persistent=persistent)
+
+
+def packed_ternary_preflight(
+    keys_and_launchers: Sequence[
+        tuple[TuneKey, Callable[[PackedLaunchConfig], Any]]
+    ],
+    *,
+    device: DeviceInfo | torch.device | int | str = "cuda",
+    software: SoftwareInfo | None = None,
+) -> None:
+    """Tune all provided keys on rank 0, then synchronize all ranks.
+
+    In a homogeneous distributed job only global rank 0 performs measurement
+    and persistent-cache writes.  Non-zero ranks wait, receive the shared
+    status, and reload the cache so they see rank-0's results.  A rank-0
+    failure is broadcast instead of silently hanging the other ranks.
+    """
+    device_info = (
+        device if isinstance(device, DeviceInfo) else DeviceInfo.from_cuda_device(device)
+    )
+    software_info = software or SoftwareInfo.current()
+    items = list(keys_and_launchers)
+    rank = _distributed_rank()
+
+    if rank is None:
+        for key, launcher in items:
+            _GLOBAL_TUNER.resolve(
+                key=key, device=device_info, launcher=launcher, software=software_info
+            )
+        return
+
+    status: dict[str, Any] = {"ok": True, "error": None}
+    if rank == 0:
+        try:
+            for key, launcher in items:
+                _GLOBAL_TUNER.resolve(
+                    key=key,
+                    device=device_info,
+                    launcher=launcher,
+                    software=software_info,
+                )
+        except Exception as exc:
+            status = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        else:
+            status = {"ok": True, "error": None}
+
+    status_list: list[dict[str, Any]] = [status]
+    torch.distributed.broadcast_object_list(status_list, src=0)
+    torch.distributed.barrier()
+
+    if not status_list[0]["ok"]:
+        raise RuntimeError(
+            "packed ternary autotune failed on global rank 0: "
+            f"{status_list[0]['error']}"
+        )
+    _GLOBAL_TUNER.reload_persistent_cache()
 
 
 def load_packed_tuning_plan(

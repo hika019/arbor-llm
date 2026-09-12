@@ -488,3 +488,132 @@ def test_render_packed_tuning_report_builds_markdown(tmp_path):
     assert "candidate_count: 54" in report
     assert "failed_count: 1" in report
     assert "128x64x64 warps=4 stages=2" in report
+
+
+def test_nonzero_rank_does_not_measure_and_raises_on_miss(monkeypatch):
+    import src.model.bitlinear_tuning as btl
+
+    tuner = PackedTernaryTuner(
+        PackedTuningOptions(
+            mode="auto",
+            cache_enabled=False,
+            warmup=0,
+            iterations=1,
+        )
+    )
+    monkeypatch.setattr(btl, "_distributed_rank", lambda: 1)
+    measured = False
+
+    def fail_measure(*args, **kwargs):
+        del args, kwargs
+        nonlocal measured
+        measured = True
+        return 0.0
+
+    monkeypatch.setattr(tuner, "_measure", fail_measure)
+    with pytest.raises(RuntimeError, match="cache miss on non-zero rank"):
+        tuner.resolve(
+            key=_key(),
+            device=_device(),
+            software=_software(),
+            launcher=lambda config: config,
+        )
+    assert not measured
+
+
+def test_preflight_rank0_tunes_and_reloads(monkeypatch):
+    import src.model.bitlinear_tuning as btl
+
+    keys = [(_key(), lambda config: config)]
+    resolve_calls: list[dict] = []
+    reload_calls: list[bool] = []
+
+    monkeypatch.setattr(btl, "_distributed_rank", lambda: 0)
+    monkeypatch.setattr(
+        btl._GLOBAL_TUNER,
+        "resolve",
+        lambda **kwargs: resolve_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        btl._GLOBAL_TUNER,
+        "reload_persistent_cache",
+        lambda: reload_calls.append(True),
+    )
+
+    broadcast = {"called": False}
+
+    def fake_broadcast(obj_list, src=0):
+        del obj_list
+        assert src == 0
+        broadcast["called"] = True
+
+    monkeypatch.setattr(
+        btl.torch.distributed, "broadcast_object_list", fake_broadcast
+    )
+    monkeypatch.setattr(btl.torch.distributed, "barrier", lambda: None)
+
+    btl.packed_ternary_preflight(keys, device=_device(), software=_software())
+    assert len(resolve_calls) == 1
+    assert reload_calls == [True]
+    assert broadcast["called"]
+
+
+def test_preflight_nonzero_rank_does_not_resolve(monkeypatch):
+    import src.model.bitlinear_tuning as btl
+
+    reload_calls: list[bool] = []
+    monkeypatch.setattr(btl, "_distributed_rank", lambda: 1)
+
+    def should_not_resolve(**kwargs):
+        del kwargs
+        raise AssertionError("non-zero rank must not run autotune")
+
+    monkeypatch.setattr(btl._GLOBAL_TUNER, "resolve", should_not_resolve)
+    monkeypatch.setattr(
+        btl._GLOBAL_TUNER,
+        "reload_persistent_cache",
+        lambda: reload_calls.append(True),
+    )
+    monkeypatch.setattr(
+        btl.torch.distributed,
+        "broadcast_object_list",
+        lambda obj_list, src=0: None,
+    )
+    monkeypatch.setattr(btl.torch.distributed, "barrier", lambda: None)
+
+    btl.packed_ternary_preflight(
+        [(_key(), lambda config: config)], device=_device(), software=_software()
+    )
+    assert reload_calls == [True]
+
+
+def test_preflight_rank0_failure_is_broadcast(monkeypatch):
+    import src.model.bitlinear_tuning as btl
+
+    monkeypatch.setattr(btl, "_distributed_rank", lambda: 0)
+
+    def fail_resolve(**kwargs):
+        del kwargs
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(btl._GLOBAL_TUNER, "resolve", fail_resolve)
+    monkeypatch.setattr(
+        btl._GLOBAL_TUNER, "reload_persistent_cache", lambda: None
+    )
+
+    broadcast_status: dict[str, object] = {}
+
+    def fake_broadcast(obj_list, src=0):
+        del src
+        broadcast_status["status"] = obj_list[0]
+
+    monkeypatch.setattr(
+        btl.torch.distributed, "broadcast_object_list", fake_broadcast
+    )
+    monkeypatch.setattr(btl.torch.distributed, "barrier", lambda: None)
+
+    with pytest.raises(RuntimeError, match="failed on global rank 0"):
+        btl.packed_ternary_preflight(
+            [(_key(), lambda config: config)], device=_device(), software=_software()
+        )
+    assert broadcast_status["status"]["ok"] is False
