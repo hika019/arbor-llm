@@ -5,6 +5,15 @@
 - legacy 基準: `1140a479efe3e341e213d77147d8bbd1f0d75a27`
 - 関連設計: [arbor_packed_ternary_runtime_tuning_design.md](arbor_packed_ternary_runtime_tuning_design.md)
 
+> **2026-09-12追記:** 本文の約58k bytes/s・約9 s/stepの120-step比較は、
+> lossが一致せず現行meanとは異なるモデル条件だった（中断メモ上は一時的な
+> `patch_pooling: legacy`）。現行
+> `patch_pooling: mean` では `custom_op + auto + reduce-overhead` がA-B-B-A再測で
+> legacy/default比 `bytes/s +18.98%`, step time `-16.09%`となり、既定へ採用した。
+> 最新のA-B-B-A結果と再取得したNsight検証は
+> [arbor_bitnet_launch_bound_investigation.md](arbor_bitnet_launch_bound_investigation.md)
+> を正とする。
+
 ## 結論
 
 runtime autotune のデータモデル、候補生成、fingerprint 付き cache、失敗policyは概ね妥当である。加えて、cache済みの `TuneKey -> PackedLaunchConfig` をcompile前に読み、compiled hot pathから`custom_op`、resolver、I/O、計測を外す`raw_plan`経路まで実装した。機能とcorrectnessは成立している。

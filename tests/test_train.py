@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 
@@ -15,6 +17,58 @@ from src.train.train import CudaBatchPrefetcher
 from src.train.train import ThreadedBatchPrefetcher
 from src.train.train import rebase_scheduler_lr
 from src.train.train import should_restore_dataloader_state
+from src.train.train import prepare_cudagraph_gradient_buffers
+from src.train.train import uses_cudagraph_compile
+from src.train.train import parse_args
+
+
+def test_parse_args_accepts_positive_benchmark_steps(monkeypatch, tmp_path):
+    config = tmp_path / "config.yaml"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train", "--config", str(config), "--benchmark-steps", "120"],
+    )
+
+    args = parse_args()
+
+    assert args.config == config
+    assert args.benchmark_steps == 120
+    assert not args.dry_run
+
+
+@pytest.mark.parametrize("steps", ["0", "-1"])
+def test_parse_args_rejects_nonpositive_benchmark_steps(monkeypatch, tmp_path, steps):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train", "--config", str(tmp_path / "config.yaml"), "--benchmark-steps", steps],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+
+    assert exc_info.value.code == 2
+
+
+def test_parse_args_rejects_benchmark_steps_with_dry_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--benchmark-steps",
+            "1",
+            "--dry-run",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+
+    assert exc_info.value.code == 2
 
 
 def test_resolve_precision_accepts_supported_modes():
@@ -285,7 +339,7 @@ def test_unknown_ternary_wgrad_backend_is_error():
 
 
 @pytest.mark.parametrize("compile_mode", ["reduce-overhead", "max-autotune"])
-def test_cuda_graph_compile_modes_reject_gradient_accumulation(compile_mode):
+def test_cuda_graph_compile_modes_allow_gradient_accumulation(compile_mode):
     cfg = {
         "model": {"global_attn_impl": "sdpa"},
         "speed": {
@@ -294,8 +348,8 @@ def test_cuda_graph_compile_modes_reject_gradient_accumulation(compile_mode):
             "grad_accum_steps": 16,
         },
     }
-    with pytest.raises(ValueError, match="CUDA Graphs.*grad_accum_steps"):
-        adapt_config_for_device(cfg, torch.device("cuda"))
+    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+    assert uses_cudagraph_compile(cfg["speed"])
 
 
 @pytest.mark.parametrize("compile_mode", ["default", "max-autotune-no-cudagraphs"])
@@ -309,6 +363,53 @@ def test_non_cudagraph_compile_modes_allow_gradient_accumulation(compile_mode):
         },
     }
     assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+    assert not uses_cudagraph_compile(cfg["speed"])
+
+
+def test_cudagraph_gradient_buffers_are_persistent_and_reused():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 3, bias=False),
+        torch.nn.Linear(3, 2, bias=False),
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    count, num_bytes = prepare_cudagraph_gradient_buffers(model, optimizer)
+    parameters = list(model.parameters())
+    pointers = [parameter.grad.data_ptr() for parameter in parameters]
+
+    assert count == len(parameters)
+    assert num_bytes == sum(
+        parameter.numel() * parameter.element_size() for parameter in parameters
+    )
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in parameters)
+
+    for parameter in parameters:
+        parameter.grad.fill_(1)
+    optimizer.zero_grad(set_to_none=False)
+
+    assert [parameter.grad.data_ptr() for parameter in parameters] == pointers
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in parameters)
+    assert prepare_cudagraph_gradient_buffers(model, optimizer) == (0, 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cudagraph_gradient_accumulation_reuses_external_buffers_cuda():
+    torch.manual_seed(0)
+    model = torch.nn.Linear(16, 16, bias=False).cuda()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    prepare_cudagraph_gradient_buffers(model, optimizer)
+    grad_pointers = [parameter.grad.data_ptr() for parameter in model.parameters()]
+    compiled = torch.compile(model, mode="reduce-overhead")
+
+    for _ in range(3):
+        for _ in range(3):
+            torch.compiler.cudagraph_mark_step_begin()
+            compiled(torch.randn(8, 16, device="cuda")).square().mean().backward()
+        torch.cuda.synchronize()
+        assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=False)
+        assert [parameter.grad.data_ptr() for parameter in model.parameters()] == grad_pointers
 
 
 def test_validation_model_is_eager_and_separate_from_training_wrapper_by_default():
