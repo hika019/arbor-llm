@@ -119,3 +119,53 @@ loss計算のlaunch律速である。1 updateで約40 msと小さいため今回
 - 再現: `scripts/profile_training_nsys.sh --config CONFIG --wait 25 --active 2
   --output OUT -- --benchmark-steps 27` の後、sqlite exportをNVTX区間で
   分解する (本文の表はこの方法)。
+
+## 修正後のGPU時間内訳 (どこが律速か)
+
+修正後trace (update 1、wall 2410 ms、kernel合計 2360 ms) をkernel名で集計:
+
+| 種別 | GPU ms/update | 比率 |
+|---|---:|---:|
+| packed ternary GEMM (`_packed_bitlinear_kernel`, forward 311 + dX 355) | 666 | 28% |
+| attention (flash fwd/bwd 42+166、flex fwd/bwd 34+140) | 382 | 16% |
+| dW FP8 GEMM (`sm89_xmma_gemm_e4m3…`) | 277 | 12% |
+| parameter grad累積 (`CUDAFunctor_add<BFloat16>` 260 tensor × 32 micro) | 247 | 10% |
+| A8量子化 / FP8 cast・transpose (`_a8_quantize_*`, `_fp8_cast_transpose`, `_a8_dequant_fp8_cast_transpose`) | 217 | 9% |
+| RMSNorm / gated FFN / その他 Inductor fused kernel | ~540 | 23% |
+| AdamW (`_adamw_kernel`) | 29 | 1% |
+| cache再生成 (`_ternary_pack_dual_kernel` + absmean) | 2 | <0.1% |
+
+idleは2.1%なので、残りはGPU計算そのものの時間になった。特筆点は
+grad累積の247 ms: BF16 `.grad += dW` は1 micro-stepごとに1.73 GiB×3の
+メモリ往復 (約7.7 ms) で、micro 32回分が積み上がる。これはCUDA Graph外の
+eager addで、無くすにはdW GEMMのepilogueで累積 (beta=1) するか、累積を
+compiled backwardに含める構造変更が要る。
+
+## VRAM内訳と「2bit表現」の実態
+
+`configs/arbor.yaml` の構成で実測 (allocated):
+
+| 項目 | GiB | B/param |
+|---|---:|---:|
+| shadow weight BF16 (926.8M param、うちBitLinear 923.0M) | 1.73 | 2 |
+| parameter grad BF16 (CUDA Graph用固定buffer) | 1.73 | 2 |
+| AdamW moment FP32 ×2 (`optim.state_precision: fp32`) | 6.91 | 8 |
+| low-bit cache (packed 2bit × 2 layout + row scale) | 0.43 | 0.5 |
+| 合計 (静的) | 10.79 | 12.5 |
+
+benchmarkの `peak_allocated` 10.83 GiBとほぼ一致し、micro2でのactivationは
+ごく小さい。`peak_reserved` 14.25 GiBとの差はCUDA Graph private poolと
+allocatorの余裕分。
+
+BitLinearの2bit表現は実装どおりである: `_train_w_packed` [K/4, N] と
+`_train_w_packed_t` [N/4, K] はuint8で4 weight/byte (例: 768×768×3のQKV group
+→ packed (192, 2304)、packed_t (576, 768))、cache合計は0.43 GiB = 2 layout ×
+2 bit/weight。forward/dX GEMMはこのpacked bufferをkernel内でdecodeして使う。
+
+ただし学習中のVRAMの96%は2bit表現ではなくSTE学習に必要な高精度状態
+(BF16 latent weight + BF16 grad + FP32 moment = 12 B/param) で占められて
+いる。BitNetの1.58bit重みはlatent weightの量子化viewであり、latent weight・
+勾配・optimizer stateまで2bit化する仕組みではない。VRAMを下げる余地は
+主に `optim.state_precision: int8` (moment 8→2 B/param、約5.2 GiB削減。
+READMEにあるとおり既定fp32は安定性・速度優先の選択) にあり、2bit cacheや
+packed kernel側にはない。
