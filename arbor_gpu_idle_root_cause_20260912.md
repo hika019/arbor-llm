@@ -169,3 +169,41 @@ BitLinearの2bit表現は実装どおりである: `_train_w_packed` [K/4, N] �
 主に `optim.state_precision: int8` (moment 8→2 B/param、約5.2 GiB削減。
 READMEにあるとおり既定fp32は安定性・速度優先の選択) にあり、2bit cacheや
 packed kernel側にはない。
+
+## 施策A: dY plumbing の 2 pass 統合 (branch `feat/fused-dy-plumbing`)
+
+packed ternary backward は dY から「dX 用 INT8 行量子化」「dW 用 tensorwise
+FP8 転置」「FP8 scale 用の全体 amax」を別 kernel で作り、dY を 3 回読んで
+いた (8 B/要素)。`_quantize_dy_dual` は row amax pass (行 amax と
+col_scale 適用後の行 amax を同時取得) + tile pass (INT8 行と FP8 転置を
+`tl.trans` で coalesced に同時 store) の 2 pass にし、全体 amax は行 amax の
+max で得る (6 B/要素)。dW が FP8 backend のときだけ使い、それ以外は従来経路。
+
+出力は分離実装と bit 一致 (`tests/test_dy_plumbing.py`: 9 shape × 3 dtype、
+全ゼロ行、STE backward の dX/dW 一致)。実モデル eager でも 260 param 全て一致。
+
+| | kernel 時間/update | 備考 |
+|---|---:|---|
+| dY 側 plumbing 修正前 | 180 ms | fp8 転置 86 + INT8 量子化 67 + 全体 amax 27 |
+| dY 側 plumbing 修正後 | 122 ms | row amax 52 + dual 70 |
+| quant plumbing 合計 | 344 → 224 ms | X 側 (34+31+amax 走査 26) は未着手 |
+
+benchmark (同条件、steady): step 2375 → **2315 ms (-2.5%)**、bwd 1640 → 1580 ms、
+bytes/s 219k → 224k。GPU idle は 2.2% のまま。
+
+### 数値の注意: 学習 loss が step 30 以降 1e-5 オーダーで変わる
+
+eager では bit 一致するが、torch.compile した実学習では 260 param 中 3 つ
+(`global_layers.15.attn.wo`, `global_layers.19.ffn.down`,
+`decoder_layers.1.ffn.down`) の dW が 1 ulp 程度ずれ、loss が僅かに変わる。
+graph 内に照合カウンタを入れて調べた結果、INT8 側は完全一致で、ずれは
+**分離実装側の tensorwise FP8 scale** にあった: 分離実装は
+`t.abs().amax()` を torch op として書いており、Inductor がこの reduction を
+grad_output を生成する pointwise kernel (residual add) に融合すると、bf16 へ
+丸める前の fp32 中間値で amax を取る。そのため scale が bf16 tensor の真の
+amax より最大 0.2% 大きくなる (観測 0.023%)。統合実装は materialize 済みの
+bf16 dY を raw kernel で読むので eager 定義どおりの値になる。融合対象になる
+producer を持つ `wo`/`down` (単体 BitLinear、入力が residual 勾配) だけで
+起きることとも整合する。どちらも FP8 range 内で安全だが、eager 定義に
+一致するのは統合実装の方である。この照合コードを入れると Inductor の融合が
+変わってずれ自体が消えたため、再現には無計装の学習 graph が必要。
