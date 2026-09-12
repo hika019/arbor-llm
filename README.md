@@ -73,6 +73,12 @@ BOSへresetし、attention mask外のresidual経路から前文書が漏れる�
 各micro-step前にCUDAGraph Treesのstep境界を明示する。これにより次のforward replayが
 累積途中のgrad storageを上書きすることを防ぐ。固定buffer分のVRAMは起動時から確保される。
 `default`と`max-autotune-no-cudagraphs`は従来どおりCUDA Graphsを使わない。
+low-bit weight cache (`_train_w_packed` 等) はcompiled forward/backwardの
+static inputなので、optimizer step後の再生成は同じbufferへin-placeで書く。
+新しいtensorに差し替えるとaddressが変わり、CUDAGraph Treesがupdateごとに
+forward/backwardを再captureして数百msのGPU idleになる (詳細は
+`arbor_gpu_idle_root_cause_20260912.md`)。CUDA + Tritonではこの再生成を
+`src/model/ternary_pack.py` の1 kernel/層で行い、純PyTorch経路とbit一致する。
 既定の1B/8k構成では `custom_op + auto + reduce-overhead` を使う。RTX 4090で
 A-B-B-A各120 step（step 21--120集計）した結果、旧
 `dot_current + legacy_raw + default`比で `bytes/s +19.0%`、step time `-16.1%`。

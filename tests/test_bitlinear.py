@@ -172,6 +172,85 @@ def test_ternary_training_cache_uses_two_packed_layouts():
         set_bitlinear_ternary_backend("dot_current")
 
 
+def _cache_buffer_ptrs(module) -> dict[str, int]:
+    return {
+        name: buf.data_ptr()
+        for name, buf in module.named_buffers(recurse=False)
+        if name.startswith("_train_w") and buf is not None
+    }
+
+
+def _cache_buffer_values(module) -> dict[str, torch.Tensor]:
+    return {
+        name: buf.detach().clone()
+        for name, buf in module.named_buffers(recurse=False)
+        if name.startswith("_train_w") and buf is not None
+    }
+
+
+_CACHE_DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("device", _CACHE_DEVICES)
+@pytest.mark.parametrize("mode", ["off", "ternary"])
+@pytest.mark.parametrize("backend", ["dot_current", "kmajor_single_dot"])
+def test_refresh_training_weight_cache_keeps_buffer_addresses(mode, backend, device):
+    """cache 更新は address を保つ (CUDA Graph static input の再 capture 防止).
+
+    address が変わると compile(mode=reduce-overhead) の forward/backward が
+    optimizer step ごとに再 capture され、GPU idle の主因になる。CUDA では
+    2 回目以降の ternary 更新が fused Triton kernel 経路になるため、新規確保
+    (純 PyTorch 経路) との bit 一致も同時に検証する。
+    """
+    set_bitlinear_ternary_backend(backend)
+    try:
+        torch.manual_seed(0)
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        # BitLinear 単体は N/K が 4 の倍数でなくてよい (pad)。group member は
+        # 4 行単位に揃える (fused 経路の条件) 。
+        a = BitLinear(33, 17).to(device=device, dtype=dtype)
+        b = BitLinear(33, 24).to(device=device, dtype=dtype)
+        c = BitLinear(36, 16).to(device=device, dtype=dtype)
+        d = BitLinear(36, 8).to(device=device, dtype=dtype)
+        group = BitLinearGroup((c, d), kind="test")
+        for module in (a, b, c, d, group):
+            module._fp8_mode = mode
+            module.enable_training_weight_cache(True)
+        for module in (a, b, group):
+            before_ptrs = _cache_buffer_ptrs(module)
+            assert before_ptrs
+            with torch.no_grad():
+                for member in (a, b, c, d):
+                    member.weight.mul_(-1.0).add_(0.01)
+            if device == "cuda" and mode == "ternary":
+                from src.model.bitlinear import _fused_ternary_refresh_ready
+
+                assert _fused_ternary_refresh_ready(
+                    (module.members()[0] if module is group else module).weight,
+                    module._train_w_packed,
+                    module._train_w_packed_t,
+                    module._train_w_scale,
+                    sum(m.out_features for m in module.members())
+                    if module is group
+                    else module.out_features,
+                    backend,
+                )
+            module.refresh_training_weight_cache()
+            assert _cache_buffer_ptrs(module) == before_ptrs
+            # 内容は「新規確保した場合」と一致する。
+            fresh = _cache_buffer_values(module)
+            for name in list(fresh):
+                setattr(module, name, None)
+            module.refresh_training_weight_cache()
+            expected = _cache_buffer_values(module)
+            assert fresh.keys() == expected.keys()
+            for name, value in expected.items():
+                assert torch.equal(fresh[name], value), name
+                assert getattr(module, name).is_contiguous(), name
+    finally:
+        set_bitlinear_ternary_backend("dot_current")
+
+
 def test_bitlinear_group_matches_individual_projections():
     torch.manual_seed(0)
     a = BitLinear(32, 16)

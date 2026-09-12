@@ -689,6 +689,95 @@ def test_compiled_train_eager_validation_compiled_train_cuda():
     assert base.training
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cudagraph_train_does_not_rerecord_after_cache_refresh_cuda():
+    """optimizer step + cache 更新後も CUDA Graph を再 capture しない回帰テスト.
+
+    low-bit cache buffer は compiled forward/backward の static input。
+    毎 update で address が変わると CUDA Graph Trees が forward/backward を
+    再 capture し、その間 GPU がほぼ idle になる (実 run で 1 update 約 440ms)。
+    """
+    from torch._inductor import cudagraph_trees
+
+    from src.model.arbor import ArborConfig, ArborModel
+    from src.model.bitlinear import (
+        configure_bitlinear_training_cache,
+        install_arbor_projection_fusions,
+        refresh_bitlinear_training_cache,
+        set_bitlinear_fp8_mode,
+        set_bitlinear_int8_backend,
+    )
+
+    cfg = ArborConfig.from_dict(
+        {
+            "vocab_size": 260,
+            "patch_size": 4,
+            "patch_pooling": "mean",
+            "max_bytes": 64,
+            "hidden_size": 32,
+            "num_heads": 4,
+            "num_kv_heads": 2,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "local_hidden_size": 16,
+            "local_num_heads": 2,
+            "local_num_kv_heads": 2,
+            "local_intermediate_size": 32,
+            "num_local_encoder_layers": 1,
+            "num_local_decoder_layers": 1,
+        }
+    )
+    torch._dynamo.reset()
+    base = ArborModel(cfg).to(device="cuda", dtype=torch.bfloat16).train()
+    install_arbor_projection_fusions(base)
+    set_bitlinear_int8_backend("auto")
+    set_bitlinear_fp8_mode(base, "int8")
+    configure_bitlinear_training_cache(
+        base,
+        enabled="full",
+        grad_accum_steps=1,
+        max_cache_gib=0.1,
+        min_numel=0,
+    )
+    train_model = torch.compile(base, mode="reduce-overhead")
+    optimizer = torch.optim.AdamW(base.parameters(), lr=1e-3)
+    prepare_cudagraph_gradient_buffers(base, optimizer)
+    x = torch.randint(4, 260, (1, 64), device="cuda")
+
+    def train_step():
+        torch.compiler.cudagraph_mark_step_begin()
+        logits = train_model(x).logits
+        loss = torch.nn.functional.cross_entropy(
+            logits[:, :-1].float().reshape(-1, logits.size(-1)),
+            x[:, 1:].reshape(-1),
+        )
+        loss.backward()
+        optimizer.step()
+        refresh_bitlinear_training_cache(base)
+        optimizer.zero_grad(set_to_none=False)
+        return loss.detach().clone()
+
+    # warmup → record の 2 step を経て replay に入る
+    losses = [train_step() for _ in range(3)]
+    manager = cudagraph_trees.get_manager(
+        torch.cuda.current_device(), create_if_none_exists=False
+    )
+    assert manager is not None
+    recorded_before = next(manager.graph_counter)
+    rerecord_before = manager.debug_fail_counter
+    for _ in range(4):
+        losses.append(train_step())
+    torch.cuda.synchronize()
+    assert manager.debug_fail_counter == rerecord_before
+    # graph_counter は itertools.count なので、参照のたびに 1 進む
+    assert next(manager.graph_counter) == recorded_before + 1
+    assert sum(
+        count for per_fn in manager.num_rerecord.values() for count in per_fn.values()
+    ) == 0
+    assert all(torch.isfinite(loss) for loss in losses)
+    torch._dynamo.reset()
+
+
 def test_entropy_model_config_is_loaded_from_single_reference(tmp_path):
     entropy_path = tmp_path / "entropy_lm.yaml"
     entropy_path.write_text(
