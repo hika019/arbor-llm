@@ -146,7 +146,15 @@ optim:
                                 # 節約したい時のみint8を選ぶ(fp32比で二次モーメントの
                                 # underflowを防ぐ非線形符号帳を使用)。
   fp32_backend: auto           # auto: 対応する連続CUDA tensorでAdamW演算を融合。eagerで従来版、tritonで明示必須。
-  lr: 2.0e-4
+  # parameter (bf16, fp32 master 無し) への書き戻し丸め。
+  #   nearest    … 最近接丸め。更新が半 ulp (相対 ~0.2%) 未満だと消える。lr*wd ~1e-5 の
+  #                weight decay は一度も効かず、lr が下がる後半は更新の大半が消える (実測)。
+  #   stochastic … 端数に比例した確率で切り上げる不偏丸め (torchao bf16_stochastic_round
+  #                / Ozkara+ 2025 と同方式)。追加メモリ無し、AdamW kernel 内で完結。
+  param_rounding: stochastic    # choices: nearest | stochastic
+  # BitNet b1.58 公式再現設定 (Training Tips, 1.3B): 1.2e-3 -> 8e-4、LLaMA FP 1.3B は 2e-4。
+  # 2e-4 は FP 側の値だった。8e-4 は旧 filter run (bnb 8bit) で実績あり。
+  lr: 8.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.1             # stage1 の weight decay (two_stage では stage2 で切替)

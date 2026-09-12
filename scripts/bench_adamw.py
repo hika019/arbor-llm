@@ -14,6 +14,7 @@ import yaml
 
 from src.model.arbor import build_arbor
 from src.train.optim import AdamWFP32
+from src.train.rounding import resolve_param_rounding
 
 
 def main():
@@ -37,7 +38,8 @@ def main():
         p.grad = torch.randn_like(p)
     opt_cfg = cfg["optim"]
     opt = AdamWFP32(params, lr=opt_cfg["lr"], betas=tuple(opt_cfg["betas"]),
-                    eps=opt_cfg["eps"], weight_decay=opt_cfg["weight_decay"])
+                    eps=opt_cfg["eps"], weight_decay=opt_cfg["weight_decay"],
+                    param_rounding=resolve_param_rounding(opt_cfg.get("param_rounding")))
     results = []
     for backend in ("eager", "triton", "triton", "eager"):
         opt.backend = backend
