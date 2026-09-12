@@ -820,7 +820,7 @@ class PackedTernaryTuner:
                         launcher,
                         candidate,
                         device.device_index,
-                        warmup=min(3, options.warmup),
+                        warmup=options.warmup,
                         iterations=options.iterations,
                     )
                     timings.append((median_ms, candidate))
