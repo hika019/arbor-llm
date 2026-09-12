@@ -19,6 +19,7 @@ from src.model.bitlinear_tuning import (
     TuneKey,
     conservative_packed_launch_config,
     load_packed_tuning_plan,
+    packed_tune_entry,
     packed_launch_candidates,
     parse_packed_launch_config,
 )
@@ -433,6 +434,175 @@ def test_auto_mode_uses_memory_then_persistent_cache(tmp_path, monkeypatch):
     assert payload["schema"] == 2
     entry = list(payload["entries"].values())[0]
     assert entry["sources"]
+
+
+def test_checkpoint_tune_entries_reuse_compatible_and_skip_benchmark(monkeypatch):
+    tuner = PackedTernaryTuner(
+        PackedTuningOptions(
+            mode="auto",
+            cache_enabled=False,
+            warmup=0,
+            iterations=1,
+        )
+    )
+    measurements = 0
+
+    def fake_measure(launcher, candidate, device_index, **kwargs):
+        del launcher, device_index, kwargs
+        nonlocal measurements
+        measurements += 1
+        return float(candidate.block_m)
+
+    monkeypatch.setattr(tuner, "_measure", fake_measure)
+    first = tuner.resolve(
+        key=_key(), device=_device(), software=_software(), launcher=lambda config: config
+    )
+    assert first.source == "measured"
+    assert measurements > 0
+
+    entries = list(tuner.snapshot_entries(device=_device(), software=_software()))
+    assert len(entries) == 1
+    assert entries[0]["fingerprint"]["key"] == _key().to_dict()
+
+    restored = PackedTernaryTuner(
+        PackedTuningOptions(
+            mode="auto",
+            cache_enabled=False,
+            warmup=0,
+            iterations=1,
+        )
+    )
+    assert (
+        restored.preload_checkpoint_entries(
+            entries, device=_device(), software=_software()
+        )
+        == 1
+    )
+
+    def must_not_benchmark(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("compatible checkpoint tune entry must not benchmark")
+
+    monkeypatch.setattr(restored, "_measure", must_not_benchmark)
+    reused = restored.resolve(
+        key=_key(),
+        device=_device(),
+        software=_software(),
+        launcher=lambda config: pytest.fail("compatible entry must not launch"),
+    )
+    assert reused.source == "checkpoint"
+    assert reused.config == first.config
+    assert reused.median_ms == first.median_ms
+
+
+def test_checkpoint_tune_entries_incompatible_falls_back_to_benchmark(monkeypatch):
+    from src.model.bitlinear_tuning import TuneSelection
+
+    tuner = PackedTernaryTuner(
+        PackedTuningOptions(
+            mode="auto",
+            cache_enabled=False,
+            warmup=0,
+            iterations=1,
+        )
+    )
+    entry = packed_tune_entry(
+        TuneFingerprint(_key(), _device(), _software()),
+        TuneSelection(PackedLaunchConfig(128, 64, 64, 4, 3), source="measured"),
+    )
+    assert (
+        tuner.preload_checkpoint_entries(
+            [entry], device=_device("Another GPU"), software=_software()
+        )
+        == 0
+    )
+
+    measurements = 0
+
+    def fake_measure(launcher, candidate, device_index, **kwargs):
+        del launcher, device_index, kwargs
+        nonlocal measurements
+        measurements += 1
+        return float(candidate.block_m)
+
+    monkeypatch.setattr(tuner, "_measure", fake_measure)
+    selected = tuner.resolve(
+        key=_key(), device=_device(), software=_software(), launcher=lambda config: config
+    )
+    assert selected.source == "measured"
+    assert measurements > 0
+
+
+def test_checkpoint_tune_entries_shape_change_falls_back(monkeypatch):
+    from src.model.bitlinear_tuning import TuneSelection
+
+    tuner = PackedTernaryTuner(
+        PackedTuningOptions(
+            mode="auto",
+            cache_enabled=False,
+            warmup=0,
+            iterations=1,
+        )
+    )
+    entry = packed_tune_entry(
+        TuneFingerprint(_key(1024), _device(), _software()),
+        TuneSelection(PackedLaunchConfig(128, 64, 64, 4, 3), source="measured"),
+    )
+    assert (
+        tuner.preload_checkpoint_entries(
+            [entry], device=_device(), software=_software()
+        )
+        == 1
+    )
+
+    measurements = 0
+
+    def fake_measure(launcher, candidate, device_index, **kwargs):
+        del launcher, device_index, kwargs
+        nonlocal measurements
+        measurements += 1
+        return float(candidate.block_m)
+
+    monkeypatch.setattr(tuner, "_measure", fake_measure)
+    selected = tuner.resolve(
+        key=_key(2048),
+        device=_device(),
+        software=_software(),
+        launcher=lambda config: config,
+    )
+    assert selected.source == "measured"
+    assert measurements > 0
+
+
+def test_checkpoint_tune_entries_missing_falls_back(monkeypatch):
+    tuner = PackedTernaryTuner(
+        PackedTuningOptions(
+            mode="auto",
+            cache_enabled=False,
+            warmup=0,
+            iterations=1,
+        )
+    )
+    assert (
+        tuner.preload_checkpoint_entries(
+            [], device=_device(), software=_software()
+        )
+        == 0
+    )
+    measurements = 0
+
+    def fake_measure(launcher, candidate, device_index, **kwargs):
+        del launcher, device_index, kwargs
+        nonlocal measurements
+        measurements += 1
+        return float(candidate.block_m)
+
+    monkeypatch.setattr(tuner, "_measure", fake_measure)
+    selected = tuner.resolve(
+        key=_key(), device=_device(), software=_software(), launcher=lambda config: config
+    )
+    assert selected.source == "measured"
+    assert measurements > 0
 
 
 def test_auto_mode_ignores_cache_config_outside_current_candidates(

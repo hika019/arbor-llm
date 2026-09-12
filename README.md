@@ -53,14 +53,15 @@ bytes (T=8192)                          token = byte + 4, vocab 260, tokenizer �
 ただし現状は符号帳検索のoptimizer処理が重いため、既定は高速かつ安定なfp32。
 VRAM制約がある場合のみ改良int8を明示選択する。
 
-`bitlinear_fp8=bwd`はforwardを従来BF16のまま維持し、backward GEMMだけをFP8化する。
-`bitlinear_fp8=int8`はnativeな
+`speed.bitlinear_compute_mode=bwd`はforwardを従来BF16のまま維持し、backward GEMMだけをFP8化する。
+`speed.bitlinear_compute_mode=int8`はnativeな
 `A8 INT8 × ternary INT8 → INT32 accumulation` forwardを使う。既定の
-`bitlinear_fp8=ternary`は2bit packed weightをkernel内でdecodeし、backwardは
+`speed.bitlinear_compute_mode=ternary`は2bit packed weightをkernel内でdecodeし、backwardは
 optimizer step単位でcacheしたFP8 weightのN×K/K×N両layoutを使う。sm89+ (RTX
 4090/5090) で動く。既定 `configs/arbor.yaml` はこのpacked経路 + patch_size=16 +
 固定dim mean pooling + local encoder/decoder=1/2層で構成している。
 INT8 GEMMは`speed.bitlinear_int8_backend: auto|int_mm|triton`でA/Bできる。
+互換のため旧表記`speed.bitlinear_fp8`も引き続き受理する。
 
 `data.packing=document`かつstatic patchingでは、dataloaderが新しいdocumentを
 `model.patch_size`境界へPAD alignする。これによりlocal encoder/decoderでも
@@ -237,10 +238,10 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
 - `best` は **train loss の EMA** が最良だった checkpoint (validation best ではない)。
 - `speed.cuda_prefetch: true` で次 batch を別 CUDA stream で GPU へ先行転送する。
   prefetched batch は checkpoint state に同梱されるため、resume で 1 batch 欠落しない。
-- `speed.bitlinear_fp8: bwd` は sm89+ CUDA で BitLinear の backward GEMM を
+- `speed.bitlinear_compute_mode: bwd` は sm89+ CUDA で BitLinear の backward GEMM を
   FP8化する。非対応deviceではエラーになり、暗黙に無効化しない。forwardまで
   FP8化する`full`は追加丸めと速度低下があり得るため既定では使わない。
-- `speed.bitlinear_fp8: ternary` は実験的な学習経路。optimizer step後に
+- `speed.bitlinear_compute_mode: ternary` は実験的な学習経路。optimizer step後に
   forward用とdX用のternary weightをそれぞれ2bit（4 weights/byte）へpackし、
   Triton kernel内でdecodeする。`kmajor_single_dot` は packed weight を
   `[K/4,N]` のGEMM向けlayoutから1回loadし、4 weightへregister内decode後、

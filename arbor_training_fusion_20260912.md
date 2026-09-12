@@ -194,3 +194,44 @@ guard追加後の最終コードでCUDA有効環境から `tests/test_optim.py` 
 `tests/test_adamw_triton.py` を実行し、40 passed / 1 skippedを確認した。
 skipは2 GPUを必要とする実機テスト（手元は1 GPU）。変更対象全体のRuffと
 `git diff --check` も合格した。
+
+## 通常学習142k bytes/sと残るGPU idleの再確認
+
+ユーザーの通常起動後の `checkpoints/arbor2_1b_8k_lowbit/metrics.jsonl` では、
+step60/80/100が142,676 / 141,642 / 143,383 bytes/sだった（すべてphase=steady）。
+したがって単に初回compile/warmupが遅いという説明では足りない。
+optimizer区間は109〜126msで融合版の実績と近い一方、forwardは811〜838ms、
+backwardは2521〜2542msで、上記の合成データ測定より長い。
+
+178,787 bytes/sは固定ローカル合成入力の結果であり、通常のstreaming/document
+packingでの保証値ではない。通常学習はfilter・source混合・文書packingを行い、
+EOS/PADを含むため文書別FlexAttention maskも異なる。とはいえbatch待ちは
+100〜146ms程度で、差全体をI/Oへ帰属することもできない。
+
+さらに `/tmp/arbor-abba-b2.log` には、実データ・micro2/accum32で184〜188kの
+過去の定常ログが実在する。起動ログでmicro2を確認できる（同名の一時YAMLは
+後にmicro4へ変更されているため、その現在値を過去ログへ遡及適用しない）。
+旧ログと直近benchmarkではautotuneの選択tileが変わっているが、保存medianは
+異なる測定条件の値なので直接比較できない。過去の実データ約186kからの低下は
+未解決であり、合成入力との差だけで説明したり、142kをGPUの限界と断定しない。
+
+取得済み `/tmp/arbor-adamw-nsys-triton.sqlite`（合成入力、wait25/active2、
+node trace）を `scripts.analyze_launch_gaps` で再集計すると、GPU activityの
+全体span5872.447ms中、kernel/memcpy/memsetのunionは4766.811ms、空白は
+1105.636ms（18.8%、約553ms/更新）。この比率はtrace負荷込みで、ユーザーの
+142k runのidle率ではない。約230msの最大空白が各更新のbackward内にあり、
+2更新でBeginCapture/EndCapture/GraphInstantiateがそれぞれ4回記録されている。
+定常区間でもGraphの再記録が起きており、replayだけになっていない。
+
+`BitLinear` / `BitLinearGroup.refresh_training_weight_cache` は更新ごとに
+登録bufferを新しいtensorで置き換えている。これによるアドレス変化は再記録の
+原因候補だが、因果関係と通常実行での影響は未検証。
+[PyTorch公式CUDAGraph Trees解説](https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_cudagraph_trees.html)
+でもparameter/bufferのアドレス安定性と再記録の条件が説明されている。
+
+以上から、前節の打ち切りは追加の探索を止めた判断であり、残るidleが改善不能、
+あるいはRTX4090固有の問題という証明ではない。「backward約70%」もCUDA event
+区間にはlaunch待ちが含まれるため、純粋なGPU算術が70%を占める証拠ではない。
+次の切り分け対象はGraph再記録とcache寿命、autotune測定の再現性であり、
+4090専用tileの固定やbatch追い込みではない。この追記では再測定・追加高速化は
+行っていない。

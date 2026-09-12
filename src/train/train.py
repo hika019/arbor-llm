@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 # torch import / CUDA 初期化より前に効かせる必要がある env (env.sh と二重で保険).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -48,7 +49,9 @@ from src.train.signals import StopFlag  # noqa: E402
 from src.train.throughput import ThroughputMeter  # noqa: E402
 from src.model.bitlinear_tuning import (  # noqa: E402
     clear_observed_packed_tune_keys,
+    make_packed_tune_checkpoint_payload,
     observed_packed_tune_keys,
+    preload_packed_tune_checkpoint_payload,
 )
 
 
@@ -736,6 +739,59 @@ def _bind_torchrun_cuda_device() -> torch.device:
     return torch.device("cuda", local_rank)
 
 
+_BITLINEAR_COMPUTE_MODES = frozenset({"off", "bwd", "full", "int8", "ternary"})
+
+
+def _normalize_bitlinear_compute_value(value: Any) -> str:
+    """Apply the legacy ``bitlinear_fp8`` YAML/native-value normalization.
+
+    PyYAML parses an unquoted ``off`` as boolean ``False``, so False and None
+    both mean the explicit ``off`` mode rather than an absent key.
+    """
+    if value in (None, False):
+        return "off"
+    mode = str(value).lower()
+    if mode == "native":
+        mode = "int8"
+    return mode
+
+
+def resolve_bitlinear_compute_mode(speed_cfg: dict) -> str:
+    """Return the canonical ``speed.bitlinear_compute_mode`` value.
+
+    The legacy ``speed.bitlinear_fp8`` key remains accepted for compatibility.
+    When both keys are present they must resolve to the same mode; conflicting
+    dual specification is rejected instead of silently picking one.
+    """
+    has_legacy = "bitlinear_fp8" in speed_cfg
+    has_canonical = "bitlinear_compute_mode" in speed_cfg
+    legacy_raw = speed_cfg.get("bitlinear_fp8")
+    canonical_raw = speed_cfg.get("bitlinear_compute_mode")
+    legacy = (
+        None
+        if not has_legacy
+        else _normalize_bitlinear_compute_value(legacy_raw)
+    )
+    canonical = (
+        None
+        if not has_canonical
+        else _normalize_bitlinear_compute_value(canonical_raw)
+    )
+    if canonical is not None and legacy is not None and canonical != legacy:
+        raise ValueError(
+            "conflicting speed.bitlinear_compute_mode="
+            f"{canonical!r} and speed.bitlinear_fp8={legacy!r}; "
+            "remove the legacy key or make them equal"
+        )
+    mode = canonical if canonical is not None else (legacy if legacy is not None else "off")
+    if mode not in _BITLINEAR_COMPUTE_MODES:
+        raise ValueError(
+            f"unknown speed.bitlinear_compute_mode: {mode!r} "
+            "(choices: off | bwd | full | int8 | ternary; auto/fallbackは禁止)"
+        )
+    return mode
+
+
 def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     """単一 config を device の実行制約へ、意味を変えずに適合させる。
 
@@ -762,21 +818,12 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             "model.global_attn_impl=flex には speed.torch_compile=true が必要です。"
             "暗黙フォールバックは行いません"
         )
-    fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
-    if fp8_raw in (None, False):
-        fp8_raw = "off"
-    fp8_mode = str(fp8_raw).lower()
-    if fp8_mode == "native":
-        fp8_mode = "int8"
-        speed_cfg["bitlinear_fp8"] = "int8"
-    if fp8_mode not in {"off", "bwd", "full", "int8", "ternary"}:
-        raise ValueError(
-            f"unknown speed.bitlinear_fp8: {fp8_mode!r} "
-            "(choices: off | bwd | full | int8 | ternary; auto/fallbackは禁止)"
-        )
+    fp8_mode = resolve_bitlinear_compute_mode(speed_cfg)
+    if "bitlinear_compute_mode" in speed_cfg or "bitlinear_fp8" in speed_cfg:
+        speed_cfg["bitlinear_compute_mode"] = fp8_mode
     if fp8_mode != "off" and device.type != "cuda":
         raise ValueError(
-            f"speed.bitlinear_fp8={fp8_mode} はCUDA専用です。"
+            f"speed.bitlinear_compute_mode={fp8_mode} はCUDA専用です。"
             "暗黙フォールバックは行わないため、offを明示してください"
         )
     int8_backend = str(speed_cfg.get("bitlinear_int8_backend", "auto")).lower()
@@ -1106,9 +1153,7 @@ def configure_training_bitnet(base_model, device, cfg):
     speed_cfg = cfg.get("speed", {})
     # modeを先に設定し、cache allocatorがINT8/FP8両layoutの実コストを使う。
     install_arbor_projection_fusions(base_model)
-    fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
-    if fp8_raw in (None, False):
-        fp8_raw = "off"
+    fp8_mode = resolve_bitlinear_compute_mode(speed_cfg)
     int8_backend = set_bitlinear_int8_backend(
         str(speed_cfg.get("bitlinear_int8_backend", "auto"))
     )
@@ -1149,7 +1194,7 @@ def configure_training_bitnet(base_model, device, cfg):
     ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
         str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
     )
-    fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
+    fp8_info = set_bitlinear_fp8_mode(base_model, fp8_mode)
     bitnet_cache_info = configure_bitlinear_training_cache(
         base_model,
         enabled=speed_cfg.get("bitnet_weight_cache", "auto"),
@@ -1169,7 +1214,7 @@ def configure_training_bitnet(base_model, device, cfg):
         f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
     )
     print(
-        f"[train] bitlinear_fp8={fp8_info['mode']} "
+        f"[train] bitlinear_compute_mode={fp8_info['mode']} "
         f"int8_backend={int8_backend} "
         f"ternary_backend={ternary_backend} "
         f"ternary_execution={ternary_execution} "
@@ -1196,6 +1241,71 @@ def configure_training_bitnet(base_model, device, cfg):
                 f"{len(preflight_tune_keys)}"
             )
     return refresh_bitlinear_training_cache, preflight_tune_keys
+
+
+def _preload_resume_packed_tune(
+    ckpt: CheckpointManager,
+    resume: str,
+    device: torch.device,
+    speed_cfg: dict,
+) -> int | None:
+    """Preload checkpoint-persisted packed tuning for a same-GPU resume skip.
+
+    Returns the compatible entry count, ``0`` when present but incompatible,
+    and ``None`` when the checkpoint carries no packed-tuning metadata.  This
+    only affects the ternary tuner; model initialization and compile warmup
+    are intentionally not skipped.
+    """
+    if device.type != "cuda":
+        return None
+    if str(speed_cfg.get("bitlinear_ternary_tuning", "off")).lower().replace(
+        "-", "_"
+    ) != "auto":
+        return None
+    resolved = ckpt.resolve(resume)
+    if resolved is None:
+        return None
+    meta_path = resolved / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print(
+            "[bitlinear-tune] resume checkpoint meta is unreadable; "
+            "falling back to on-disk cache/benchmark"
+        )
+        return None
+    extra = meta.get("extra")
+    payload = extra.get("packed_ternary_tuning") if isinstance(extra, dict) else None
+    if payload is None:
+        print(
+            "[bitlinear-tune] resume checkpoint has no packed ternary tuning "
+            "metadata; falling back to on-disk cache/benchmark"
+        )
+        return None
+    try:
+        count = preload_packed_tune_checkpoint_payload(payload, device=device)
+    except Exception as exc:  # defensive fallback for malformed metadata
+        print(
+            "[bitlinear-tune] resume checkpoint packed ternary tuning metadata is "
+            f"invalid ({type(exc).__name__}: {exc}); "
+            "falling back to on-disk cache/benchmark"
+        )
+        return 0
+    if count == 0:
+        print(
+            "[bitlinear-tune] resume checkpoint packed ternary tuning metadata is "
+            "incompatible with current GPU/software; falling back to "
+            "on-disk cache/benchmark"
+        )
+        return 0
+    print(
+        "[bitlinear-tune] resume skip/reuse compatible packed ternary tuning "
+        f"entries={count}; same GPU/software/kernel/shape fingerprint, "
+        "skipping benchmark for matched shapes"
+    )
+    return count
 
 
 def main() -> int:
@@ -1282,6 +1392,20 @@ def main() -> int:
             f"[train] init_from={init_path} loaded in {time.perf_counter() - t0:.1f}s "
             "(weights only; optimizer/scheduler/step は新規)"
         )
+
+    # ---- チェックポイント管理 ----
+    # packed-ternary の resume skip 判定で checkpoint meta を読むため、tuning
+    # 設定より先に manager だけを構築する (load はまだ行わない)。
+    ckpt_cfg = cfg["checkpoint"]
+    ckpt_dir = Path(os.environ.get("CHECKPOINT_DIR", ckpt_cfg["dir"]))
+    ckpt = CheckpointManager(
+        ckpt_dir,
+        keep_last_k=ckpt_cfg.get("keep_last_k", 3),
+        keep_every_n_steps=ckpt_cfg.get("keep_every_n_steps"),
+        async_save=ckpt_cfg.get("async_save", True),
+    )
+    if args.resume:
+        _preload_resume_packed_tune(ckpt, args.resume, device, cfg.get("speed", {}))
 
     refresh_bitlinear_training_cache, preflight_tune_keys = configure_training_bitnet(
         base_model, device, cfg
@@ -1374,15 +1498,7 @@ def main() -> int:
     scheduler = build_scheduler(optimizer, cfg["optim"])
     timing_mark("scheduler_created", device)
 
-    # ---- チェックポイント ----
-    ckpt_cfg = cfg["checkpoint"]
-    ckpt_dir = Path(os.environ.get("CHECKPOINT_DIR", ckpt_cfg["dir"]))
-    ckpt = CheckpointManager(
-        ckpt_dir,
-        keep_last_k=ckpt_cfg.get("keep_last_k", 3),
-        keep_every_n_steps=ckpt_cfg.get("keep_every_n_steps"),
-        async_save=ckpt_cfg.get("async_save", True),
-    )
+    # ---- チェックポイント (manager は tuning skip 判定のため構築済み) ----
     # loss/ema/lr の時系列 (log_every_steps ごとに 1 行追記)。resume 時は追記継続
     # なので、巻き戻した場合は同じ step が重複しうる (プロット時は後勝ちで dedup)。
     if benchmark_mode:
@@ -1658,6 +1774,28 @@ def main() -> int:
         validation_results: dict[str, float] | None,
         validation_status: str,
     ) -> CheckpointMeta:
+        packed_tune_payload = None
+        if device.type == "cuda":
+            try:
+                packed_tune_payload = make_packed_tune_checkpoint_payload(
+                    device=device
+                )
+            except Exception as exc:  # checkpoint saving must not fail on this
+                print(
+                    "[bitlinear-tune] could not snapshot packed tuning for "
+                    f"checkpoint: {type(exc).__name__}: {exc}"
+                )
+        extra = {
+            "git": git_info,
+            "run": run_info,
+            "best_metric": (
+                "validation_mean_bpb" if validation_enabled else "train_ema_loss"
+            ),
+            "validation": validation_results,
+            "validation_status": validation_status,
+        }
+        if packed_tune_payload is not None:
+            extra["packed_ternary_tuning"] = packed_tune_payload
         return CheckpointMeta(
             global_step=step,
             best_loss=best_value,
@@ -1673,15 +1811,7 @@ def main() -> int:
                 else None
             ),
             wandb_run_id=os.environ.get("WANDB_RUN_ID"),
-            extra={
-                "git": git_info,
-                "run": run_info,
-                "best_metric": (
-                    "validation_mean_bpb" if validation_enabled else "train_ema_loss"
-                ),
-                "validation": validation_results,
-                "validation_status": validation_status,
-            },
+            extra=extra,
         )
 
     model.train()

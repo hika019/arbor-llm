@@ -10,6 +10,7 @@ from src.train.train import resolve_precision
 from src.train.train import resolve_autocast
 from src.train.train import resolve_entropy_lm_reference
 from src.train.train import adapt_config_for_device
+from src.train.train import resolve_bitlinear_compute_mode
 from src.train.train import pick_device
 from src.train.train import byte_kind_loss_stats
 from src.train.train import build_validation_model
@@ -22,7 +23,9 @@ from src.train.train import prepare_cudagraph_gradient_buffers
 from src.train.train import uses_cudagraph_compile
 from src.train.train import parse_args
 from src.train.train import _run_tuning_preflight_preserving_state
+from src.train.train import _preload_resume_packed_tune
 from src.train.train import configure_training_bitnet
+from src.train.checkpoint import CheckpointManager
 
 
 def test_training_bitnet_initialization_enables_requested_cache(capsys):
@@ -216,6 +219,78 @@ def test_fp8_on_non_cuda_is_error():
     }
     with pytest.raises(ValueError, match="CUDA専用"):
         adapt_config_for_device(cfg, torch.device("cpu"))
+
+
+def test_bitlinear_compute_mode_canonical_and_legacy_alias():
+    assert resolve_bitlinear_compute_mode({}) == "off"
+    assert resolve_bitlinear_compute_mode(
+        {"bitlinear_compute_mode": "ternary"}
+    ) == "ternary"
+    assert resolve_bitlinear_compute_mode({"bitlinear_fp8": "ternary"}) == "ternary"
+    assert resolve_bitlinear_compute_mode({"bitlinear_compute_mode": False}) == "off"
+    assert resolve_bitlinear_compute_mode({"bitlinear_fp8": False}) == "off"
+    assert resolve_bitlinear_compute_mode(
+        {"bitlinear_compute_mode": "native"}
+    ) == "int8"
+    assert resolve_bitlinear_compute_mode({"bitlinear_fp8": "native"}) == "int8"
+    assert (
+        resolve_bitlinear_compute_mode(
+            {"bitlinear_compute_mode": "int8", "bitlinear_fp8": "native"}
+        )
+        == "int8"
+    )
+
+
+def test_bitlinear_compute_mode_conflicting_dual_keys_are_rejected():
+    with pytest.raises(ValueError, match="conflicting speed.bitlinear_compute_mode"):
+        resolve_bitlinear_compute_mode(
+            {"bitlinear_compute_mode": "ternary", "bitlinear_fp8": "off"}
+        )
+
+    with pytest.raises(ValueError, match="conflicting speed.bitlinear_compute_mode"):
+        adapt_config_for_device(
+            {
+                "model": {"global_attn_impl": "sdpa"},
+                "speed": {
+                    "bitlinear_compute_mode": "ternary",
+                    "bitlinear_fp8": "bwd",
+                },
+            },
+            torch.device("cuda"),
+        )
+
+
+def test_unknown_bitlinear_compute_mode_is_error():
+    with pytest.raises(ValueError, match="bitlinear_compute_mode"):
+        resolve_bitlinear_compute_mode({"bitlinear_compute_mode": "guess"})
+
+
+def test_adapt_config_canonicalizes_legacy_compute_mode():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_fp8": "native"},
+    }
+    resolved = adapt_config_for_device(cfg, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_compute_mode"] == "int8"
+
+
+def test_training_bitnet_initialization_uses_canonical_compute_mode(capsys):
+    from src.model.bitlinear import BitLinear
+
+    model = torch.nn.Sequential(BitLinear(32, 32))
+    refresh, keys = configure_training_bitnet(model, torch.device("cpu"), {
+        "speed": {
+            "bitlinear_compute_mode": "off",
+            "bitnet_weight_cache": "full",
+            "bitnet_weight_cache_min_numel": 0,
+        },
+    })
+    assert model[0].training_weight_cache_enabled
+    assert refresh(model) == 1
+    assert keys is None
+    out = capsys.readouterr().out
+    assert "bitlinear_compute_mode=off" in out
+    assert "bitlinear_fp8=" not in out
 
 
 def test_unknown_int8_backend_is_error():
@@ -716,6 +791,69 @@ def test_tuning_preflight_restores_rng_buffers_grads_and_mode():
     assert model.counter.item() == 0
     assert torch.equal(model.linear.weight.grad, torch.full_like(model.linear.weight, 7))
     assert model.linear.bias.grad is None
+
+
+def _make_resume_checkpoint(tmp_path, *, extra):
+    import json
+
+    ckpt = CheckpointManager(tmp_path)
+    step_dir = tmp_path / "step_0000000001"
+    step_dir.mkdir()
+    (step_dir / "meta.json").write_text(
+        json.dumps({"global_step": 1, "extra": extra}), encoding="utf-8"
+    )
+    return ckpt, step_dir
+
+
+def test_resume_packed_tune_missing_metadata_falls_back(capsys, monkeypatch, tmp_path):
+    ckpt, step_dir = _make_resume_checkpoint(tmp_path, extra={"git": {}})
+    preload_calls = []
+    monkeypatch.setattr(
+        "src.train.train.preload_packed_tune_checkpoint_payload",
+        lambda **kwargs: preload_calls.append(kwargs) or 0,
+    )
+
+    result = _preload_resume_packed_tune(
+        ckpt, str(step_dir), torch.device("cuda"), {"bitlinear_ternary_tuning": "auto"}
+    )
+
+    assert result is None
+    assert preload_calls == []
+    assert "no packed ternary tuning metadata" in capsys.readouterr().out
+
+
+def test_resume_packed_tune_compatible_entries_skip(capsys, monkeypatch, tmp_path):
+    ckpt, step_dir = _make_resume_checkpoint(
+        tmp_path, extra={"packed_ternary_tuning": {"entries": [{"fingerprint": {}}]}}
+    )
+    monkeypatch.setattr(
+        "src.train.train.preload_packed_tune_checkpoint_payload",
+        lambda *args, **kwargs: 3,
+    )
+
+    result = _preload_resume_packed_tune(
+        ckpt, str(step_dir), torch.device("cuda"), {"bitlinear_ternary_tuning": "auto"}
+    )
+
+    assert result == 3
+    assert "resume skip/reuse compatible packed ternary tuning entries=3" in capsys.readouterr().out
+
+
+def test_resume_packed_tune_incompatible_entries_fallback(capsys, monkeypatch, tmp_path):
+    ckpt, step_dir = _make_resume_checkpoint(
+        tmp_path, extra={"packed_ternary_tuning": {"entries": [{"fingerprint": {}}]}}
+    )
+    monkeypatch.setattr(
+        "src.train.train.preload_packed_tune_checkpoint_payload",
+        lambda *args, **kwargs: 0,
+    )
+
+    result = _preload_resume_packed_tune(
+        ckpt, str(step_dir), torch.device("cuda"), {"bitlinear_ternary_tuning": "auto"}
+    )
+
+    assert result == 0
+    assert "incompatible with current GPU/software" in capsys.readouterr().out
 
 
 def test_should_restore_dataloader_state_when_data_config_matches():

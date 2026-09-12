@@ -50,7 +50,7 @@ def main() -> None:
         "--bitlinear-fp8",
         default=None,
         choices=["off", "bwd", "full", "int8", "ternary"],
-        help="既定は config speed.bitlinear_fp8",
+        help="既定は config speed.bitlinear_compute_mode",
     )
     ap.add_argument(
         "--int8-backend",
@@ -170,7 +170,31 @@ def main() -> None:
     )
     fp8_mode = args.bitlinear_fp8
     if fp8_mode is None:
-        fp8_mode = speed_cfg.get("bitlinear_fp8", "off")
+        legacy = speed_cfg.get("bitlinear_fp8")
+        canonical = speed_cfg.get("bitlinear_compute_mode")
+
+        def _normalize(value):
+            if value in (None, False):
+                return "off"
+            value = str(value).lower()
+            return "int8" if value == "native" else value
+
+        legacy_norm = None if legacy is None else _normalize(legacy)
+        canonical_norm = None if canonical is None else _normalize(canonical)
+        if (
+            canonical_norm is not None
+            and legacy_norm is not None
+            and canonical_norm != legacy_norm
+        ):
+            raise ValueError(
+                "conflicting speed.bitlinear_compute_mode="
+                f"{canonical_norm!r} and speed.bitlinear_fp8={legacy_norm!r}"
+            )
+        fp8_mode = (
+            canonical_norm
+            if canonical_norm is not None
+            else (legacy_norm if legacy_norm is not None else "off")
+        )
     if fp8_mode in (None, False):
         fp8_mode = "off"
     install_arbor_projection_fusions(model)

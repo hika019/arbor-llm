@@ -7,7 +7,7 @@
 # (16 bytes/patch) なので global は512 patches。実効バッチは64 seq=524k bytes/update。
 #
 # このbranchの既定値はCUDA sm89+専用。非対応deviceへは暗黙フォールバックしない。
-# MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_fp8: off を明示する。
+# MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_compute_mode: off を明示する。
 
 run_name: arbor2_1b_8k_lowbit
 seed: 42
@@ -173,10 +173,11 @@ speed:
   compile_mode: reduce-overhead # packed kernelのlaunch gapをCUDA Graphsで削減。grad bufferを固定確保する。
   cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
   cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
-  bitlinear_fp8: ternary           # choices: off | bwd | full | int8 | ternary。ternaryは実験的packed W1.58 training。
+  bitlinear_compute_mode: ternary  # choices: off | bwd | full | int8 | ternary。ternaryは実験的packed W1.58 training。
                                 # int8=A8 INT8×ternary INT8 forward + cached FP8 backward (本命)。
                                 # ternary=packed 2bit forward/dX + 下記backendのdW。
                                 # bwd=forward BF16 維持で backward のみ FP8。fullは追加丸めが乗る。
+                                # 旧表記 speed.bitlinear_fp8 は互換のため引き続き受理する。
   bitlinear_int8_backend: auto  # choices: auto | int_mm | triton。5090では両者をA/Bする。
   bitlinear_ternary_backend: kmajor_single_dot # choices: dot_current | kmajor_current | kmajor_single_dot | dot。backendは固定しtileだけ実測選択。
   bitlinear_ternary_execution: custom_op # choices: legacy_raw | legacy_custom_op | custom_op | raw | raw_plan。Graph capture後はresolverをreplayしない。

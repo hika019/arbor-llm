@@ -534,6 +534,23 @@ def _distributed_world_size() -> int | None:
     return torch.distributed.get_world_size()
 
 
+def packed_tune_entry(
+    fingerprint: TuneFingerprint,
+    selection: TuneSelection,
+    record: TuneRecord | None = None,
+) -> dict[str, Any]:
+    """Render one cache/checkpoint tune entry in the shared JSON format."""
+    entry: dict[str, Any] = {
+        "fingerprint": fingerprint.to_dict(),
+        "config": selection.config.to_dict(),
+        "median_ms": selection.median_ms,
+        "sources": sorted(selection.candidate_sources),
+    }
+    if record is not None:
+        entry.update(record.to_dict())
+    return entry
+
+
 class PersistentTuneCache:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -595,14 +612,7 @@ class PersistentTuneCache:
         record: TuneRecord | None = None,
     ) -> None:
         self._load()
-        entry: dict[str, Any] = {
-            "fingerprint": fingerprint.to_dict(),
-            "config": selection.config.to_dict(),
-            "median_ms": selection.median_ms,
-            "sources": sorted(selection.candidate_sources),
-        }
-        if record is not None:
-            entry.update(record.to_dict())
+        entry = packed_tune_entry(fingerprint, selection, record=record)
         self._entries[fingerprint.cache_id] = entry
         payload = {
             "schema": PACKED_TUNE_CACHE_SCHEMA,
@@ -653,6 +663,11 @@ class PackedTernaryTuner:
             cache_path=default_packed_tune_cache_path()
         )
         self._memory: dict[tuple[Any, ...], TuneSelection] = {}
+        self._memory_fingerprints: dict[tuple[Any, ...], TuneFingerprint] = {}
+        self._memory_records: dict[tuple[Any, ...], TuneRecord | None] = {}
+        self._checkpoint_entries: dict[
+            str, tuple[TuneFingerprint, TuneSelection]
+        ] = {}
         self._persistent: PersistentTuneCache | None = None
         self._logged_static: set[tuple[Any, ...]] = set()
         self._lock = threading.RLock()
@@ -665,12 +680,17 @@ class PackedTernaryTuner:
         with self._lock:
             self._options = options
             self._memory.clear()
+            self._memory_fingerprints.clear()
+            self._memory_records.clear()
             self._persistent = None
             self._logged_static.clear()
 
     def clear(self, *, persistent: bool = False) -> None:
         with self._lock:
             self._memory.clear()
+            self._memory_fingerprints.clear()
+            self._memory_records.clear()
+            self._checkpoint_entries.clear()
             self._logged_static.clear()
             if persistent:
                 cache = self._persistent_cache()
@@ -692,7 +712,89 @@ class PackedTernaryTuner:
         """
         with self._lock:
             self._memory.clear()
+            self._memory_fingerprints.clear()
+            self._memory_records.clear()
             self._persistent = None
+
+    def preload_checkpoint_entries(
+        self,
+        entries: Sequence[dict[str, Any]],
+        *,
+        device: DeviceInfo,
+        software: SoftwareInfo,
+    ) -> int:
+        """Load checkpoint-persisted tune entries and return the compatible count.
+
+        Only entries whose full fingerprint (GPU, torch/CUDA/Triton versions,
+        kernel version, schema, and shape) matches the current process are
+        retained.  These are a resume-only, in-memory fallback and never mutate
+        the on-disk cache.
+        """
+        loaded = 0
+        with self._lock:
+            checkpoint: dict[str, tuple[TuneFingerprint, TuneSelection]] = {}
+            for raw in entries:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    fingerprint_data = raw.get("fingerprint")
+                    if not isinstance(fingerprint_data, dict):
+                        continue
+                    key_data = fingerprint_data.get("key")
+                    if not isinstance(key_data, dict):
+                        continue
+                    key = TuneKey(**key_data)
+                    expected = TuneFingerprint(key, device, software)
+                    if fingerprint_data != expected.to_dict():
+                        continue
+                    config = PackedLaunchConfig.from_dict(raw["config"])
+                    median_ms = raw.get("median_ms")
+                    if median_ms is not None:
+                        median_ms = float(median_ms)
+                    selection = TuneSelection(
+                        config,
+                        source="checkpoint",
+                        median_ms=median_ms,
+                        candidate_sources=_sources_from_json(raw.get("sources")),
+                    )
+                    checkpoint[expected.cache_id] = (expected, selection)
+                    loaded += 1
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._checkpoint_entries = checkpoint
+        return loaded
+
+    def snapshot_entries(
+        self,
+        *,
+        device: DeviceInfo,
+        software: SoftwareInfo,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return checkpoint-extra tune entries known to this process."""
+        with self._lock:
+            if self._options.mode != "auto":
+                return ()
+            entries: dict[str, dict[str, Any]] = {}
+            for memory_key, selection in self._memory.items():
+                fingerprint = self._memory_fingerprints.get(memory_key)
+                if fingerprint is None:
+                    continue
+                if fingerprint.device != device or fingerprint.software != software:
+                    continue
+                record = self._memory_records.get(memory_key)
+                entries[fingerprint.cache_id] = packed_tune_entry(
+                    fingerprint, selection, record=record
+                )
+            return tuple(entries.values())
+
+    def _checkpoint_selection(
+        self, fingerprint: TuneFingerprint
+    ) -> TuneSelection | None:
+        entry = self._checkpoint_entries.get(fingerprint.cache_id)
+        if entry is None:
+            return None
+        stored_fingerprint, selection = entry
+        return selection if stored_fingerprint == fingerprint else None
 
     def resolve(
         self,
@@ -760,6 +862,28 @@ class PackedTernaryTuner:
                 device=device,
             )
             candidates = tuple(candidate_map.keys())
+            checkpoint_hit = self._checkpoint_selection(fingerprint)
+            # A checkpoint-persisted entry must still be legal under the
+            # current launch policy; otherwise fall back like a stale cache hit.
+            if checkpoint_hit is not None and checkpoint_hit.config not in candidates:
+                checkpoint_hit = None
+            if checkpoint_hit is not None:
+                sources = (
+                    checkpoint_hit.candidate_sources
+                    or candidate_map[checkpoint_hit.config]
+                )
+                resolved = TuneSelection(
+                    checkpoint_hit.config,
+                    source="checkpoint",
+                    median_ms=checkpoint_hit.median_ms,
+                    candidate_sources=sources,
+                )
+                self._memory[memory_key] = resolved
+                self._memory_fingerprints[memory_key] = fingerprint
+                self._memory_records[memory_key] = None
+                self._log_selection(key, device, resolved)
+                return resolved
+
             persistent = self._persistent_cache()
             disk_hit = persistent.get(fingerprint) if persistent is not None else None
             # A syntactically valid but manually edited/stale cache entry must
@@ -775,6 +899,8 @@ class PackedTernaryTuner:
                     candidate_sources=sources,
                 )
                 self._memory[memory_key] = resolved
+                self._memory_fingerprints[memory_key] = fingerprint
+                self._memory_records[memory_key] = None
                 self._log_selection(key, device, resolved)
                 return resolved
 
@@ -902,16 +1028,19 @@ class PackedTernaryTuner:
                 candidate_sources=candidate_map[winner],
             )
             self._memory[memory_key] = selection
+            self._memory_fingerprints[memory_key] = fingerprint
+            record = TuneRecord(
+                candidate_count=len(candidates),
+                timings=record_timings,
+                failures=record_failures,
+                boundary=boundary,
+            )
+            self._memory_records[memory_key] = record
             if persistent is not None:
                 persistent.put(
                     fingerprint,
                     selection,
-                    record=TuneRecord(
-                        candidate_count=len(candidates),
-                        timings=record_timings,
-                        failures=record_failures,
-                        boundary=boundary,
-                    ),
+                    record=record,
                 )
             if boundary:
                 warnings.warn(
@@ -1070,6 +1199,54 @@ def resolve_packed_launch_config(
 
 def clear_packed_tuning_cache(*, persistent: bool = False) -> None:
     _GLOBAL_TUNER.clear(persistent=persistent)
+
+
+def preload_packed_tune_checkpoint_payload(
+    payload: Any,
+    *,
+    device: DeviceInfo | torch.device | int | str,
+    software: SoftwareInfo | None = None,
+) -> int:
+    """Preload checkpoint-persisted packed-ternary tuning into the global tuner.
+
+    Returns the number of entries compatible with the current GPU/software.
+    Incompatible or malformed entries are ignored so older checkpoints (or
+    checkpoints written on a different GPU/software stack) fall back safely to
+    the on-disk cache and normal benchmarking.
+    """
+    device_info = (
+        device if isinstance(device, DeviceInfo) else DeviceInfo.from_cuda_device(device)
+    )
+    software_info = software or SoftwareInfo.current()
+    if not isinstance(payload, dict):
+        return 0
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return 0
+    return _GLOBAL_TUNER.preload_checkpoint_entries(
+        entries, device=device_info, software=software_info
+    )
+
+
+def make_packed_tune_checkpoint_payload(
+    *,
+    device: DeviceInfo | torch.device | int | str,
+    software: SoftwareInfo | None = None,
+) -> dict[str, Any] | None:
+    """Return a checkpoint-extra payload with current-GPU compatible tune entries."""
+    device_info = (
+        device if isinstance(device, DeviceInfo) else DeviceInfo.from_cuda_device(device)
+    )
+    software_info = software or SoftwareInfo.current()
+    entries = _GLOBAL_TUNER.snapshot_entries(
+        device=device_info, software=software_info
+    )
+    if not entries:
+        return None
+    return {
+        "schema": PACKED_TUNE_CACHE_SCHEMA,
+        "entries": list(entries),
+    }
 
 
 def packed_ternary_preflight(
