@@ -400,3 +400,91 @@ def test_all_candidate_failures_are_reported(monkeypatch):
             software=_software(),
             launcher=lambda config: config,
         )
+
+
+def test_auto_mode_uses_two_stage_measurement(monkeypatch):
+    from src.model.bitlinear_tuning import packed_launch_candidates
+
+    candidate_count = len(
+        packed_launch_candidates(
+            m=1024,
+            n=11264,
+            k=2048,
+            backend="kmajor_single_dot",
+            device=_device(),
+        )
+    )
+    precise_candidates = 3
+    tuner = PackedTernaryTuner(
+        PackedTuningOptions(
+            mode="auto",
+            cache_enabled=False,
+            warmup=0,
+            iterations=1,
+            coarse_iterations=1,
+            precise_candidates=precise_candidates,
+        )
+    )
+    calls: list[PackedLaunchConfig] = []
+
+    def fake_measure(launcher, candidate, device_index, **kwargs):
+        del launcher, device_index, kwargs
+        calls.append(candidate)
+        return float(candidate.block_m)
+
+    monkeypatch.setattr(tuner, "_measure", fake_measure)
+    tuner.resolve(
+        key=_key(), device=_device(), software=_software(), launcher=lambda config: config
+    )
+
+    coarse = calls[:candidate_count]
+    precise = calls[candidate_count:]
+    assert len(set(coarse)) == candidate_count
+    assert len(precise) == precise_candidates
+    assert set(precise) <= set(coarse)
+
+
+def test_render_packed_tuning_report_builds_markdown(tmp_path):
+    from src.model.bitlinear_tuning import (
+        CandidateFailure,
+        CandidateTiming,
+        TuneRecord,
+        TuneSelection,
+        render_packed_tuning_report,
+    )
+
+    path = tmp_path / "tune.json"
+    fingerprint = TuneFingerprint(_key(), _device(), _software())
+    winner = PackedLaunchConfig(128, 64, 64, 4, 3)
+    runner_up = PackedLaunchConfig(128, 64, 64, 4, 2)
+    cache = PersistentTuneCache(path)
+    cache.put(
+        fingerprint,
+        TuneSelection(
+            winner,
+            source="measured",
+            median_ms=0.2,
+            candidate_sources=frozenset({"arbor_base"}),
+        ),
+        record=TuneRecord(
+            candidate_count=54,
+            timings=(
+                CandidateTiming(winner, 0.2, frozenset({"arbor_base"})),
+                CandidateTiming(runner_up, 0.3, frozenset({"arbor_base"})),
+            ),
+            failures=(
+                CandidateFailure(PackedLaunchConfig(256, 128, 128, 8, 3), "oom"),
+            ),
+            boundary=False,
+        ),
+    )
+
+    report = render_packed_tuning_report(
+        path, device=_device(), software=_software()
+    )
+    assert "shape=1024x2048x11264" in report
+    assert "winner: 128x64x64 warps=4 stages=3" in report
+    assert "winner_sources: arbor_base" in report
+    assert "candidate_count: 54" in report
+    assert "failed_count: 1" in report
+    assert "128x64x64 warps=4 stages=2" in report

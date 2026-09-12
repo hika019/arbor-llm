@@ -212,6 +212,45 @@ class TuneSelection:
 
 
 @dataclass(frozen=True)
+class CandidateTiming:
+    config: PackedLaunchConfig
+    median_ms: float
+    sources: frozenset[str] = frozenset()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "config": self.config.to_dict(),
+            "median_ms": self.median_ms,
+            "sources": sorted(self.sources),
+        }
+
+
+@dataclass(frozen=True)
+class CandidateFailure:
+    config: PackedLaunchConfig
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"config": self.config.to_dict(), "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class TuneRecord:
+    candidate_count: int
+    timings: tuple[CandidateTiming, ...]
+    failures: tuple[CandidateFailure, ...]
+    boundary: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_count": self.candidate_count,
+            "timings": [timing.to_dict() for timing in self.timings],
+            "failures": [failure.to_dict() for failure in self.failures],
+            "boundary": self.boundary,
+        }
+
+
+@dataclass(frozen=True)
 class PackedTuningOptions:
     mode: str = "auto"
     cache_enabled: bool = True
@@ -219,6 +258,8 @@ class PackedTuningOptions:
     fixed_config: PackedLaunchConfig | None = None
     warmup: int = 10
     iterations: int = 30
+    coarse_iterations: int = 8
+    precise_candidates: int = 4
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -231,6 +272,10 @@ class PackedTuningOptions:
             raise ValueError("packed ternary tuning=fixed requires fixed_config")
         if self.warmup < 0 or self.iterations <= 0:
             raise ValueError("packed tuning warmup must be >=0 and iterations must be >0")
+        if self.coarse_iterations <= 0 or self.precise_candidates <= 0:
+            raise ValueError(
+                "packed tuning coarse_iterations and precise_candidates must be >0"
+            )
 
 
 def default_packed_tune_cache_path() -> Path:
@@ -429,6 +474,28 @@ def _sources_from_json(value: Any) -> frozenset[str]:
     return frozenset(str(item) for item in value if str(item) in valid)
 
 
+def _winner_at_search_boundary(
+    winner: PackedLaunchConfig,
+    candidates: tuple[PackedLaunchConfig, ...],
+) -> bool:
+    """Return True when the winner sits at >=2 axes of the search boundary."""
+    maxima = (
+        max(config.block_m for config in candidates),
+        max(config.block_n for config in candidates),
+        max(config.block_k for config in candidates),
+        max(config.num_warps for config in candidates),
+        max(config.num_stages for config in candidates),
+    )
+    winner_values = (
+        winner.block_m,
+        winner.block_n,
+        winner.block_k,
+        winner.num_warps,
+        winner.num_stages,
+    )
+    return sum(a == b for a, b in zip(winner_values, maxima)) >= 2
+
+
 class PersistentTuneCache:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -483,14 +550,22 @@ class PersistentTuneCache:
         self._load()
         return tuple(self._entries.items())
 
-    def put(self, fingerprint: TuneFingerprint, selection: TuneSelection) -> None:
+    def put(
+        self,
+        fingerprint: TuneFingerprint,
+        selection: TuneSelection,
+        record: TuneRecord | None = None,
+    ) -> None:
         self._load()
-        self._entries[fingerprint.cache_id] = {
+        entry: dict[str, Any] = {
             "fingerprint": fingerprint.to_dict(),
             "config": selection.config.to_dict(),
             "median_ms": selection.median_ms,
             "sources": sorted(selection.candidate_sources),
         }
+        if record is not None:
+            entry.update(record.to_dict())
+        self._entries[fingerprint.cache_id] = entry
         payload = {
             "schema": PACKED_TUNE_CACHE_SCHEMA,
             "entries": self._entries,
@@ -643,21 +718,31 @@ class PackedTernaryTuner:
                 self._log_selection(key, device, resolved)
                 return resolved
 
-            prepared: list[PackedLaunchConfig] = []
+            # Stage 1: compile + coarse-measure every legal candidate.  This
+            # pass JIT-compiles each config and gathers a cheap first ranking
+            # so that the expensive precise pass only targets the most
+            # promising few configs (two-stage measurement, section 13).
+            coarse: list[tuple[float, PackedLaunchConfig]] = []
             failures: list[tuple[PackedLaunchConfig, str]] = []
-            # First pass compiles every candidate and warms the device before
-            # any winner decision.  Choosing from this pass biases later
-            # configs when GPU clocks/JIT caches are still settling.
             for candidate in candidates:
                 try:
-                    self._measure(
+                    median_ms = self._measure(
                         launcher,
                         candidate,
                         device.device_index,
                         warmup=options.warmup,
-                        iterations=1,
+                        iterations=options.coarse_iterations,
                     )
-                    prepared.append(candidate)
+                    coarse.append((median_ms, candidate))
+                    if options.verbose:
+                        print(
+                            "[bitlinear-tune] coarse "
+                            f"shape={key.m}x{key.k}x{key.n} "
+                            f"backend={key.backend} BM={candidate.block_m} "
+                            f"BN={candidate.block_n} BK={candidate.block_k} "
+                            f"warps={candidate.num_warps} stages={candidate.num_stages} "
+                            f"median={median_ms:.4f}ms"
+                        )
                 except Exception as exc:  # candidate compile/runtime failure
                     failures.append((candidate, f"{type(exc).__name__}: {exc}"))
                     if options.verbose:
@@ -667,7 +752,7 @@ class PackedTernaryTuner:
                             f"config={candidate} reason={failures[-1][1]}"
                         )
 
-            if not prepared:
+            if not coarse:
                 attempted = "\n".join(
                     f"  {config}: {reason}" for config, reason in failures
                 )
@@ -678,11 +763,14 @@ class PackedTernaryTuner:
                     f"cc={device.compute_capability}\n{attempted}"
                 )
 
-            # Re-measure all successfully compiled candidates on the now-warm
-            # device.  The candidate set is intentionally small, so this is
-            # more robust than allowing first-use/JIT order to pick a winner.
+            coarse.sort(key=lambda item: item[0])
+            precise_targets = [
+                candidate for _, candidate in coarse[: options.precise_candidates]
+            ]
+
+            # Stage 2: precise re-measurement of the coarse top-K only.
             timings: list[tuple[float, PackedLaunchConfig]] = []
-            for candidate in prepared:
+            for candidate in precise_targets:
                 try:
                     median_ms = self._measure(
                         launcher,
@@ -694,7 +782,7 @@ class PackedTernaryTuner:
                     timings.append((median_ms, candidate))
                     if options.verbose:
                         print(
-                            "[bitlinear-tune] candidate "
+                            "[bitlinear-tune] precise "
                             f"shape={key.m}x{key.k}x{key.n} "
                             f"backend={key.backend} BM={candidate.block_m} "
                             f"BN={candidate.block_n} BK={candidate.block_k} "
@@ -720,7 +808,21 @@ class PackedTernaryTuner:
                     f"cc={device.compute_capability}\n{attempted}"
                 )
 
-            median_ms, winner = min(timings, key=lambda item: item[0])
+            timings.sort(key=lambda item: item[0])
+            median_ms, winner = timings[0]
+            record_timings = tuple(
+                CandidateTiming(
+                    config=config,
+                    median_ms=ms,
+                    sources=candidate_map[config],
+                )
+                for ms, config in timings
+            )
+            record_failures = tuple(
+                CandidateFailure(config=config, reason=reason)
+                for config, reason in failures
+            )
+            boundary = _winner_at_search_boundary(winner, candidates)
             selection = TuneSelection(
                 config=winner,
                 source="measured",
@@ -729,7 +831,23 @@ class PackedTernaryTuner:
             )
             self._memory[memory_key] = selection
             if persistent is not None:
-                persistent.put(fingerprint, selection)
+                persistent.put(
+                    fingerprint,
+                    selection,
+                    record=TuneRecord(
+                        candidate_count=len(candidates),
+                        timings=record_timings,
+                        failures=record_failures,
+                        boundary=boundary,
+                    ),
+                )
+            if boundary:
+                warnings.warn(
+                    "packed ternary winner is at >=2 search-space boundary axes; "
+                    "consider extending the candidate space",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             self._log_selection(
                 key, device, selection, candidate_count=len(candidates)
             )
@@ -924,6 +1042,99 @@ def load_packed_tuning_plan(
             continue
         plan[key] = config
     return plan
+
+
+def render_packed_tuning_report(
+    cache_path: str | os.PathLike[str] | None = None,
+    *,
+    device: DeviceInfo | torch.device | int | str = "cuda",
+    software: SoftwareInfo | None = None,
+) -> str:
+    """Render a Markdown report for current-GPU cache entries."""
+    resolved_path = (
+        default_packed_tune_cache_path()
+        if cache_path is None or str(cache_path).lower() == "auto"
+        else Path(cache_path).expanduser()
+    )
+    device_info = (
+        device if isinstance(device, DeviceInfo) else DeviceInfo.from_cuda_device(device)
+    )
+    software_info = software or SoftwareInfo.current()
+    cache = PersistentTuneCache(resolved_path)
+    gpu_fingerprint = device_info.fingerprint_dict()
+    software_fingerprint = asdict(software_info)
+
+    lines = ["# Packed ternary autotune report", ""]
+    matched = 0
+    for cache_id, raw in sorted(cache.entries(), key=lambda item: item[0]):
+        if not isinstance(raw, dict):
+            continue
+        fingerprint = raw.get("fingerprint")
+        if not isinstance(fingerprint, dict):
+            continue
+        if fingerprint.get("gpu") != gpu_fingerprint:
+            continue
+        if fingerprint.get("software") != software_fingerprint:
+            continue
+        try:
+            key = TuneKey(**fingerprint["key"])
+            winner = PackedLaunchConfig.from_dict(raw["config"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        matched += 1
+        sources = _sources_from_json(raw.get("sources"))
+        timings = raw.get("timings")
+        failures = raw.get("failures")
+        candidate_count = raw.get("candidate_count")
+        boundary = raw.get("boundary")
+        median_ms = raw.get("median_ms")
+
+        lines.append(f"## backend={key.backend} shape={key.m}x{key.k}x{key.n}")
+        lines.append("")
+        lines.append(f"- dtype: {key.dtype}")
+        lines.append(
+            f"- scale: {'per_output' if key.scale_per_output else 'tensorwise'}"
+        )
+        lines.append(
+            f"- candidate_count: {candidate_count if candidate_count is not None else '?'}"
+        )
+        lines.append(
+            f"- winner: {winner.tile_string} warps={winner.num_warps} "
+            f"stages={winner.num_stages}"
+        )
+        lines.append(
+            f"- winner_sources: {', '.join(sorted(sources)) or '(none)'}"
+        )
+        lines.append(
+            f"- winner_median_ms: "
+            f"{median_ms if isinstance(median_ms, (int, float)) else '?'}"
+        )
+        lines.append(f"- boundary_winner: {bool(boundary)}")
+        if isinstance(timings, list) and timings:
+            lines.append("- top timings:")
+            for position, item in enumerate(timings[:5], start=1):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    config = PackedLaunchConfig.from_dict(item["config"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                median = item.get("median_ms")
+                item_sources = _sources_from_json(item.get("sources"))
+                lines.append(
+                    f"  {position}. {config.tile_string} "
+                    f"warps={config.num_warps} stages={config.num_stages} "
+                    f"median={median if isinstance(median, (int, float)) else '?'}ms "
+                    f"sources={','.join(sorted(item_sources)) or '-'}"
+                )
+        if isinstance(failures, list) and failures:
+            lines.append(f"- failed_count: {len(failures)}")
+        lines.append("")
+
+    if matched == 0:
+        lines.append("(no matching entries for current GPU/software fingerprint)")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def current_packed_tuning_options() -> PackedTuningOptions:
