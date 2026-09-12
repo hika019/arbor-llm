@@ -27,7 +27,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
 
 # torch import / CUDA 初期化より前に効かせる必要がある env (env.sh と二重で保険).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -47,6 +46,10 @@ from src.train.checkpoint import CheckpointManager, CheckpointMeta  # noqa: E402
 from src.train.optim import build_optimizer, build_scheduler  # noqa: E402
 from src.train.signals import StopFlag  # noqa: E402
 from src.train.throughput import ThroughputMeter  # noqa: E402
+from src.model.bitlinear_tuning import (  # noqa: E402
+    clear_observed_packed_tune_keys,
+    observed_packed_tune_keys,
+)
 
 
 _TIMING_ENABLED = os.environ.get("ARBOR_TIMING", "0") == "1"
@@ -1086,6 +1089,115 @@ def build_validation_model(
 
 
 # ------------------------------------------------------------------- main
+def configure_training_bitnet(base_model, device, cfg):
+    """Apply requested low-bit execution; initialization errors must be visible."""
+    preflight_tune_keys = None
+    from src.model.bitlinear import (
+        configure_bitlinear_ternary_tuning,
+        configure_bitlinear_training_cache,
+        install_arbor_projection_fusions,
+        refresh_bitlinear_training_cache,
+        set_bitlinear_fp8_mode,
+        set_bitlinear_int8_backend,
+        set_bitlinear_ternary_backend,
+        set_bitlinear_ternary_execution_path,
+        set_bitlinear_ternary_wgrad_backend,
+    )
+    speed_cfg = cfg.get("speed", {})
+    # modeを先に設定し、cache allocatorがINT8/FP8両layoutの実コストを使う。
+    install_arbor_projection_fusions(base_model)
+    fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
+    if fp8_raw in (None, False):
+        fp8_raw = "off"
+    int8_backend = set_bitlinear_int8_backend(
+        str(speed_cfg.get("bitlinear_int8_backend", "auto"))
+    )
+    ternary_backend = set_bitlinear_ternary_backend(
+        str(speed_cfg.get("bitlinear_ternary_backend", "dot_current"))
+    )
+    ternary_tuning_raw = speed_cfg.get("bitlinear_ternary_tuning", "off")
+    if ternary_tuning_raw in (None, False):
+        ternary_tuning_raw = "off"
+    ternary_execution_default = (
+        "legacy_raw"
+        if ternary_backend == "dot_current"
+        and str(ternary_tuning_raw).lower().replace("-", "_") == "off"
+        else "custom_op"
+    )
+    ternary_execution = set_bitlinear_ternary_execution_path(
+        str(
+            speed_cfg.get(
+                "bitlinear_ternary_execution", ternary_execution_default
+            )
+        )
+    )
+    ternary_tuning = configure_bitlinear_ternary_tuning(
+        mode=str(ternary_tuning_raw),
+        cache_enabled=bool(
+            speed_cfg.get("bitlinear_ternary_tuning_cache", True)
+        ),
+        cache_path=speed_cfg.get(
+            "bitlinear_ternary_tuning_cache_path", "auto"
+        ),
+        fixed_tile=speed_cfg.get("bitlinear_ternary_fixed_tile"),
+        warmup=int(speed_cfg.get("bitlinear_ternary_tuning_warmup", 10)),
+        iterations=int(speed_cfg.get("bitlinear_ternary_tuning_iters", 30)),
+        verbose=bool(
+            speed_cfg.get("bitlinear_ternary_tuning_verbose", False)
+        ),
+    )
+    ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
+        str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
+    )
+    fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
+    bitnet_cache_info = configure_bitlinear_training_cache(
+        base_model,
+        enabled=speed_cfg.get("bitnet_weight_cache", "auto"),
+        grad_accum_steps=int(speed_cfg.get("grad_accum_steps", 1)),
+        max_cache_gib=speed_cfg.get("bitnet_weight_cache_gib", 1.25),
+        min_numel=int(speed_cfg.get("bitnet_weight_cache_min_numel", 65536)),
+    )
+    print(
+        "[train] bitnet_weight_cache="
+        f"{bitnet_cache_info['mode']} enabled={bitnet_cache_info['enabled']} "
+        f"cached_layers={bitnet_cache_info['cached_layers']}/"
+        f"{bitnet_cache_info['eligible_layers']} "
+        f"fused_groups={bitnet_cache_info['fused_groups']} "
+        f"cache={bitnet_cache_info['cache_gib']:.2f}GiB "
+        f"format={bitnet_cache_info['cache_format']} "
+        f"qkv_groups={bitnet_cache_info['qkv_groups']} "
+        f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
+    )
+    print(
+        f"[train] bitlinear_fp8={fp8_info['mode']} "
+        f"int8_backend={int8_backend} "
+        f"ternary_backend={ternary_backend} "
+        f"ternary_execution={ternary_execution} "
+        f"ternary_tuning={ternary_tuning['mode']} "
+        f"ternary_tune_cache={ternary_tuning['cache_path']} "
+        f"ternary_plan_entries={ternary_tuning['plan_entries']} "
+        f"ternary_wgrad_backend={ternary_wgrad_backend} "
+        f"layers={fp8_info['layers']}"
+    )
+    if (
+        _distributed_rank() is not None
+        and str(ternary_tuning_raw).lower().replace("-", "_") == "auto"
+    ):
+        clear_observed_packed_tune_keys()
+        _preflight_packed_ternary_tuning(base_model, device, cfg)
+        # On rank 0 these are keys actually exercised by the dummy
+        # forward/backward; other ranks validate against their cache hit
+        # set on the first real step below.
+        preflight_tune_keys = observed_packed_tune_keys()
+        clear_observed_packed_tune_keys()
+        if _distributed_rank() == 0:
+            print(
+                "[train] packed_ternary_preflight_keys="
+                f"{len(preflight_tune_keys)}"
+            )
+    return refresh_bitlinear_training_cache, preflight_tune_keys
+
+
 def main() -> int:
     timing_mark("process_start")
     args = parse_args()
@@ -1146,8 +1258,6 @@ def main() -> int:
     # checkpoint 保存とサンプル生成は compile 前のモデルで行う
     # (compile wrapper を保存すると state dict が _orig_mod. 付きになる)
     base_model = model
-    bitnet_cache_info: dict | None = None
-    preflight_tune_keys: frozenset[Any] | None = None
 
     # ---- 重みのみの初期化 (--init-from): 長コンテキスト拡張などの continued pretraining ----
     # RoPE バッファは非永続 (config から再計算) なので max_bytes / rope_theta が
@@ -1173,116 +1283,9 @@ def main() -> int:
             "(weights only; optimizer/scheduler/step は新規)"
         )
 
-    # ---- BitNet 訓練高速化: QKV/gate-up 融合と量子化重みcache ----
-    try:
-        from src.model.bitlinear import (
-            configure_bitlinear_ternary_tuning,
-            clear_observed_packed_tune_keys,
-            configure_bitlinear_training_cache,
-            install_arbor_projection_fusions,
-            refresh_bitlinear_training_cache,
-            observed_packed_tune_keys,
-            set_bitlinear_fp8_mode,
-            set_bitlinear_int8_backend,
-            set_bitlinear_ternary_backend,
-            set_bitlinear_ternary_execution_path,
-            set_bitlinear_ternary_wgrad_backend,
-        )
-    except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
-        refresh_bitlinear_training_cache = None
-    else:
-        speed_cfg = cfg.get("speed", {})
-        # modeを先に設定し、cache allocatorがINT8/FP8両layoutの実コストを使う。
-        install_arbor_projection_fusions(base_model)
-        fp8_raw = speed_cfg.get("bitlinear_fp8", "off")
-        if fp8_raw in (None, False):
-            fp8_raw = "off"
-        int8_backend = set_bitlinear_int8_backend(
-            str(speed_cfg.get("bitlinear_int8_backend", "auto"))
-        )
-        ternary_backend = set_bitlinear_ternary_backend(
-            str(speed_cfg.get("bitlinear_ternary_backend", "dot_current"))
-        )
-        ternary_tuning_raw = speed_cfg.get("bitlinear_ternary_tuning", "off")
-        if ternary_tuning_raw in (None, False):
-            ternary_tuning_raw = "off"
-        ternary_execution_default = (
-            "legacy_raw"
-            if ternary_backend == "dot_current"
-            and str(ternary_tuning_raw).lower().replace("-", "_") == "off"
-            else "custom_op"
-        )
-        ternary_execution = set_bitlinear_ternary_execution_path(
-            str(
-                speed_cfg.get(
-                    "bitlinear_ternary_execution", ternary_execution_default
-                )
-            )
-        )
-        ternary_tuning = configure_bitlinear_ternary_tuning(
-            mode=str(ternary_tuning_raw),
-            cache_enabled=bool(
-                speed_cfg.get("bitlinear_ternary_tuning_cache", True)
-            ),
-            cache_path=speed_cfg.get(
-                "bitlinear_ternary_tuning_cache_path", "auto"
-            ),
-            fixed_tile=speed_cfg.get("bitlinear_ternary_fixed_tile"),
-            warmup=int(speed_cfg.get("bitlinear_ternary_tuning_warmup", 10)),
-            iterations=int(speed_cfg.get("bitlinear_ternary_tuning_iters", 30)),
-            verbose=bool(
-                speed_cfg.get("bitlinear_ternary_tuning_verbose", False)
-            ),
-        )
-        ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
-            str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
-        )
-        fp8_info = set_bitlinear_fp8_mode(base_model, str(fp8_raw))
-        bitnet_cache_info = configure_bitlinear_training_cache(
-            base_model,
-            enabled=speed_cfg.get("bitnet_weight_cache", "auto"),
-            grad_accum_steps=int(speed_cfg.get("grad_accum_steps", 1)),
-            max_cache_gib=speed_cfg.get("bitnet_weight_cache_gib", 1.25),
-            min_numel=int(speed_cfg.get("bitnet_weight_cache_min_numel", 65536)),
-        )
-        print(
-            "[train] bitnet_weight_cache="
-            f"{bitnet_cache_info['mode']} enabled={bitnet_cache_info['enabled']} "
-            f"cached_layers={bitnet_cache_info['cached_layers']}/"
-            f"{bitnet_cache_info['eligible_layers']} "
-            f"fused_groups={bitnet_cache_info['fused_groups']} "
-            f"cache={bitnet_cache_info['cache_gib']:.2f}GiB "
-            f"format={bitnet_cache_info['cache_format']} "
-            f"qkv_groups={bitnet_cache_info['qkv_groups']} "
-            f"gate_up_groups={bitnet_cache_info['gate_up_groups']}"
-        )
-        print(
-            f"[train] bitlinear_fp8={fp8_info['mode']} "
-            f"int8_backend={int8_backend} "
-            f"ternary_backend={ternary_backend} "
-            f"ternary_execution={ternary_execution} "
-            f"ternary_tuning={ternary_tuning['mode']} "
-            f"ternary_tune_cache={ternary_tuning['cache_path']} "
-            f"ternary_plan_entries={ternary_tuning['plan_entries']} "
-            f"ternary_wgrad_backend={ternary_wgrad_backend} "
-            f"layers={fp8_info['layers']}"
-        )
-        if (
-            _distributed_rank() is not None
-            and str(ternary_tuning_raw).lower().replace("-", "_") == "auto"
-        ):
-            clear_observed_packed_tune_keys()
-            _preflight_packed_ternary_tuning(base_model, device, cfg)
-            # On rank 0 these are keys actually exercised by the dummy
-            # forward/backward; other ranks validate against their cache hit
-            # set on the first real step below.
-            preflight_tune_keys = observed_packed_tune_keys()
-            clear_observed_packed_tune_keys()
-            if _distributed_rank() == 0:
-                print(
-                    "[train] packed_ternary_preflight_keys="
-                    f"{len(preflight_tune_keys)}"
-                )
+    refresh_bitlinear_training_cache, preflight_tune_keys = configure_training_bitnet(
+        base_model, device, cfg
+    )
 
     model = apply_compile_settings(model, cfg["speed"], device)
     validation_compile_cfg = (

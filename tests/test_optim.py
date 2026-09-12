@@ -8,15 +8,89 @@ import torch
 from src.train.optim import (
     AdamW8bit,
     AdamWBF8,
+    AdamWFP32,
     Lion,
     build_optimizer,
     build_scheduler,
     resolve_state_precision,
-)
-from src.train.optim import (
     _quantize_dynamic_state,
     _dequantize_dynamic_state,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("size", [1, 4097, 131072])
+def test_fused_adamw_matches_eager_with_scheduler_and_skipped_grad(dtype, size):
+    torch.manual_seed(18)
+    p = torch.nn.Parameter(torch.randn(size, device="cuda", dtype=dtype))
+    q = torch.nn.Parameter(p.detach().clone())
+    eager = AdamWFP32([p], lr=0.001, betas=(0.9, 0.95), backend="eager")
+    fused = AdamWFP32([q], lr=0.001, betas=(0.9, 0.95), backend="triton")
+    for step in range(30):
+        for opt in (eager, fused):
+            opt.param_groups[0]["lr"] = 0.001 * (step + 1) / 30
+            opt.param_groups[0]["weight_decay"] = 0.1 if step < 15 else 0.0
+        p.grad = None if step == 11 else torch.randn_like(p) * 0.01
+        q.grad = None if p.grad is None else p.grad.clone()
+        previous_version = q._version
+        eager.step()
+        fused.step()
+        assert (q._version > previous_version) == (q.grad is not None)
+        # FP32 division implementations may differ by a few ULPs; preserve
+        # the exact BF16/FP16 parameter-rounding contract on this workload.
+        torch.testing.assert_close(q, p, rtol=1e-6 if dtype == torch.float32 else 0,
+                                   atol=1e-8 if dtype == torch.float32 else 0)
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert fused.state[q][key].dtype == torch.float32
+            torch.testing.assert_close(fused.state[q][key], eager.state[p][key], rtol=1e-6, atol=1e-10)
+        assert fused.state[q]["step"] == eager.state[p]["step"]
+
+
+def test_fused_adamw_backend_validation_and_cpu_auto():
+    p = torch.nn.Parameter(torch.ones(3))
+    with pytest.raises(ValueError, match="backend"):
+        AdamWFP32([p], lr=0.01, backend="invalid")
+    opt = AdamWFP32([p], lr=0.01, backend="auto")
+    p.grad = torch.ones_like(p)
+    opt.step()
+    assert torch.isfinite(p).all()
+    with pytest.raises(RuntimeError, match="contiguous CUDA"):
+        AdamWFP32([p], lr=0.01, backend="triton").step()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_adamw_fp32_resume_preserves_moment_values_and_backend(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(17)
+    p = torch.nn.Parameter(torch.randn(4097, device=device, dtype=torch.bfloat16))
+    eager = AdamWFP32([p], lr=0.001, backend="eager")
+    for _ in range(3):
+        p.grad = torch.randn_like(p)
+        eager.step()
+    q = torch.nn.Parameter(p.detach().clone())
+    restored = AdamWFP32([q], lr=0.001, backend="auto")
+    restored.load_state_dict(copy.deepcopy(eager.state_dict()))
+    assert restored.backend == "auto"
+    for key in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(restored.state[q][key], eager.state[p][key], rtol=0, atol=0)
+    p.grad = torch.randn_like(p)
+    q.grad = p.grad.clone()
+    eager.step()
+    restored.step()
+    torch.testing.assert_close(p, q, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_adamw_auto_handles_strided_parameters():
+    p = torch.nn.Parameter(torch.randn(7, 5, device="cuda").T)
+    q = torch.nn.Parameter(p.detach().clone())
+    p.grad = torch.randn_like(p)
+    q.grad = p.grad.clone()
+    AdamWFP32([p], lr=0.01, backend="auto").step()
+    AdamWFP32([q], lr=0.01, backend="eager").step()
+    torch.testing.assert_close(p, q, rtol=0, atol=0)
 
 
 def test_lion_optimizer_step_updates_parameter():

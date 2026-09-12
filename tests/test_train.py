@@ -22,6 +22,53 @@ from src.train.train import prepare_cudagraph_gradient_buffers
 from src.train.train import uses_cudagraph_compile
 from src.train.train import parse_args
 from src.train.train import _run_tuning_preflight_preserving_state
+from src.train.train import configure_training_bitnet
+
+
+def test_training_bitnet_initialization_enables_requested_cache(capsys):
+    from src.model.bitlinear import BitLinear
+
+    model = torch.nn.Sequential(BitLinear(32, 32))
+    refresh, keys = configure_training_bitnet(model, torch.device("cpu"), {
+        "speed": {"bitlinear_fp8": "off", "bitnet_weight_cache": "full",
+                  "bitnet_weight_cache_min_numel": 0},
+    })
+    assert model[0].training_weight_cache_enabled
+    assert refresh(model) == 1
+    assert keys is None
+    assert "cached_layers=1/1" in capsys.readouterr().out
+
+
+def test_training_bitnet_import_failure_is_not_silently_ignored(monkeypatch):
+    import src.model.bitlinear as bitlinear
+
+    monkeypatch.delattr(bitlinear, "install_arbor_projection_fusions")
+    with pytest.raises(ImportError, match="install_arbor_projection_fusions"):
+        configure_training_bitnet(torch.nn.Linear(2, 2), torch.device("cpu"), {})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_training_initialization_runs_requested_ternary_and_cache_refresh():
+    from src.model.bitlinear import BitLinear
+    from src.train.optim import AdamWFP32
+
+    model = torch.nn.Sequential(BitLinear(32, 32)).to(device="cuda", dtype=torch.bfloat16)
+    refresh, keys = configure_training_bitnet(model, torch.device("cuda"), {
+        "speed": {"bitlinear_fp8": "ternary", "bitnet_weight_cache": "full",
+                  "bitnet_weight_cache_min_numel": 0},
+    })
+    assert model[0]._fp8_mode == "ternary"
+    assert model[0]._train_w_packed is not None
+    assert keys is None
+    opt = AdamWFP32(model.parameters(), lr=0.01, backend="triton")
+    for _ in range(2):
+        x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+        loss = model(x).float().square().mean()
+        loss.backward()
+        opt.step()
+        assert refresh(model) == 1
+        opt.zero_grad(set_to_none=True)
+        assert torch.isfinite(loss)
 
 
 def test_parse_args_accepts_positive_benchmark_steps(monkeypatch, tmp_path):

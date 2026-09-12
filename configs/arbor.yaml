@@ -145,6 +145,7 @@ optim:
                                 # int8はdynamic codebook量子化へ改良済み(下記)。VRAMを
                                 # 節約したい時のみint8を選ぶ(fp32比で二次モーメントの
                                 # underflowを防ぐ非線形符号帳を使用)。
+  fp32_backend: auto           # auto: 対応する連続CUDA tensorでAdamW演算を融合。eagerで従来版、tritonで明示必須。
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8

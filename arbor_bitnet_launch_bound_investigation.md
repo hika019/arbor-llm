@@ -12,6 +12,11 @@
 
 ## 0. 現在の状態 (再検証後)
 
+> 2026-09-12追記: 後続のHEAD `470bd3e` を実行すると、train.pyのimport先の誤りを
+> `except Exception` が握りつぶし、設定したpacked演算・重みcache初期化がスキップされる
+> 回帰を確認した。下記は過去の測定記録であり、現コードで同経路が動く保証ではない。
+> 今回の修正と再測定は [学習融合の検証記録](arbor_training_fusion_20260912.md) を参照。
+
 ### コミット済み
 
 - `6fcdc83 feat: add packed ternary runtime tuning diagnostics`

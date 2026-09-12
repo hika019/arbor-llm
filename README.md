@@ -274,6 +274,12 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
 - `optim.state_precision: fp32` が既定。実データ1000-stepでloss 1.89まで安定して低下。
   `int8`はblockwise scale + 非線形dynamic符号帳で、同じ1000-stepをloss 1.90で完走。
   無スケール`bf8`は発散を確認しており、実験用途以外では使わない。
+- `optim.fp32_backend: auto` は連続CUDA tensorのFP32-moment AdamWをTritonで融合する。
+  中間tensorとkernel起動を削減し、moment精度・BF16/FP16 parameterの丸め位置を維持する。
+  GPU機種判定やTensor Core専用命令は使わない。CPU/MPS/ROCm・非連続tensorは同じAdamWの
+  従来演算を使う。`eager`で従来版、`triton`で融合必須（非対応入力はエラー）。
+  backendはcheckpointに固定されず、resume時のconfigで選ぶ。
+  単体比較: `python -m scripts.bench_adamw --config configs/arbor.yaml`。
 - `speed.sync_each_step: false` が既定。毎 step の `torch.cuda.synchronize()` は行わず、
   ログ/保存など scalar 化が必要な箇所でのみ同期する。
 - 性能A/Bには `--benchmark-steps N` を使う。指定optimizer step数だけ実行し、

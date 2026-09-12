@@ -219,7 +219,11 @@ class AdamWFP32(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        backend: str = "auto",
     ) -> None:
+        if backend not in ("auto", "eager", "triton"):
+            raise ValueError(f"unknown AdamWFP32 backend: {backend!r}")
+        self.backend = backend
         if lr <= 0:
             raise ValueError(f"lr must be positive: {lr}")
         if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
@@ -232,12 +236,14 @@ class AdamWFP32(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """parameter が BF16/FP16 でも checkpoint state を FP32 に戻す。"""
+        """Restore FP32 moments without a lossy intermediate parameter-dtype cast."""
         super().load_state_dict(state_dict)
-        for p, state in self.state.items():
-            for key in ("exp_avg", "exp_avg_sq"):
-                if key in state:
-                    state[key] = state[key].to(device=p.device, dtype=torch.float32)
+        for saved_group, group in zip(state_dict["param_groups"], self.param_groups):
+            for saved_id, p in zip(saved_group["params"], group["params"]):
+                saved = state_dict["state"].get(saved_id, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in saved:
+                        self.state[p][key] = saved[key].to(device=p.device, dtype=torch.float32)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -268,6 +274,25 @@ class AdamWFP32(torch.optim.Optimizer):
                 step = state["step"]
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
+                if self.backend != "eager":
+                    from src.train.adamw_triton import adamw_update, supported
+
+                    can_fuse = (
+                        supported(p, grad)
+                        and exp_avg.is_contiguous()
+                        and exp_avg_sq.is_contiguous()
+                    )
+                    if can_fuse:
+                        adamw_update(
+                            p, grad, exp_avg, exp_avg_sq,
+                            lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, step=step,
+                        )
+                        continue
+                    if self.backend == "triton":
+                        raise RuntimeError(
+                            "AdamWFP32 triton requires contiguous CUDA floating tensors "
+                            "(NVIDIA; FP32/FP16/BF16)"
+                        )
                 grad32 = grad.float()
 
                 exp_avg.mul_(beta1).add_(grad32, alpha=1.0 - beta1)
@@ -453,6 +478,7 @@ def _build_adamw(
     betas: tuple[float, float],
     eps: float,
     wd: float,
+    fp32_backend: str = "auto",
 ) -> torch.optim.Optimizer:
     """state_precision に従い、全 parameter で一様な AdamW を作る。
 
@@ -466,7 +492,7 @@ def _build_adamw(
         return AdamW8bit(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
     if state_precision == "bf8":
         return AdamWBF8(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
-    return AdamWFP32(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+    return AdamWFP32(params, lr=lr, betas=betas, eps=eps, weight_decay=wd, backend=fp32_backend)
 
 
 def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.optim.Optimizer:
@@ -499,6 +525,7 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
         betas=betas,
         eps=eps,
         wd=wd,
+        fp32_backend=str(cfg.get("fp32_backend", "auto")),
     )
 
 
