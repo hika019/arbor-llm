@@ -23,19 +23,19 @@
   - `scripts/profile_training_nsys.sh` の初回実行バグ (コピー先の親ディレクトリ
     未作成) を修正。これが直前の作業停止点だった。
 
-### 再開後に完成・再検証した変更 (作業ツリー)
+### 再開後に完成・再検証した変更
 
-- `src/train/train.py`
-  - CUDA Graphs + gradient accumulation を成立させる修正 (下記 5 章)。
-  - CUDA Graphs と `grad_accum_steps>1` の一律禁止を解除。
+- `a35e81b feat: enable CUDA graphs for packed ternary training`
+  - `src/train/train.py`: CUDA Graphs + gradient accumulation を成立させる修正
+    (下記 5 章)。CUDA Graphs と `grad_accum_steps>1` の一律禁止を解除。
   - `--benchmark-steps N` を完成。benchmark時はcheckpoint/validation/sampling/probeを
     実行せず、終了時にCUDA peak memoryを表示する。
-- `tests/test_train.py`: 固定 grad buffer のテスト、禁止テストを許可テストへ置換。
-- `README.md`, `configs/arbor.yaml`: compile modeと検証済みdefaultの説明を更新。
-- `configs/arbor.yaml` の既定を、後述のA-B-B-Aに合格した
-  `kmajor_single_dot + custom_op + auto + reduce-overhead`へ変更。
-- CPU全suite `223 passed / 24 skipped`、CUDA対象suite `92 passed`、Ruff、
-  `git diff --check`に合格。
+  - `tests/test_train.py`: 固定 grad buffer のテスト、禁止テストを許可テストへ置換。
+  - `README.md`, `configs/arbor.yaml`: compile modeと検証済みdefaultの説明を更新。
+  - `configs/arbor.yaml` の既定を、後述のA-B-B-Aに合格した
+    `kmajor_single_dot + custom_op + auto + reduce-overhead`へ変更。
+  - CPU全suite `223 passed / 24 skipped`、CUDA対象suite `92 passed`、Ruff、
+    `git diff --check`に合格。
 
 ## 1. 結論 (要約)
 
@@ -48,6 +48,8 @@
    legacy/default比 `bytes/s +18.98%`, step time `-16.09%`。run間差も約0.2%以下だった。
 4. CUDA Graphs + gradient accumulation のクラッシュは、graph外の固定grad bufferと
    step境界通知で解消した。小規模compiled testと926.8M modelのaccum=32で再確認した。
+5. 同じsteady intervalで `1f42ae7` は64.3k bytes/s、現行defaultは186.0k bytes/sだった。
+   「約320k」は別の21.0M parameter小型ベンチの値で、現行1B級モデルの過去値ではない。
 
 ## 2. 仕組みと期待値 (原理)
 
@@ -148,6 +150,50 @@ Graph構成はlaunch API callを70.8%減らし、Nsight wallもlegacy比17.0%短
 Graph reportではchild kernelが `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` にaggregateされるため、
 Graph内packed kernelの名前別時間はこの取得方式では集計しない。
 
+### 3.6 `1f42ae7` との同条件比較
+
+commit `1f42ae7a8f3a7ad26dfe1217ac825c0712eff68d` を別worktreeへ展開し、
+現行と同じRTX 4090・データ・seed・926.8M model・`patch_pooling: mean`・
+micro batch 2・gradient accumulation 32で120 optimizer stepsを実行した。
+checkpoint保存だけを無効化し、計算内容は変えていない。step 60/80/100/120の
+log interval平均を比較する。
+
+| revision / 構成 | bytes/s | step ms | fwd ms | bwd ms | opt ms |
+|---|---:|---:|---:|---:|---:|
+| `1f42ae7` / INT8 | 64,340 | 8129.3 | 2685.4 | 5053.2 | 129.0 |
+| 現行 / legacy packed | 155,406 | 3368.4 | 1055.7 | 2100.3 | 177.1 |
+| 現行 / custom+auto/Graph | **186,033** | **2812.9** | **606.4** | **1982.6** | 184.8 |
+
+現行defaultは `1f42ae7` の約2.89倍のthroughputで、step timeは65.4%短い。
+現行のlegacy packedだけでも約2.42倍であり、`1f42ae7` が速かったという事実は
+再現しなかった。旧版の通常サイズINT8 GEMMはPyTorchの `torch._int_mm` を使っており、
+RTX 4090専用tileを固定した実装ではない。configには4090実測で選んだFlexAttentionの
+注記があるが、その設定は現行にも残っているため、今回の速度差の説明にはならない。
+
+### 3.7 「約320k bytes/s」の出所
+
+過去の実行記録に300k超の値は実在した。ただし2026-09-07の小型合成ベンチで、
+現行フルモデルの過去baselineではない。
+
+| 項目 | 小型ベンチ | 現行フルモデル |
+|---|---:|---:|
+| parameter数 | 約21.0M | 926.8M |
+| global model | hidden 512 / 2 layers | hidden 2048 / 20 layers |
+| local model | hidden 768 / encoder 1 + decoder 1 | hidden 768 / encoder 1 + decoder 2 |
+| 入力 | synthetic random batch | production data mixture |
+
+小型ベンチの実測は、同じeffective batch 16で `micro=4/accum=4` が
+379--385k bytes/s、`micro=8/accum=2` が332--333k bytes/s、
+`micro=16/accum=1` が274--299k bytes/sだった。「320k前後」という記憶は正しいが、
+parameter数が約44分の1の別ベンチなので、926.8M modelの性能比較には使えない。
+
+この差が単なるmicro-batchの違いかも確認するため、フルモデルのeffective batchを64に
+保ったまま `micro=4/accum=16` で120 stepsを追加実行した。step 40--100は
+181.7--187.4k bytes/sで、既定の `micro=2/accum=32` の平均185.7kに対して改善しない。
+さらにstep 101--120は50.7k bytes/s、10.33 s/stepへ急落した。実行中に観測したGPU
+memory使用量は22.1 / 23.0 GiBで、100-step区間全体の実効throughputは約120.5k bytes/s。
+容量限界に近く不安定なため、このbatch形状は既定値へ採用しない。
+
 ## 4. 一般化の方向 (4090 固有にしない)
 
 `raw_plan` は事前 cache 必須で利用者 default に不向き。代わりに:
@@ -182,7 +228,7 @@ custom_op + auto
 forward replay が同じ storage を再利用するため、累積途中の grad が壊れる。
 activation ではなく **gradient accumulation の grad 生存契約**と Graph Trees の衝突。
 
-### 修正 (`src/train/train.py`, 未コミット)
+### 修正 (`src/train/train.py`, `a35e81b`)
 
 1. `prepare_cudagraph_gradient_buffers()` で `parameter.grad` を graph 外に事前確保。
 2. model invocation ごとに `torch.compiler.cudagraph_mark_step_begin()`。
@@ -200,8 +246,8 @@ activation ではなく **gradient accumulation の grad 生存契約**と Graph
 
 ## 6. 変更・生成物の場所
 
-- 修正コード: `src/train/train.py` (未コミット)
-- テスト: `tests/test_train.py` (未コミット)
+- 修正コード: `src/train/train.py` (`a35e81b`)
+- テスト: `tests/test_train.py` (`a35e81b`)
 - 診断用 config (再現用、リポジトリ外 `/tmp`):
   - `/tmp/arbor-nsys-raw-plan.yaml` (kmajor_single_dot + raw_plan + auto)
   - `/tmp/arbor-cudagraph-raw-plan.yaml` (上記 + reduce-overhead)
