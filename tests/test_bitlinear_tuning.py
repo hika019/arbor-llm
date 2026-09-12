@@ -82,12 +82,58 @@ def test_candidate_generator_is_shape_table_free_for_representative_m_values():
     }
     assert len(candidate_sets) == 1
     candidates = next(iter(candidate_sets))
-    assert len(candidates) == 21
+    assert len(candidates) == 54
     assert PackedLaunchConfig(128, 64, 64, 4, 2) in candidates
     assert PackedLaunchConfig(128, 128, 64, 4, 2) in candidates
     assert PackedLaunchConfig(128, 128, 64, 8, 2) in candidates
-    assert {config.num_stages for config in candidates} == {2, 3}
-    assert {config.num_warps for config in candidates} == {4, 8}
+    assert {config.num_stages for config in candidates} == {2, 3, 4, 5}
+    assert {config.num_warps for config in candidates} == {2, 4, 8}
+
+
+def test_candidate_sources_include_triton_official_and_dedupe():
+    device = _device()
+    from src.model.bitlinear_tuning import (
+        _CANDIDATE_SOURCE_ARBOR,
+        _CANDIDATE_SOURCE_TRITON_MATMUL,
+        _CANDIDATE_SOURCE_TRITON_PERSISTENT,
+        packed_launch_candidates_with_sources,
+    )
+
+    sources = packed_launch_candidates_with_sources(
+        m=1024,
+        n=11264,
+        k=2048,
+        backend="kmajor_single_dot",
+        device=device,
+    )
+    assert len(sources) == 54
+    # Official configs with no Arbor overlap:
+    assert PackedLaunchConfig(256, 128, 128, 8, 3) in sources
+    assert (
+        _CANDIDATE_SOURCE_TRITON_MATMUL
+        in sources[PackedLaunchConfig(256, 128, 128, 8, 3)]
+    )
+    assert PackedLaunchConfig(128, 128, 32, 4, 4) in sources
+    assert (
+        _CANDIDATE_SOURCE_TRITON_MATMUL
+        in sources[PackedLaunchConfig(128, 128, 32, 4, 4)]
+    )
+    # Config shared by matmul and persistent sources must merge the tags:
+    overlap = PackedLaunchConfig(128, 256, 64, 8, 3)
+    assert overlap in sources
+    assert sources[overlap] == frozenset(
+        {_CANDIDATE_SOURCE_TRITON_MATMUL, _CANDIDATE_SOURCE_TRITON_PERSISTENT}
+    )
+    # Arbor-only config retained with its own tag:
+    assert PackedLaunchConfig(64, 64, 32, 4, 2) in sources
+    assert (
+        sources[PackedLaunchConfig(64, 64, 32, 4, 2)]
+        == frozenset({_CANDIDATE_SOURCE_ARBOR})
+    )
+    # Arbor/persistent overlap merges both tags:
+    assert sources[PackedLaunchConfig(128, 128, 64, 8, 2)] == frozenset(
+        {_CANDIDATE_SOURCE_ARBOR, _CANDIDATE_SOURCE_TRITON_PERSISTENT}
+    )
 
 
 def test_candidate_pruning_removes_extreme_boundary_tiles():
@@ -269,7 +315,9 @@ def test_auto_mode_uses_memory_then_persistent_cache(tmp_path, monkeypatch):
     assert disk.source == "cache"
     assert disk.config == first.config
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema"] == 1
+    assert payload["schema"] == 2
+    entry = list(payload["entries"].values())[0]
+    assert entry["sources"]
 
 
 def test_auto_mode_ignores_cache_config_outside_current_candidates(

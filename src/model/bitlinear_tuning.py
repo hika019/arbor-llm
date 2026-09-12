@@ -24,11 +24,38 @@ except Exception:  # pragma: no cover - CUDA stack dependent
     triton = None
 
 
-PACKED_TUNE_CACHE_SCHEMA = 1
+PACKED_TUNE_CACHE_SCHEMA = 2
 PACKED_TERNARY_KERNEL_VERSION = "packed_ternary_v3_runtime_tuning"
 PACKED_BACKENDS = ("dot", "dot_current", "kmajor_current", "kmajor_single_dot")
 _TUNING_MODES = ("auto", "fixed", "off")
 
+_CANDIDATE_SOURCE_ARBOR = "arbor_base"
+_CANDIDATE_SOURCE_TRITON_MATMUL = "triton_matmul"
+_CANDIDATE_SOURCE_TRITON_PERSISTENT = "triton_persistent_matmul"
+_CANDIDATE_SOURCE_EXPERIMENTAL = "experimental"
+
+_PACKED_TUNE_SOURCE_TAGS = (
+    _CANDIDATE_SOURCE_ARBOR,
+    _CANDIDATE_SOURCE_TRITON_MATMUL,
+    _CANDIDATE_SOURCE_TRITON_PERSISTENT,
+    _CANDIDATE_SOURCE_EXPERIMENTAL,
+)
+
+# Structural Arbor-only samples.  These cover M/N/K tile tradeoffs while
+# limiting first-use JIT latency; no template encodes a winner for a model
+# shape or GPU SKU.  num_stages is expanded to {2, 3} at generation time.
+_ARBOR_BASE_TEMPLATES: tuple[tuple[int, int, int, int], ...] = (
+    (64, 64, 32, 4),
+    (64, 64, 64, 4),
+    (64, 128, 32, 4),
+    (64, 128, 64, 4),
+    (128, 64, 32, 4),
+    (128, 64, 64, 4),
+    (128, 128, 32, 4),
+    (128, 128, 64, 4),
+    (128, 128, 32, 8),
+    (128, 128, 64, 8),
+)
 
 @dataclass(frozen=True, order=True)
 class PackedLaunchConfig:
@@ -181,6 +208,7 @@ class TuneSelection:
     config: PackedLaunchConfig
     source: str
     median_ms: float | None = None
+    candidate_sources: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -286,6 +314,98 @@ def _candidate_is_legal(
     return True
 
 
+# Triton official CUDA matmul autotune configs as of triton 3.6.0, taken from
+# python/tutorials/03-matrix-multiplication.py `get_cuda_autotune_config()`.
+# GROUP_SIZE_M is a launch-ordering hint for the tutorial's 1D grid and has no
+# Arbor analog, so only the (BM, BN, BK, warps, stages) tile is retained.
+# HIP-only configs are intentionally excluded.
+_TRITON_OFFICIAL_MATMUL_CONFIGS: tuple[PackedLaunchConfig, ...] = (
+    PackedLaunchConfig(128, 256, 64, 8, 3),
+    PackedLaunchConfig(64, 256, 32, 4, 4),
+    PackedLaunchConfig(128, 128, 32, 4, 4),
+    PackedLaunchConfig(128, 64, 32, 4, 4),
+    PackedLaunchConfig(64, 128, 32, 4, 4),
+    PackedLaunchConfig(128, 32, 32, 4, 4),
+    PackedLaunchConfig(64, 32, 32, 2, 5),
+    PackedLaunchConfig(32, 64, 32, 2, 5),
+    PackedLaunchConfig(128, 256, 128, 8, 3),
+    PackedLaunchConfig(256, 128, 128, 8, 3),
+    PackedLaunchConfig(256, 64, 128, 4, 4),
+    PackedLaunchConfig(64, 256, 128, 4, 4),
+    PackedLaunchConfig(128, 128, 128, 4, 4),
+    PackedLaunchConfig(128, 64, 64, 4, 4),
+    PackedLaunchConfig(64, 128, 64, 4, 4),
+    PackedLaunchConfig(128, 32, 64, 4, 4),
+)
+
+# Triton official persistent matmul CUDA configs as of triton 3.6.0, from
+# python/tutorials/09-persistent-matmul.py `matmul_get_configs()`.
+# `matmul_tma_persistent_get_configs()` adds EPILOGUE_SUBTILE/WS choices that
+# expand the TMA kernel shape, not the tile; its (BM, BN, BK, warps, stages)
+# set is identical, so it adds no new tile here.
+_TRITON_OFFICIAL_PERSISTENT_MATMUL_CONFIGS: tuple[PackedLaunchConfig, ...] = tuple(
+    PackedLaunchConfig(bm, bn, bk, warps, stages)
+    for bm in (128,)
+    for bn in (128, 256)
+    for bk in (64, 128)
+    for stages in (2, 3, 4)
+    for warps in (4, 8)
+)
+
+
+def _arbor_base_configs(
+    *, m: int, n: int, k: int, backend: str
+) -> tuple[PackedLaunchConfig, ...]:
+    configs = [
+        PackedLaunchConfig(bm, bn, bk, warps, stages)
+        for bm, bn, bk, warps in _ARBOR_BASE_TEMPLATES
+        for stages in (2, 3)
+    ]
+    configs.append(conservative_packed_launch_config(backend, m=m, n=n, k=k))
+    return tuple(configs)
+
+
+def packed_launch_candidates_with_sources(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    backend: str,
+    device: DeviceInfo,
+) -> dict[PackedLaunchConfig, frozenset[str]]:
+    """Return the deduplicated candidate space keyed by source tags.
+
+    A config shared by multiple sources retains the union of those tags.  This
+    is the authoritative mapping used by both the tuner and the tuning report;
+    :func:`packed_launch_candidates` is a thin projection to the later's keys.
+    """
+    if min(m, n, k) <= 0:
+        raise ValueError(f"packed candidate shape must be positive: {(m, k, n)}")
+
+    merged: dict[PackedLaunchConfig, set[str]] = {}
+
+    def add(configs: tuple[PackedLaunchConfig, ...], source: str) -> None:
+        for config in configs:
+            if _candidate_is_legal(
+                config, m=m, n=n, k=k, backend=backend, device=device
+            ):
+                merged.setdefault(config, set()).add(source)
+
+    add(
+        _arbor_base_configs(m=m, n=n, k=k, backend=backend),
+        _CANDIDATE_SOURCE_ARBOR,
+    )
+    add(_TRITON_OFFICIAL_MATMUL_CONFIGS, _CANDIDATE_SOURCE_TRITON_MATMUL)
+    add(
+        _TRITON_OFFICIAL_PERSISTENT_MATMUL_CONFIGS,
+        _CANDIDATE_SOURCE_TRITON_PERSISTENT,
+    )
+    return {
+        config: frozenset(tags)
+        for config, tags in sorted(merged.items())
+    }
+
+
 def packed_launch_candidates(
     *,
     m: int,
@@ -295,42 +415,18 @@ def packed_launch_candidates(
     device: DeviceInfo,
 ) -> tuple[PackedLaunchConfig, ...]:
     """Generate a bounded, GPU-SKU-independent launch search space."""
-    if min(m, n, k) <= 0:
-        raise ValueError(f"packed candidate shape must be positive: {(m, k, n)}")
-
-    # Deliberately not a full Cartesian product.  These structural samples
-    # cover M/N/K tile tradeoffs while limiting first-use JIT latency.  The
-    # largest output tile compares both warp counts; no template encodes a
-    # winner for a model shape or GPU SKU.
-    templates = (
-        (64, 64, 32, 4),
-        (64, 64, 64, 4),
-        (64, 128, 32, 4),
-        (64, 128, 64, 4),
-        (128, 64, 32, 4),
-        (128, 64, 64, 4),
-        (128, 128, 32, 4),
-        (128, 128, 64, 4),
-        (128, 128, 32, 8),
-        (128, 128, 64, 8),
-    )
-    candidates = {
-        PackedLaunchConfig(bm, bn, bk, warps, stages)
-        for bm, bn, bk, warps in templates
-        for stages in (2, 3)
-    }
-    candidates.add(
-        conservative_packed_launch_config(backend, m=m, n=n, k=k)
-    )
     return tuple(
-        sorted(
-            config
-            for config in candidates
-            if _candidate_is_legal(
-                config, m=m, n=n, k=k, backend=backend, device=device
-            )
-        )
+        packed_launch_candidates_with_sources(
+            m=m, n=n, k=k, backend=backend, device=device
+        ).keys()
     )
+
+
+def _sources_from_json(value: Any) -> frozenset[str]:
+    if not isinstance(value, list):
+        return frozenset()
+    valid = frozenset(_PACKED_TUNE_SOURCE_TAGS)
+    return frozenset(str(item) for item in value if str(item) in valid)
 
 
 class PersistentTuneCache:
@@ -377,6 +473,7 @@ class PersistentTuneCache:
                 median_ms=(
                     None if raw.get("median_ms") is None else float(raw["median_ms"])
                 ),
+                candidate_sources=_sources_from_json(raw.get("sources")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -392,6 +489,7 @@ class PersistentTuneCache:
             "fingerprint": fingerprint.to_dict(),
             "config": selection.config.to_dict(),
             "median_ms": selection.median_ms,
+            "sources": sorted(selection.candidate_sources),
         }
         payload = {
             "schema": PACKED_TUNE_CACHE_SCHEMA,
@@ -504,22 +602,29 @@ class PackedTernaryTuner:
         memory_hit = self._memory.get(memory_key)
         if memory_hit is not None:
             return TuneSelection(
-                memory_hit.config, source="memory", median_ms=memory_hit.median_ms
+                memory_hit.config,
+                source="memory",
+                median_ms=memory_hit.median_ms,
+                candidate_sources=memory_hit.candidate_sources,
             )
         with self._lock:
             memory_hit = self._memory.get(memory_key)
             if memory_hit is not None:
                 return TuneSelection(
-                    memory_hit.config, source="memory", median_ms=memory_hit.median_ms
+                    memory_hit.config,
+                    source="memory",
+                    median_ms=memory_hit.median_ms,
+                    candidate_sources=memory_hit.candidate_sources,
                 )
 
-            candidates = packed_launch_candidates(
+            candidate_map = packed_launch_candidates_with_sources(
                 m=key.m,
                 n=key.n,
                 k=key.k,
                 backend=key.backend,
                 device=device,
             )
+            candidates = tuple(candidate_map.keys())
             persistent = self._persistent_cache()
             disk_hit = persistent.get(fingerprint) if persistent is not None else None
             # A syntactically valid but manually edited/stale cache entry must
@@ -527,9 +632,16 @@ class PackedTernaryTuner:
             if disk_hit is not None and disk_hit.config not in candidates:
                 disk_hit = None
             if disk_hit is not None:
-                self._memory[memory_key] = disk_hit
-                self._log_selection(key, device, disk_hit)
-                return disk_hit
+                sources = disk_hit.candidate_sources or candidate_map[disk_hit.config]
+                resolved = TuneSelection(
+                    disk_hit.config,
+                    source="cache",
+                    median_ms=disk_hit.median_ms,
+                    candidate_sources=sources,
+                )
+                self._memory[memory_key] = resolved
+                self._log_selection(key, device, resolved)
+                return resolved
 
             prepared: list[PackedLaunchConfig] = []
             failures: list[tuple[PackedLaunchConfig, str]] = []
@@ -610,7 +722,10 @@ class PackedTernaryTuner:
 
             median_ms, winner = min(timings, key=lambda item: item[0])
             selection = TuneSelection(
-                config=winner, source="measured", median_ms=median_ms
+                config=winner,
+                source="measured",
+                median_ms=median_ms,
+                candidate_sources=candidate_map[winner],
             )
             self._memory[memory_key] = selection
             if persistent is not None:
