@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 WAIT_STEPS=25
 ACTIVE_STEPS=2
+GRAPH_TRACE="node"
 CONFIG="configs/arbor.yaml"
 OUTPUT="/tmp/arbor-nsys-$(date +%Y%m%d-%H%M%S)"
 NSYS_BIN="${NSYS_BIN:-}"
@@ -21,6 +22,7 @@ Options:
   --active N       Optimizer steps to capture (default: 2)
   --output PATH    Report path without .nsys-rep
   --nsys PATH      Nsight Systems CLI (also accepted via NSYS_BIN)
+  --graph-trace M  CUDA graph granularity: node (default) or graph
   -h, --help       Show this help
 
 The script sources scripts/env.sh and profiles only the requested steady-state
@@ -51,6 +53,10 @@ while (($#)); do
             NSYS_BIN="$2"
             shift 2
             ;;
+        --graph-trace)
+            GRAPH_TRACE="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -74,6 +80,10 @@ if ! [[ "$WAIT_STEPS" =~ ^[0-9]+$ ]] || ! [[ "$ACTIVE_STEPS" =~ ^[1-9][0-9]*$ ]]
 fi
 if [[ ! -f "$CONFIG" ]]; then
     echo "config not found: $CONFIG" >&2
+    exit 2
+fi
+if [[ "$GRAPH_TRACE" != "node" && "$GRAPH_TRACE" != "graph" ]]; then
+    echo "--graph-trace must be node or graph" >&2
     exit 2
 fi
 
@@ -166,6 +176,7 @@ ARBOR_NSYS_PROFILE="${WAIT_STEPS},${ACTIVE_STEPS}" "$NSYS_BIN" profile \
     --cpuctxsw=none \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop-shutdown \
+    --cuda-graph-trace="$GRAPH_TRACE" \
     --kill=sigkill \
     --force-overwrite=true \
     --output="$OUTPUT" \
