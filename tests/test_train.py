@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 
@@ -15,6 +17,58 @@ from src.train.train import CudaBatchPrefetcher
 from src.train.train import ThreadedBatchPrefetcher
 from src.train.train import rebase_scheduler_lr
 from src.train.train import should_restore_dataloader_state
+from src.train.train import prepare_cudagraph_gradient_buffers
+from src.train.train import uses_cudagraph_compile
+from src.train.train import parse_args
+
+
+def test_parse_args_accepts_positive_benchmark_steps(monkeypatch, tmp_path):
+    config = tmp_path / "config.yaml"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train", "--config", str(config), "--benchmark-steps", "120"],
+    )
+
+    args = parse_args()
+
+    assert args.config == config
+    assert args.benchmark_steps == 120
+    assert not args.dry_run
+
+
+@pytest.mark.parametrize("steps", ["0", "-1"])
+def test_parse_args_rejects_nonpositive_benchmark_steps(monkeypatch, tmp_path, steps):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train", "--config", str(tmp_path / "config.yaml"), "--benchmark-steps", steps],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+
+    assert exc_info.value.code == 2
+
+
+def test_parse_args_rejects_benchmark_steps_with_dry_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--benchmark-steps",
+            "1",
+            "--dry-run",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+
+    assert exc_info.value.code == 2
 
 
 def test_resolve_precision_accepts_supported_modes():
@@ -133,6 +187,148 @@ def test_unknown_ternary_backend_is_error():
         adapt_config_for_device(cfg, torch.device("cuda"))
 
 
+def test_kmajor_ternary_backend_alias_is_normalized():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_backend": "kmajor"},
+    }
+    resolved = adapt_config_for_device(cfg, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_backend"] == "kmajor_current"
+
+
+def test_decode_v2_ternary_backend_alias_is_normalized():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_backend": "decode_v2"},
+    }
+    resolved = adapt_config_for_device(cfg, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_backend"] == "kmajor_single_dot"
+
+
+def test_unknown_ternary_tuning_mode_is_error():
+    cfg = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_tuning": "guess"},
+    }
+    with pytest.raises(ValueError, match="bitlinear_ternary_tuning"):
+        adapt_config_for_device(cfg, torch.device("cuda"))
+
+
+def test_fixed_ternary_tuning_requires_and_validates_tile():
+    missing = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_tuning": "fixed"},
+    }
+    with pytest.raises(ValueError, match="requires.*fixed_tile"):
+        adapt_config_for_device(missing, torch.device("cuda"))
+
+    invalid = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64",
+        },
+    }
+    with pytest.raises(ValueError, match="invalid.*fixed_tile"):
+        adapt_config_for_device(invalid, torch.device("cuda"))
+
+    valid = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64,32,4,3",
+        },
+    }
+    resolved = adapt_config_for_device(valid, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_tuning"] == "fixed"
+
+
+def test_ternary_execution_path_is_validated_against_tuning_mode():
+    invalid = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {"bitlinear_ternary_execution": "graph_break"},
+    }
+    with pytest.raises(ValueError, match="bitlinear_ternary_execution"):
+        adapt_config_for_device(invalid, torch.device("cuda"))
+
+    raw_auto = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw",
+            "bitlinear_ternary_tuning": "auto",
+        },
+    }
+    with pytest.raises(ValueError, match="execution=raw.*tuning=fixed"):
+        adapt_config_for_device(raw_auto, torch.device("cuda"))
+
+    raw_fixed = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw",
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64,32,4,3",
+        },
+    }
+    resolved = adapt_config_for_device(raw_fixed, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_execution"] == "raw"
+
+    legacy_raw = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "legacy_raw",
+            "bitlinear_ternary_tuning": "off",
+        },
+    }
+    resolved = adapt_config_for_device(legacy_raw, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_execution"] == "legacy_raw"
+
+    legacy_raw["speed"]["bitlinear_ternary_tuning"] = False
+    resolved = adapt_config_for_device(legacy_raw, torch.device("cuda"))
+    assert resolved["speed"]["bitlinear_ternary_tuning"] == "off"
+
+    raw_plan_without_cache = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw_plan",
+            "bitlinear_ternary_tuning_cache": False,
+        },
+    }
+    with pytest.raises(ValueError, match="raw_plan requires cache"):
+        adapt_config_for_device(raw_plan_without_cache, torch.device("cuda"))
+
+    raw_plan_without_auto = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_execution": "raw_plan",
+            "bitlinear_ternary_tuning": "off",
+        },
+    }
+    with pytest.raises(ValueError, match="raw_plan requires.*tuning=auto"):
+        adapt_config_for_device(raw_plan_without_auto, torch.device("cuda"))
+
+    wrong_legacy_backend = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_backend": "kmajor_single_dot",
+            "bitlinear_ternary_execution": "legacy_custom_op",
+        },
+    }
+    with pytest.raises(ValueError, match="legacy_custom_op requires"):
+        adapt_config_for_device(wrong_legacy_backend, torch.device("cuda"))
+
+    wrong_legacy_tuning = {
+        "model": {"global_attn_impl": "sdpa"},
+        "speed": {
+            "bitlinear_ternary_backend": "dot_current",
+            "bitlinear_ternary_execution": "legacy_raw",
+            "bitlinear_ternary_tuning": "fixed",
+            "bitlinear_ternary_fixed_tile": "64,64,32,4,3",
+        },
+    }
+    with pytest.raises(ValueError, match="legacy_raw requires.*tuning=off"):
+        adapt_config_for_device(wrong_legacy_tuning, torch.device("cuda"))
+
+
 def test_unknown_ternary_wgrad_backend_is_error():
     cfg = {
         "model": {"global_attn_impl": "sdpa"},
@@ -143,7 +339,7 @@ def test_unknown_ternary_wgrad_backend_is_error():
 
 
 @pytest.mark.parametrize("compile_mode", ["reduce-overhead", "max-autotune"])
-def test_cuda_graph_compile_modes_reject_gradient_accumulation(compile_mode):
+def test_cuda_graph_compile_modes_allow_gradient_accumulation(compile_mode):
     cfg = {
         "model": {"global_attn_impl": "sdpa"},
         "speed": {
@@ -152,8 +348,8 @@ def test_cuda_graph_compile_modes_reject_gradient_accumulation(compile_mode):
             "grad_accum_steps": 16,
         },
     }
-    with pytest.raises(ValueError, match="CUDA Graphs.*grad_accum_steps"):
-        adapt_config_for_device(cfg, torch.device("cuda"))
+    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+    assert uses_cudagraph_compile(cfg["speed"])
 
 
 @pytest.mark.parametrize("compile_mode", ["default", "max-autotune-no-cudagraphs"])
@@ -167,6 +363,53 @@ def test_non_cudagraph_compile_modes_allow_gradient_accumulation(compile_mode):
         },
     }
     assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+    assert not uses_cudagraph_compile(cfg["speed"])
+
+
+def test_cudagraph_gradient_buffers_are_persistent_and_reused():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 3, bias=False),
+        torch.nn.Linear(3, 2, bias=False),
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    count, num_bytes = prepare_cudagraph_gradient_buffers(model, optimizer)
+    parameters = list(model.parameters())
+    pointers = [parameter.grad.data_ptr() for parameter in parameters]
+
+    assert count == len(parameters)
+    assert num_bytes == sum(
+        parameter.numel() * parameter.element_size() for parameter in parameters
+    )
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in parameters)
+
+    for parameter in parameters:
+        parameter.grad.fill_(1)
+    optimizer.zero_grad(set_to_none=False)
+
+    assert [parameter.grad.data_ptr() for parameter in parameters] == pointers
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in parameters)
+    assert prepare_cudagraph_gradient_buffers(model, optimizer) == (0, 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cudagraph_gradient_accumulation_reuses_external_buffers_cuda():
+    torch.manual_seed(0)
+    model = torch.nn.Linear(16, 16, bias=False).cuda()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    prepare_cudagraph_gradient_buffers(model, optimizer)
+    grad_pointers = [parameter.grad.data_ptr() for parameter in model.parameters()]
+    compiled = torch.compile(model, mode="reduce-overhead")
+
+    for _ in range(3):
+        for _ in range(3):
+            torch.compiler.cudagraph_mark_step_begin()
+            compiled(torch.randn(8, 16, device="cuda")).square().mean().backward()
+        torch.cuda.synchronize()
+        assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=False)
+        assert [parameter.grad.data_ptr() for parameter in model.parameters()] == grad_pointers
 
 
 def test_validation_model_is_eager_and_separate_from_training_wrapper_by_default():

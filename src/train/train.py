@@ -51,6 +51,7 @@ from src.train.throughput import ThroughputMeter  # noqa: E402
 _TIMING_ENABLED = os.environ.get("ARBOR_TIMING", "0") == "1"
 _TIMING_T0 = time.perf_counter()
 _TIMING_LAST = _TIMING_T0
+_CUDAGRAPH_COMPILE_MODES = frozenset({"reduce-overhead", "max-autotune"})
 
 
 def timing_mark(label: str, device: torch.device | None = None) -> None:
@@ -68,6 +69,36 @@ def timing_mark(label: str, device: torch.device | None = None) -> None:
     _TIMING_LAST = now
 
 
+def uses_cudagraph_compile(speed: dict) -> bool:
+    """Return whether the selected torch.compile mode uses CUDA Graphs."""
+    return bool(speed.get("torch_compile", True)) and str(
+        speed.get("compile_mode", "default")
+    ) in _CUDAGRAPH_COMPILE_MODES
+
+
+def prepare_cudagraph_gradient_buffers(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> tuple[int, int]:
+    """Allocate persistent parameter.grad buffers outside graph-private memory.
+
+    CUDA Graph Trees may reuse a first backward's private output storage on the
+    next forward replay. Gradient accumulation must therefore target stable
+    buffers whose addresses survive every micro-step and optimizer zeroing.
+    """
+    allocated = 0
+    allocated_bytes = 0
+    for parameter in model.parameters():
+        if parameter.requires_grad and parameter.grad is None:
+            parameter.grad = torch.zeros_like(
+                parameter, memory_format=torch.preserve_format
+            )
+            allocated += 1
+            allocated_bytes += parameter.grad.numel() * parameter.grad.element_size()
+    optimizer.zero_grad(set_to_none=False)
+    return allocated, allocated_bytes
+
+
 # --------------------------------------------------------------- 引数 / 設定
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -80,6 +111,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dry-run", action="store_true", help="1 step だけ走らせて即終了")
     p.add_argument(
+        "--benchmark-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "checkpoint/validation/sampleを実行せずoptimizer stepをN回だけ走らせる。"
+            "性能A/B専用"
+        ),
+    )
+    p.add_argument(
         "--allow-config-mismatch", action="store_true",
         help="resume 時に checkpoint の model 設定と現在の config が違っても続行する",
     )
@@ -90,7 +131,13 @@ def parse_args() -> argparse.Namespace:
             "現在の config の optim.lr に差し替える"
         ),
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.benchmark_steps is not None:
+        if args.benchmark_steps <= 0:
+            p.error("--benchmark-steps must be > 0")
+        if args.dry_run:
+            p.error("--benchmark-steps and --dry-run are mutually exclusive")
+    return args
 
 
 def load_config(path: Path) -> dict:
@@ -183,6 +230,7 @@ def run_metadata(args: argparse.Namespace, device: torch.device) -> dict[str, ob
         "config_path": str(args.config),
         "resume": args.resume,
         "dry_run": bool(args.dry_run),
+        "benchmark_steps": args.benchmark_steps,
         "hostname": socket.gethostname(),
         "python": platform.python_version(),
         "platform": platform.platform(),
@@ -563,10 +611,112 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     if ternary_backend in {"current", "legacy"}:
         ternary_backend = "dot_current"
         speed_cfg["bitlinear_ternary_backend"] = "dot_current"
-    if ternary_backend not in {"dot", "dot_current"}:
+    if ternary_backend in {"kmajor", "k_major", "packed_kmajor_current"}:
+        ternary_backend = "kmajor_current"
+        speed_cfg["bitlinear_ternary_backend"] = "kmajor_current"
+    if ternary_backend in {
+        "kmajor_single",
+        "k_major_single_dot",
+        "single_dot",
+        "decode_v2",
+        "packed_kmajor_single_dot",
+    }:
+        ternary_backend = "kmajor_single_dot"
+        speed_cfg["bitlinear_ternary_backend"] = "kmajor_single_dot"
+    if ternary_backend not in {
+        "dot",
+        "dot_current",
+        "kmajor_current",
+        "kmajor_single_dot",
+    }:
         raise ValueError(
             f"unknown speed.bitlinear_ternary_backend: {ternary_backend!r} "
-            "(choices: dot | dot_current)"
+            "(choices: dot | dot_current | kmajor_current | kmajor_single_dot)"
+        )
+    ternary_tuning_raw = speed_cfg.get("bitlinear_ternary_tuning", "off")
+    if ternary_tuning_raw in (None, False):
+        ternary_tuning_raw = "off"
+    ternary_tuning = str(ternary_tuning_raw).lower().replace("-", "_")
+    if ternary_tuning not in {"auto", "fixed", "off"}:
+        raise ValueError(
+            f"unknown speed.bitlinear_ternary_tuning: {ternary_tuning!r} "
+            "(choices: auto | fixed | off)"
+        )
+    if "bitlinear_ternary_tuning" in speed_cfg:
+        speed_cfg["bitlinear_ternary_tuning"] = ternary_tuning
+    fixed_tile = speed_cfg.get("bitlinear_ternary_fixed_tile")
+    if ternary_tuning == "fixed" and fixed_tile is None:
+        raise ValueError(
+            "speed.bitlinear_ternary_tuning=fixed requires "
+            "speed.bitlinear_ternary_fixed_tile"
+        )
+    if fixed_tile is not None:
+        from src.model.bitlinear_tuning import parse_packed_launch_config
+
+        try:
+            parse_packed_launch_config(fixed_tile)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid speed.bitlinear_ternary_fixed_tile: {fixed_tile!r}"
+            ) from exc
+    execution_default = (
+        "legacy_raw"
+        if ternary_backend == "dot_current" and ternary_tuning == "off"
+        else "custom_op"
+    )
+    ternary_execution = str(
+        speed_cfg.get("bitlinear_ternary_execution", execution_default)
+    ).lower().replace("-", "_")
+    if ternary_execution not in {
+        "custom_op",
+        "raw",
+        "raw_plan",
+        "legacy_raw",
+        "legacy_custom_op",
+    }:
+        raise ValueError(
+            f"unknown speed.bitlinear_ternary_execution: {ternary_execution!r} "
+            "(choices: custom_op | raw | raw_plan | legacy_raw | "
+            "legacy_custom_op)"
+        )
+    if ternary_execution == "raw" and ternary_tuning != "fixed":
+        raise ValueError(
+            "speed.bitlinear_ternary_execution=raw currently requires "
+            "speed.bitlinear_ternary_tuning=fixed"
+        )
+    if ternary_execution == "raw_plan" and not bool(
+        speed_cfg.get("bitlinear_ternary_tuning_cache", True)
+    ):
+        raise ValueError("speed.bitlinear_ternary_execution=raw_plan requires cache")
+    if ternary_execution == "raw_plan" and ternary_tuning != "auto":
+        raise ValueError(
+            "speed.bitlinear_ternary_execution=raw_plan requires "
+            "speed.bitlinear_ternary_tuning=auto"
+        )
+    if (
+        ternary_execution in {"legacy_raw", "legacy_custom_op"}
+        and ternary_backend != "dot_current"
+    ):
+        raise ValueError(
+            f"speed.bitlinear_ternary_execution={ternary_execution} requires "
+            "speed.bitlinear_ternary_backend=dot_current"
+        )
+    if (
+        ternary_execution in {"legacy_raw", "legacy_custom_op"}
+        and ternary_tuning != "off"
+    ):
+        raise ValueError(
+            f"speed.bitlinear_ternary_execution={ternary_execution} requires "
+            "speed.bitlinear_ternary_tuning=off"
+        )
+    if "bitlinear_ternary_execution" in speed_cfg:
+        speed_cfg["bitlinear_ternary_execution"] = ternary_execution
+    tuning_warmup = int(speed_cfg.get("bitlinear_ternary_tuning_warmup", 10))
+    tuning_iters = int(speed_cfg.get("bitlinear_ternary_tuning_iters", 30))
+    if tuning_warmup < 0 or tuning_iters <= 0:
+        raise ValueError(
+            "speed.bitlinear_ternary_tuning_warmup must be >=0 and "
+            "speed.bitlinear_ternary_tuning_iters must be >0"
         )
     ternary_wgrad_backend = str(
         speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8")
@@ -578,20 +728,6 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
         raise ValueError(
             "unknown speed.bitlinear_ternary_wgrad_backend: "
             f"{ternary_wgrad_backend!r} (choices: int8 | fp8 | auto)"
-        )
-    compile_mode = str(speed_cfg.get("compile_mode", "default"))
-    grad_accum = int(speed_cfg.get("grad_accum_steps", 1))
-    if (
-        device.type == "cuda"
-        and speed_cfg.get("torch_compile", True)
-        and grad_accum > 1
-        and compile_mode in {"reduce-overhead", "max-autotune"}
-    ):
-        raise ValueError(
-            f"speed.compile_mode={compile_mode} は CUDA Graphs を使うため "
-            f"grad_accum_steps>1 (={grad_accum}) と併用不可 "
-            "(gradient tensor 上書きで実行時クラッシュ)。"
-            "compile_mode=default か max-autotune-no-cudagraphs を使うこと"
         )
     if device.type != "mps":
         return resolved
@@ -697,26 +833,20 @@ def apply_compile_settings(
     if not speed.get("torch_compile", True):
         print("[train] torch_compile=OFF")
         return model
-    # compile_mode=reduce-overhead / max-autotune は CUDA Graphs を有効にする。
-    # gradient accumulation では複数 microbatch の backward で同じ graph を replay し、
-    # 「CUDAGraphs が上書きした gradient tensor へアクセスした」実行時クラッシュを
-    # 起こす (compile_mode=max-autotune + grad_accum=16 で再現済み)。黙って走らせると
-    # accumulation 途中で落ちるので、config 段階で弾き cudagraph 無しの mode を案内する。
     mode = speed.get("compile_mode", "default")
-    grad_accum = int(speed.get("grad_accum_steps", 1))
-    if grad_accum > 1 and mode in {"reduce-overhead", "max-autotune"}:
-        raise ValueError(
-            f"speed.compile_mode={mode} は CUDA Graphs を使うため grad_accum_steps>1 "
-            f"(={grad_accum}) と併用不可 (gradient tensor 上書きで実行時クラッシュ)。"
-            "compile_mode=default か max-autotune-no-cudagraphs を使うか、"
-            "grad_accum_steps=1 にすること"
-        )
     # torch.compile は Inductor→(CUDA|CPU) 前提。MPS backend は codegen が不安定で
     # 落ちる/遅い。compile は結果を変えない速度最適化なので、非 CUDA では
     # semantic を変えずに OFF にする (別 optimizer/精度への置換とは異なる)。
     if device.type != "cuda":
         print(f"[train] torch_compile=OFF (device={device.type}: CUDA 以外は非対応)")
         return model
+    if uses_cudagraph_compile(speed) and not hasattr(
+        torch.compiler, "cudagraph_mark_step_begin"
+    ):
+        raise RuntimeError(
+            f"speed.compile_mode={mode} requires "
+            "torch.compiler.cudagraph_mark_step_begin()"
+        )
     # torch 2.5 では compile × gradient_checkpointing の併用で最初の backward
     # から loss が NaN になる (1B/小モデル・窓/密マスク・モデル全体/層単位
     # compile の全組合せで再現を確認済み)。黙って走らせると run 全体が無駄に
@@ -779,6 +909,7 @@ def build_validation_model(
 def main() -> int:
     timing_mark("process_start")
     args = parse_args()
+    benchmark_mode = args.benchmark_steps is not None
     timing_mark("parse_args")
     cfg = load_config(args.config)
     cfg = resolve_entropy_lm_reference(cfg, args.config)
@@ -855,12 +986,14 @@ def main() -> int:
     # ---- BitNet 訓練高速化: QKV/gate-up 融合と量子化重みcache ----
     try:
         from src.model.bitlinear import (
+            configure_bitlinear_ternary_tuning,
             configure_bitlinear_training_cache,
             install_arbor_projection_fusions,
             refresh_bitlinear_training_cache,
             set_bitlinear_fp8_mode,
             set_bitlinear_int8_backend,
             set_bitlinear_ternary_backend,
+            set_bitlinear_ternary_execution_path,
             set_bitlinear_ternary_wgrad_backend,
         )
     except Exception:  # pragma: no cover - bitnet 無効構成でも学習は継続
@@ -876,7 +1009,38 @@ def main() -> int:
             str(speed_cfg.get("bitlinear_int8_backend", "auto"))
         )
         ternary_backend = set_bitlinear_ternary_backend(
-            str(speed_cfg.get("bitlinear_ternary_backend", "dot"))
+            str(speed_cfg.get("bitlinear_ternary_backend", "dot_current"))
+        )
+        ternary_tuning_raw = speed_cfg.get("bitlinear_ternary_tuning", "off")
+        if ternary_tuning_raw in (None, False):
+            ternary_tuning_raw = "off"
+        ternary_execution_default = (
+            "legacy_raw"
+            if ternary_backend == "dot_current"
+            and str(ternary_tuning_raw).lower().replace("-", "_") == "off"
+            else "custom_op"
+        )
+        ternary_execution = set_bitlinear_ternary_execution_path(
+            str(
+                speed_cfg.get(
+                    "bitlinear_ternary_execution", ternary_execution_default
+                )
+            )
+        )
+        ternary_tuning = configure_bitlinear_ternary_tuning(
+            mode=str(ternary_tuning_raw),
+            cache_enabled=bool(
+                speed_cfg.get("bitlinear_ternary_tuning_cache", True)
+            ),
+            cache_path=speed_cfg.get(
+                "bitlinear_ternary_tuning_cache_path", "auto"
+            ),
+            fixed_tile=speed_cfg.get("bitlinear_ternary_fixed_tile"),
+            warmup=int(speed_cfg.get("bitlinear_ternary_tuning_warmup", 10)),
+            iterations=int(speed_cfg.get("bitlinear_ternary_tuning_iters", 30)),
+            verbose=bool(
+                speed_cfg.get("bitlinear_ternary_tuning_verbose", False)
+            ),
         )
         ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
             str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
@@ -904,13 +1068,20 @@ def main() -> int:
             f"[train] bitlinear_fp8={fp8_info['mode']} "
             f"int8_backend={int8_backend} "
             f"ternary_backend={ternary_backend} "
+            f"ternary_execution={ternary_execution} "
+            f"ternary_tuning={ternary_tuning['mode']} "
+            f"ternary_tune_cache={ternary_tuning['cache_path']} "
+            f"ternary_plan_entries={ternary_tuning['plan_entries']} "
             f"ternary_wgrad_backend={ternary_wgrad_backend} "
             f"layers={fp8_info['layers']}"
         )
 
     model = apply_compile_settings(model, cfg["speed"], device)
+    validation_compile_cfg = (
+        {"enabled": False} if benchmark_mode else cfg.get("validation", {})
+    )
     validation_model = build_validation_model(
-        base_model, cfg.get("validation", {}), device
+        base_model, validation_compile_cfg, device
     )
     timing_mark("compile_wrapper_created", device)
 
@@ -946,7 +1117,9 @@ def main() -> int:
 
     validation_cfg = cfg.get("validation", {})
     validation_loaders: dict[str, object] = {}
-    validation_enabled = bool(validation_cfg.get("enabled", False))
+    validation_enabled = (
+        bool(validation_cfg.get("enabled", False)) and not benchmark_mode
+    )
     if validation_enabled:
         domains = validation_cfg.get("domains", {})
         if not domains:
@@ -1001,7 +1174,16 @@ def main() -> int:
     )
     # loss/ema/lr の時系列 (log_every_steps ごとに 1 行追記)。resume 時は追記継続
     # なので、巻き戻した場合は同じ step が重複しうる (プロット時は後勝ちで dedup)。
-    metrics_path = ckpt_dir / "metrics.jsonl"
+    if benchmark_mode:
+        benchmark_log_dir = Path("logs")
+        benchmark_log_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = benchmark_log_dir / (
+            f"benchmark_{args.config.stem}_{time.strftime('%Y%m%d-%H%M%S')}_"
+            f"{os.getpid()}.jsonl"
+        )
+        print(f"[train] benchmark_metrics={metrics_path}")
+    else:
+        metrics_path = ckpt_dir / "metrics.jsonl"
 
     # ---- 再開処理 ----
     global_step = 0
@@ -1131,6 +1313,12 @@ def main() -> int:
     log_every = cfg["logging"].get("log_every_steps", 20)
     byte_kind_metrics = bool(cfg["logging"].get("byte_kind_metrics", False))
     total_steps = cfg["optim"]["total_steps"]
+    if benchmark_mode:
+        total_steps = global_step + int(args.benchmark_steps)
+        print(
+            "[train] benchmark_mode=ON "
+            f"steps={args.benchmark_steps} checkpoint=OFF validation=OFF sampling=OFF"
+        )
     micro_batch = data_cfg.get("micro_batch_size")
     context_length = data_cfg.get("context_length")
     if micro_batch and context_length:
@@ -1167,7 +1355,7 @@ def main() -> int:
 
     # checkpoint 保存時のサンプル生成 (任意)。学習を止めないよう失敗は警告に留める.
     sampling_cfg = cfg.get("sampling", {})
-    sampling_enabled = bool(sampling_cfg.get("enabled", False))
+    sampling_enabled = bool(sampling_cfg.get("enabled", False)) and not benchmark_mode
     if sampling_enabled:
         print(
             "[train] sampling=ON prompts={} max_new_bytes={}".format(
@@ -1180,7 +1368,7 @@ def main() -> int:
 
     # checkpoint 保存時の固定 good/bad target probe (任意)。
     probes_cfg = cfg.get("probes", {})
-    probes_enabled = bool(probes_cfg.get("enabled", False))
+    probes_enabled = bool(probes_cfg.get("enabled", False)) and not benchmark_mode
     if probes_enabled:
         probe_items = probes_cfg.get("items", [])
         if not probe_items:
@@ -1286,7 +1474,22 @@ def main() -> int:
         )
 
     model.train()
-    optimizer.zero_grad(set_to_none=True)
+    preserve_grad_buffers = (
+        device.type == "cuda"
+        and uses_cudagraph_compile(cfg["speed"])
+        and int(cfg["speed"].get("grad_accum_steps", 1)) > 1
+    )
+    if preserve_grad_buffers:
+        grad_buffer_count, grad_buffer_bytes = prepare_cudagraph_gradient_buffers(
+            model, optimizer
+        )
+        print(
+            "[train] cudagraph_grad_buffers="
+            f"persistent tensors={grad_buffer_count} "
+            f"memory={grad_buffer_bytes / 2**30:.2f}GiB"
+        )
+    else:
+        optimizer.zero_grad(set_to_none=True)
     accum_loss_tensor: torch.Tensor | None = None
     best_loss_tensor = torch.tensor(best_loss, device=device, dtype=torch.float32)
     # validation が無効な場合は EMA train loss を best に使う。validation が
@@ -1402,12 +1605,61 @@ def main() -> int:
             prof_wait = None
     torch_prof = None
     prof_steps_done = 0
+
+    # Nsight Systems capture range (ARBOR_NSYS_PROFILE="wait,active").
+    # nsys側は --capture-range=cudaProfilerApi を指定し、compile後のstepだけ採取する。
+    nsys_spec = os.environ.get("ARBOR_NSYS_PROFILE")
+    nsys_wait: int | None = None
+    nsys_active_steps = 0
+    nsys_capturing = False
+    if nsys_spec:
+        try:
+            nsys_wait, nsys_active_steps = (int(x) for x in nsys_spec.split(","))
+            if nsys_wait < 0 or nsys_active_steps <= 0:
+                raise ValueError
+            if device.type != "cuda":
+                raise RuntimeError("CUDA device is required")
+            print(
+                f"[train] Nsight capture armed: wait={nsys_wait} "
+                f"active={nsys_active_steps}"
+            )
+        except (RuntimeError, ValueError):
+            print(
+                f"[train] WARNING: ARBOR_NSYS_PROFILE='{nsys_spec}' requires "
+                "CUDA and 'wait,active' with wait>=0, active>0; ignoring"
+            )
+            nsys_wait = None
+
+    def nsys_range(name: str):
+        if nsys_capturing:
+            return torch.cuda.nvtx.range(name)
+        return nullcontext()
+
     if sync_each_step:
         print("[train] sync_each_step=ON")
 
     data_iter = make_data_iter()
     while global_step < total_steps:
         try:
+            if (
+                nsys_wait is not None
+                and not nsys_capturing
+                and prof_steps_done == nsys_wait
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStart()
+                    nsys_capturing = True
+                    print(
+                        f"[train] Nsight capture started @ step={global_step}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional diagnostics
+                    print(
+                        f"[train] WARNING: Nsight capture start failed: {exc}",
+                        flush=True,
+                    )
+                    nsys_wait = None
             if prof_wait is not None and torch_prof is None and prof_steps_done == prof_wait:
                 try:
                     torch.cuda.synchronize()
@@ -1423,6 +1675,8 @@ def main() -> int:
                     print(f"[train] WARNING: torch profiler start failed: {exc}", flush=True)
                     torch_prof = None
                     prof_wait = None
+            if nsys_capturing:
+                torch.cuda.nvtx.range_push("arbor.step")
             step_t0 = time.perf_counter()
             bytes_this_step = 0
             for micro in range(grad_accum):
@@ -1475,7 +1729,14 @@ def main() -> int:
                             latest_section_profile = {"profile_error": str(exc)[:200]}
                             print(f"[train] WARNING: section profile failed: {exc}", flush=True)
                     fwd_start = start_gpu_section("forward")
-                    out = model(inputs)
+                    with nsys_range("arbor.forward"):
+                        if device.type == "cuda" and uses_cudagraph_compile(cfg["speed"]):
+                            # CUDAGraph Trees cannot always infer the micro-step
+                            # boundary used by gradient accumulation. Mark every
+                            # model invocation explicitly so a replay does not
+                            # overwrite tensors still owned by the previous tree.
+                            torch.compiler.cudagraph_mark_step_begin()
+                        out = model(inputs)
                     end_gpu_section("forward", fwd_start)
                     if global_step == 0:
                         timing_mark(f"step0_micro{micro}_forward_done", device)
@@ -1516,7 +1777,8 @@ def main() -> int:
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_backward", device)
                 bwd_start = start_gpu_section("backward")
-                loss.backward()
+                with nsys_range("arbor.backward"):
+                    loss.backward()
                 end_gpu_section("backward", bwd_start)
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_backward_done", device)
@@ -1542,12 +1804,15 @@ def main() -> int:
                     model.parameters(), cfg["optim"]["grad_clip"]
                 )
             opt_start = start_gpu_section("optimizer")
-            optimizer.step()
-            if refresh_bitlinear_training_cache is not None:
-                refresh_bitlinear_training_cache(base_model)
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            with nsys_range("arbor.optimizer"):
+                optimizer.step()
+                if refresh_bitlinear_training_cache is not None:
+                    refresh_bitlinear_training_cache(base_model)
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=not preserve_grad_buffers)
             end_gpu_section("optimizer", opt_start)
+            if nsys_capturing:
+                torch.cuda.nvtx.range_pop()
 
             global_step += 1
             interval_steps += 1
@@ -1557,6 +1822,26 @@ def main() -> int:
             interval_cpu_ms["step"] += (time.perf_counter() - step_t0) * 1000.0
 
             prof_steps_done += 1
+            if (
+                nsys_capturing
+                and nsys_wait is not None
+                and prof_steps_done >= nsys_wait + nsys_active_steps
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
+                    print(
+                        f"[train] Nsight capture stopped @ step={global_step}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - optional diagnostics
+                    print(
+                        f"[train] WARNING: Nsight capture stop failed: {exc}",
+                        flush=True,
+                    )
+                finally:
+                    nsys_capturing = False
+                    nsys_wait = None
             if (
                 torch_prof is not None
                 and prof_wait is not None
@@ -1595,12 +1880,18 @@ def main() -> int:
                 best_improved_tensor = best_improved_tensor | is_best_tensor
                 best_loss_tensor = torch.minimum(best_loss_tensor, ema_loss_tensor)
 
-            should_save = (
+            should_save = not benchmark_mode and (
                 global_step % save_every == 0
                 or stop.requested
                 or global_step >= total_steps
             )
-            need_loss_scalar = global_step % log_every == 0 or should_save or args.dry_run
+            benchmark_done = benchmark_mode and global_step >= total_steps
+            need_loss_scalar = (
+                global_step % log_every == 0
+                or should_save
+                or benchmark_done
+                or args.dry_run
+            )
             cur_loss = float(loss_for_step.cpu()) if need_loss_scalar else None
 
             if need_loss_scalar:
@@ -1908,6 +2199,12 @@ def main() -> int:
     ckpt._await_thread()
     if device.type == "cuda":
         torch.cuda.synchronize()
+        if benchmark_mode:
+            print(
+                "[train] benchmark_cuda_memory "
+                f"peak_allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
+                f"peak_reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB"
+            )
         model = None
         validation_model = None
         base_model = None

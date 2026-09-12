@@ -36,10 +36,14 @@ __pycache__/
 Thumbs.db
 
 *.md
+!arbor_packed_ternary_runtime_tuning_design.md
+!arbor_packed_ternary_runtime_tuning_findings.md
+!arbor_bitnet_launch_bound_investigation.md
 
 # logs
 *.log
 nohup.out
+/logs/benchmark_*.jsonl
 # torch profiler の chrome trace (数百MBの巨大バイナリ; 成果物なので追跡しない)
 logs/torch_profile_*.json
 

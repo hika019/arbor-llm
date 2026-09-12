@@ -32,7 +32,9 @@ ternary 重みは optimizer step 後に INT8 {-1,0,+1} と FP8 の両レイア�
             backward は cached FP8 weight と FP8 GEMM を使う。RTX 5090向け既定候補。
   - "ternary": forward / dX は 2bit packed weight を直接 decode する Triton
                kernel。既定は旧vectorized decode後にTensor Coreを使う
-               dot_current backend。4-way grouped decodeは明示A/B用。
+               dot_current backend。kmajor_single_dotは[K/4,N]からpacked byteを
+               一度だけloadし、4 weightをdense INT8 fragmentへinterleaveして
+               tl.dotを1回呼ぶ本命A/B。4-way grouped decodeは比較専用。
                dW は A8 INT8 dense GEMM。
                shadow weight は BF16 のまま保持し、optimizer step 後だけcache更新。
 
@@ -54,6 +56,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from src.model.bitlinear_tuning import (
+    PackedLaunchConfig,
+    TuneKey,
+    configure_packed_ternary_tuning,
+    load_packed_tuning_plan,
+    resolve_packed_launch_config,
+)
 
 if hasattr(torch, "_scaled_mm_v2"):
     torch.compiler.allow_in_graph(torch._scaled_mm_v2)
@@ -150,7 +160,7 @@ def _dequantize_ternary_matching_ste(
 
 
 def pack_ternary_weight(w_q: torch.Tensor) -> torch.Tensor:
-    """int8 ternary {-1,0,1} を uint8 に 4 値/byte で pack する."""
+    """int8 ternary {-1,0,1} を N-major uint8 に 4 値/byte で pack する."""
     if w_q.dtype != torch.int8:
         raise TypeError(f"w_q must be torch.int8, got {w_q.dtype}")
     if w_q.dim() != 2:
@@ -168,6 +178,11 @@ def pack_ternary_weight(w_q: torch.Tensor) -> torch.Tensor:
     ).contiguous()
 
 
+def pack_ternary_weight_kmajor(w_q: torch.Tensor) -> torch.Tensor:
+    """int8 ternary weightをGEMM向け[K/4, N] layoutへpackする."""
+    return pack_ternary_weight(w_q).t().contiguous()
+
+
 def unpack_ternary_weight(w_packed: torch.Tensor, k: int) -> torch.Tensor:
     """pack_ternary_weight の逆変換 (検証用)."""
     codes = torch.stack(
@@ -182,6 +197,13 @@ def unpack_ternary_weight(w_packed: torch.Tensor, k: int) -> torch.Tensor:
     return (codes.reshape(w_packed.size(0), -1)[:, :k].to(torch.int8) - 1).contiguous()
 
 
+def unpack_ternary_weight_kmajor(w_packed: torch.Tensor, k: int) -> torch.Tensor:
+    """pack_ternary_weight_kmajor の逆変換 (検証用)."""
+    if w_packed.dim() != 2:
+        raise ValueError(f"w_packed must be 2D, got shape={tuple(w_packed.shape)}")
+    return unpack_ternary_weight(w_packed.t().contiguous(), k)
+
+
 if triton is not None:
 
     @triton.jit
@@ -191,6 +213,8 @@ if triton is not None:
         stride_xm: tl.constexpr, stride_ym: tl.constexpr,
         SCALE_PER_OUTPUT: tl.constexpr,
         GROUPED_DECODE: tl.constexpr,
+        K_MAJOR_LAYOUT: tl.constexpr,
+        DECODE_V2: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
         """2bit weightをregisterでdecodeするpacked GEMM core."""
@@ -200,14 +224,61 @@ if triton is not None:
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         acc = tl.zeros((BLOCK_M, BLOCK_N), tl.int32)
 
-        if GROUPED_DECODE:
+        if DECODE_V2:
+            # 本命: K-major packed byteを1回だけloadし、register内で4 weightへ
+            # decode -> [BLOCK_K, BLOCK_N] の dense INT8 fragmentを構築 ->
+            # tl.dot ×1。decode後のINT8 weightはVRAMへ書かない。
+            offs_pk = tl.arange(0, BLOCK_K // 4)
+            offs_k = tl.arange(0, BLOCK_K)
+            for k0 in range(0, k, BLOCK_K):
+                pk = k0 // 4 + offs_pk
+                # K-major layout [K/4, N]: N方向がcontiguous = coalesced load。
+                packed = tl.load(
+                    w_ptr + pk[:, None] * n + offs_n[None, :],
+                    mask=(pk[:, None] < k_packed) & (offs_n[None, :] < n),
+                    other=0x55,  # 全4スロットが code 1 = ternary 0
+                )
+                w0 = ((packed & 3).to(tl.int32) - 1).to(tl.int8)
+                w1 = (((packed >> 2) & 3).to(tl.int32) - 1).to(tl.int8)
+                w2 = (((packed >> 4) & 3).to(tl.int32) - 1).to(tl.int8)
+                w3 = (((packed >> 6) & 3).to(tl.int32) - 1).to(tl.int8)
+                # 4 weightを論理K順 (k = 4*pk + j) へ interleave する。
+                #   lo[p,n,i]  : i=0->w0, i=1->w1
+                #   hi[p,n,i]  : i=0->w2, i=1->w3
+                #   full[p,n,i,c] = w_{2*c + i}
+                lo = tl.join(w0, w1)
+                hi = tl.join(w2, w3)
+                full = tl.join(lo, hi)
+                # [p, n, i, c] -> [p, c, i, n] にして reshape すると
+                # 行 index = ((p*2 + c)*2 + i) = 4*p + 2*c + i = 論理K。
+                wtile = tl.reshape(
+                    tl.permute(full, (0, 3, 2, 1)),
+                    (BLOCK_K, BLOCK_N),
+                )
+                k_idxs = k0 + offs_k
+                x = tl.load(
+                    x_ptr + offs_m[:, None] * stride_xm + k_idxs[None, :],
+                    mask=(offs_m[:, None] < m) & (k_idxs[None, :] < k),
+                    other=0,
+                )
+                acc += tl.dot(x, wtile, out_dtype=tl.int32)
+        elif GROUPED_DECODE:
             # packed byteを4 weight単位で1回だけloadし、4本のINT8 dotへ分ける。
             # 旧decode pathは同じpacked byteをK方向に4回参照する形になる。
             offs_pk = tl.arange(0, BLOCK_K // 4)
             for k0 in range(0, k, BLOCK_K):
                 k_base = k0 + offs_pk * 4
+                if K_MAJOR_LAYOUT:
+                    packed_ptrs = (
+                        w_ptr + (k_base // 4)[:, None] * n + offs_n[None, :]
+                    )
+                else:
+                    packed_ptrs = (
+                        w_ptr + offs_n[None, :] * k_packed
+                        + (k_base // 4)[:, None]
+                    )
                 packed = tl.load(
-                    w_ptr + offs_n[None, :] * k_packed + (k_base // 4)[:, None],
+                    packed_ptrs,
                     mask=(offs_n[None, :] < n) & (k_base[:, None] < k),
                     other=1,  # code 1 = ternary 0
                 )
@@ -251,8 +322,16 @@ if triton is not None:
                 )
                 pack_idxs = k_idxs // 4
                 shifts = (k_idxs % 4) * 2
+                if K_MAJOR_LAYOUT:
+                    packed_ptrs = (
+                        w_ptr + pack_idxs[:, None] * n + offs_n[None, :]
+                    )
+                else:
+                    packed_ptrs = (
+                        w_ptr + offs_n[None, :] * k_packed + pack_idxs[:, None]
+                    )
                 packed = tl.load(
-                    w_ptr + offs_n[None, :] * k_packed + pack_idxs[:, None],
+                    packed_ptrs,
                     mask=(offs_n[None, :] < n) & (k_idxs[:, None] < k),
                     other=1,  # code 1 = ternary 0
                 )
@@ -452,37 +531,36 @@ if triton is not None:
         )
 
 
-def _packed_linear_tile(
+def _legacy_packed_launch_spec(
     m: int, n: int, k: int, *, grouped_decode: bool
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
+    """Pre-autotune RTX 4090 launch policy, retained as an explicit rollback."""
     if grouped_decode:
-        return 32, 64, 128, 4
-    # Global BitLinear / MB4 fast paths observed on RTX 4090.  Keep these
-    # narrow to avoid applying a tile that wins in forward but regresses in dX.
+        return 32, 64, 128, 4, 3
     if m == 2048:
         if k == 2048 and n == 11264:
-            return 128, 64, 128, 4
+            return 128, 64, 128, 4, 3
         if k == 11264 and n == 2048:
-            return 128, 128, 32, 4
+            return 128, 128, 32, 4, 3
         if k == 5632 and n == 2048:
-            return 128, 128, 32, 4
+            return 128, 128, 32, 4, 3
         if k == 2048 and n == 5632:
-            return 128, 64, 64, 4
+            return 128, 64, 64, 4, 3
         if k == 2048 and n == 3072:
-            return 128, 64, 128, 4
+            return 128, 64, 128, 4, 3
         if k == 3072 and n == 2048:
-            return 128, 64, 64, 4
+            return 128, 64, 64, 4, 3
         if k == 2048 and n == 2048:
-            return 128, 128, 64, 8
+            return 128, 128, 64, 8, 3
     if k == 4096 and n == 768 and m >= 32768:
-        return 128, 128, 64, 4
+        return 128, 128, 64, 4, 3
     if k == 768 and n == 4096 and m >= 131072:
-        return 128, 128, 64, 4
+        return 128, 128, 64, 4, 3
     if m >= 16384 and ((k == 768 and n == 4096) or (k == 4096 and n == 768)):
-        return 128, 64, 64, 4
+        return 128, 64, 64, 4, 3
     if m >= 32 and n >= 64:
-        return 32, 64, 32, 4
-    return 16, 32, 32, 4
+        return 32, 64, 32, 4, 3
+    return 16, 32, 32, 4, 3
 
 
 def _wgrad_tile(m: int, n: int, k: int) -> tuple[int, int, int, int]:
@@ -493,35 +571,401 @@ def _wgrad_tile(m: int, n: int, k: int) -> tuple[int, int, int, int]:
     return 32, 32, 32, 4
 
 
-def _packed_linear(
+def _launch_packed_linear(
     x_q: torch.Tensor,      # (M, K) int8
     inv_sx: torch.Tensor,   # (M,) float32: 行ごとの 1/activation_scale
-    w_packed: torch.Tensor, # (N, ceil(K/4)) uint8
+    w_packed: torch.Tensor, # N-major: (N,K/4), K-major: (K/4,N)
+    sw: torch.Tensor,       # () または (N,) float32: weight scale
+    y: torch.Tensor,
+    k: int,
+    n: int,
+    launch_spec: tuple[int, int, int, int, int],
+    *,
+    grouped_decode: bool,
+    kmajor_layout: bool,
+    decode_v2: bool,
+) -> torch.Tensor:
+    m = x_q.size(0)
+    k_packed = math.ceil(k / 4)
+    block_m, block_n, block_k, num_warps, num_stages = launch_spec
+    if decode_v2 and (block_k < 16 or block_k % 4 != 0):
+        raise ValueError(
+            f"decode_v2 requires BLOCK_K >= 16 and divisible by 4, got {block_k}"
+        )
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+    _packed_bitlinear_kernel[grid](
+        x_q.contiguous(), w_packed, inv_sx.contiguous(), sw.contiguous(), y,
+        m, n, k, k_packed,
+        x_q.stride(0), y.stride(0),
+        SCALE_PER_OUTPUT=sw.numel() != 1,
+        GROUPED_DECODE=grouped_decode,
+        K_MAJOR_LAYOUT=kmajor_layout,
+        DECODE_V2=decode_v2,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return y
+
+
+def _packed_launch_spec(
+    config: PackedLaunchConfig,
+) -> tuple[int, int, int, int, int]:
+    return (
+        config.block_m,
+        config.block_n,
+        config.block_k,
+        config.num_warps,
+        config.num_stages,
+    )
+
+
+def _packed_backend_from_flags(
+    *, grouped_decode: bool, kmajor_layout: bool, decode_v2: bool
+) -> str:
+    if decode_v2:
+        return "kmajor_single_dot"
+    if kmajor_layout:
+        return "kmajor_current"
+    if grouped_decode:
+        return "dot"
+    return "dot_current"
+
+
+def _validate_packed_linear_inputs(
+    x_q: torch.Tensor,
+    w_packed: torch.Tensor,
+    sw: torch.Tensor,
+    k: int,
+    n: int,
+    *,
+    grouped_decode: bool,
+    kmajor_layout: bool,
+    decode_v2: bool,
+    backend: str,
+) -> None:
+    if sw.numel() not in (1, n):
+        raise ValueError(f"packed weight scale must have 1 or N={n} values")
+    if decode_v2 and not kmajor_layout:
+        raise ValueError("decode_v2 requires K-major packed layout")
+    if decode_v2 and grouped_decode:
+        raise ValueError("decode_v2 is a single-dot backend, not grouped decode")
+    k_packed = math.ceil(k / 4)
+    expected_shape = (k_packed, n) if kmajor_layout else (n, k_packed)
+    if tuple(w_packed.shape) != expected_shape:
+        layout = "K-major" if kmajor_layout else "N-major"
+        raise ValueError(
+            f"{layout} packed weight must have shape={expected_shape}, "
+            f"got {tuple(w_packed.shape)}"
+        )
+    flags_backend = _packed_backend_from_flags(
+        grouped_decode=grouped_decode,
+        kmajor_layout=kmajor_layout,
+        decode_v2=decode_v2,
+    )
+    if backend != flags_backend:
+        raise ValueError(
+            f"packed backend {backend!r} does not match kernel flags "
+            f"for {flags_backend!r}"
+        )
+    if x_q.size(1) != k:
+        raise ValueError(f"packed input must have K={k}, got {x_q.size(1)}")
+
+
+def _packed_linear_execute(
+    x_q: torch.Tensor,
+    inv_sx: torch.Tensor,
+    w_packed: torch.Tensor,
+    sw: torch.Tensor,
+    k: int,
+    n: int,
+    out_dtype: torch.dtype,
+    *,
+    grouped_decode: bool,
+    kmajor_layout: bool,
+    decode_v2: bool,
+    backend: str,
+    launch_spec: tuple[int, int, int, int, int],
+) -> torch.Tensor:
+    """Execute one fixed packed launch without tuning, cache access, or logging."""
+    _validate_packed_linear_inputs(
+        x_q,
+        w_packed,
+        sw,
+        k,
+        n,
+        grouped_decode=grouped_decode,
+        kmajor_layout=kmajor_layout,
+        decode_v2=decode_v2,
+        backend=backend,
+    )
+    y = torch.empty((x_q.size(0), n), device=x_q.device, dtype=out_dtype)
+    return _launch_packed_linear(
+        x_q,
+        inv_sx,
+        w_packed,
+        sw,
+        y,
+        k,
+        n,
+        launch_spec,
+        grouped_decode=grouped_decode,
+        kmajor_layout=kmajor_layout,
+        decode_v2=decode_v2,
+    )
+
+
+def _packed_linear_impl(
+    x_q: torch.Tensor,      # (M, K) int8
+    inv_sx: torch.Tensor,   # (M,) float32: 行ごとの 1/activation_scale
+    w_packed: torch.Tensor, # N-major: (N,K/4), K-major: (K/4,N)
     sw: torch.Tensor,       # () または (N,) float32: weight scale
     k: int,
     n: int,
     out_dtype: torch.dtype,
     *,
     grouped_decode: bool = True,
+    kmajor_layout: bool = False,
+    decode_v2: bool = False,
+    backend: str | None = None,
+    launch_config: PackedLaunchConfig | None = None,
 ) -> torch.Tensor:
     m = x_q.size(0)
-    if sw.numel() not in (1, n):
-        raise ValueError(f"packed weight scale must have 1 or N={n} values")
+    resolved_backend = backend or _packed_backend_from_flags(
+        grouped_decode=grouped_decode,
+        kmajor_layout=kmajor_layout,
+        decode_v2=decode_v2,
+    )
+    _validate_packed_linear_inputs(
+        x_q,
+        w_packed,
+        sw,
+        k,
+        n,
+        grouped_decode=grouped_decode,
+        kmajor_layout=kmajor_layout,
+        decode_v2=decode_v2,
+        backend=resolved_backend,
+    )
     y = torch.empty((m, n), device=x_q.device, dtype=out_dtype)
-    block_m, block_n, block_k, num_warps = _packed_linear_tile(
-        m, n, k, grouped_decode=grouped_decode
+
+    def launch(config: PackedLaunchConfig) -> torch.Tensor:
+        return _launch_packed_linear(
+            x_q,
+            inv_sx,
+            w_packed,
+            sw,
+            y,
+            k,
+            n,
+            _packed_launch_spec(config),
+            grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
+        )
+
+    if launch_config is not None:
+        return launch(launch_config)
+    selection = resolve_packed_launch_config(
+        key=TuneKey(
+            backend=resolved_backend,
+            m=m,
+            k=k,
+            n=n,
+            dtype=str(out_dtype).removeprefix("torch."),
+            scale_per_output=sw.numel() != 1,
+        ),
+        device=x_q.device,
+        launcher=launch,
     )
-    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
-    _packed_bitlinear_kernel[grid](
-        x_q.contiguous(), w_packed, inv_sx.contiguous(), sw.contiguous(), y,
-        m, n, k, w_packed.size(1),
-        x_q.stride(0), y.stride(0),
-        SCALE_PER_OUTPUT=sw.numel() != 1,
-        GROUPED_DECODE=grouped_decode,
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-        num_warps=num_warps,
+    return launch(selection.config)
+
+
+@torch.library.custom_op(
+    "arbor::packed_ternary_linear",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _packed_linear_custom_op(
+    x_q: torch.Tensor,
+    inv_sx: torch.Tensor,
+    w_packed: torch.Tensor,
+    sw: torch.Tensor,
+    k: int,
+    n: int,
+    out_dtype: torch.dtype,
+    grouped_decode: bool,
+    kmajor_layout: bool,
+    decode_v2: bool,
+    backend: str,
+) -> torch.Tensor:
+    """Opaque torch.compile boundary around Python autotune + Triton launch."""
+    if _ternary_execution_path == "legacy_custom_op":
+        return _packed_linear_execute(
+            x_q,
+            inv_sx,
+            w_packed,
+            sw,
+            k,
+            n,
+            out_dtype,
+            grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
+            backend=backend,
+            launch_spec=_legacy_packed_launch_spec(
+                x_q.size(0), n, k, grouped_decode=grouped_decode
+            ),
+        )
+    return _packed_linear_impl(
+        x_q,
+        inv_sx,
+        w_packed,
+        sw,
+        k,
+        n,
+        out_dtype,
+        grouped_decode=grouped_decode,
+        kmajor_layout=kmajor_layout,
+        decode_v2=decode_v2,
+        backend=backend,
     )
-    return y
+
+
+@_packed_linear_custom_op.register_fake
+def _packed_linear_custom_op_fake(
+    x_q: torch.Tensor,
+    inv_sx: torch.Tensor,
+    w_packed: torch.Tensor,
+    sw: torch.Tensor,
+    k: int,
+    n: int,
+    out_dtype: torch.dtype,
+    grouped_decode: bool,
+    kmajor_layout: bool,
+    decode_v2: bool,
+    backend: str,
+) -> torch.Tensor:
+    del inv_sx, w_packed, sw, k, grouped_decode, kmajor_layout, decode_v2, backend
+    return torch.empty((x_q.shape[0], n), device=x_q.device, dtype=out_dtype)
+
+
+def _packed_linear(
+    x_q: torch.Tensor,
+    inv_sx: torch.Tensor,
+    w_packed: torch.Tensor,
+    sw: torch.Tensor,
+    k: int,
+    n: int,
+    out_dtype: torch.dtype,
+    *,
+    grouped_decode: bool = True,
+    kmajor_layout: bool = False,
+    decode_v2: bool = False,
+    backend: str | None = None,
+    launch_config: PackedLaunchConfig | None = None,
+) -> torch.Tensor:
+    resolved_backend = backend or _packed_backend_from_flags(
+        grouped_decode=grouped_decode,
+        kmajor_layout=kmajor_layout,
+        decode_v2=decode_v2,
+    )
+    if launch_config is not None:
+        return _packed_linear_execute(
+            x_q,
+            inv_sx,
+            w_packed,
+            sw,
+            k,
+            n,
+            out_dtype,
+            grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
+            backend=resolved_backend,
+            launch_spec=_packed_launch_spec(launch_config),
+        )
+    if _ternary_execution_path == "raw":
+        if _ternary_raw_launch_spec is None:
+            raise RuntimeError(
+                "bitlinear ternary execution=raw requires tuning=fixed and "
+                "a fixed launch tile"
+            )
+        return _packed_linear_execute(
+            x_q,
+            inv_sx,
+            w_packed,
+            sw,
+            k,
+            n,
+            out_dtype,
+            grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
+            backend=resolved_backend,
+            launch_spec=_ternary_raw_launch_spec,
+        )
+    if _ternary_execution_path == "legacy_raw":
+        return _packed_linear_execute(
+            x_q,
+            inv_sx,
+            w_packed,
+            sw,
+            k,
+            n,
+            out_dtype,
+            grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
+            backend=resolved_backend,
+            launch_spec=_legacy_packed_launch_spec(
+                x_q.size(0), n, k, grouped_decode=grouped_decode
+            ),
+        )
+    if _ternary_execution_path == "raw_plan":
+        key = TuneKey(
+            backend=resolved_backend,
+            m=x_q.size(0),
+            k=k,
+            n=n,
+            dtype=str(out_dtype).removeprefix("torch."),
+            scale_per_output=sw.numel() != 1,
+        )
+        launch_spec = _ternary_raw_plan.get(key)
+        if launch_spec is None:
+            raise RuntimeError(
+                "packed ternary raw plan miss for "
+                f"backend={key.backend} shape={key.m}x{key.k}x{key.n} "
+                f"dtype={key.dtype} scale_per_output={key.scale_per_output}; "
+                "run custom_op+auto preflight to populate the cache before compile"
+            )
+        return _packed_linear_execute(
+            x_q,
+            inv_sx,
+            w_packed,
+            sw,
+            k,
+            n,
+            out_dtype,
+            grouped_decode=grouped_decode,
+            kmajor_layout=kmajor_layout,
+            decode_v2=decode_v2,
+            backend=resolved_backend,
+            launch_spec=launch_spec,
+        )
+    return _packed_linear_custom_op(
+        x_q,
+        inv_sx,
+        w_packed,
+        sw,
+        k,
+        n,
+        out_dtype,
+        grouped_decode,
+        kmajor_layout,
+        decode_v2,
+        resolved_backend,
+    )
 
 
 def _quantize_a8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -716,11 +1160,45 @@ _FP8_E4M3 = torch.float8_e4m3fn
 _FP8_MAX = 448.0  # e4m3fn の最大有限値
 _FP8_MODES = ("off", "bwd", "full", "int8", "ternary")
 _INT8_BACKENDS = ("auto", "int_mm", "triton")
-_TERNARY_BACKENDS = ("dot", "dot_current")
+_TERNARY_BACKENDS = ("dot", "dot_current", "kmajor_current", "kmajor_single_dot")
 _TERNARY_WGRAD_BACKENDS = ("int8", "fp8", "auto")
+_TERNARY_EXECUTION_PATHS = (
+    "custom_op",
+    "raw",
+    "raw_plan",
+    "legacy_raw",
+    "legacy_custom_op",
+)
 _int8_backend = "auto"
 _ternary_backend = "dot_current"
 _ternary_wgrad_backend = "int8"
+_ternary_execution_path = "legacy_raw"
+_ternary_raw_launch_spec: tuple[int, int, int, int, int] | None = None
+_ternary_raw_plan: dict[TuneKey, tuple[int, int, int, int, int]] = {}
+
+
+def _ternary_backend_flags(backend: str) -> dict[str, bool]:
+    """backend名を kernel の decode/layout フラグへ変換する."""
+    return {
+        "grouped_decode": backend == "dot",
+        "kmajor_layout": backend in ("kmajor_current", "kmajor_single_dot"),
+        "decode_v2": backend == "kmajor_single_dot",
+    }
+
+
+def _ternary_inference_flags(backend: str) -> dict[str, bool]:
+    """packed inferenceの既存grouped挙動を保ちつつ新backendを選ぶ."""
+    flags = _ternary_backend_flags(backend)
+    if backend == "dot_current":
+        flags["grouped_decode"] = True
+    return flags
+
+
+def _ternary_pack_fn(backend: str):
+    """backendに応じた packed weight 生成関数を返す."""
+    if backend in ("kmajor_current", "kmajor_single_dot"):
+        return pack_ternary_weight_kmajor
+    return pack_ternary_weight
 
 
 def set_bitlinear_int8_backend(backend: str) -> str:
@@ -746,12 +1224,107 @@ def set_bitlinear_ternary_backend(backend: str) -> str:
         normalized = "dot"
     if normalized in {"current", "legacy"}:
         normalized = "dot_current"
+    if normalized in {"kmajor", "k_major", "packed_kmajor_current"}:
+        normalized = "kmajor_current"
+    if normalized in {
+        "kmajor_single",
+        "k_major_single_dot",
+        "single_dot",
+        "decode_v2",
+        "packed_kmajor_single_dot",
+    }:
+        normalized = "kmajor_single_dot"
     if normalized not in _TERNARY_BACKENDS:
         raise ValueError(
             f"unknown bitlinear ternary backend: {backend!r} "
             f"(choices: {_TERNARY_BACKENDS})"
         )
     _ternary_backend = normalized
+    return normalized
+
+
+def configure_bitlinear_ternary_tuning(
+    *,
+    mode: str = "auto",
+    cache_enabled: bool = True,
+    cache_path: str | os.PathLike[str] | None = None,
+    fixed_tile: PackedLaunchConfig | str | Sequence[int] | dict[str, Any] | None = None,
+    warmup: int = 10,
+    iterations: int = 30,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """packed ternary launch-config resolverをprocess-globalに設定する."""
+    global _ternary_raw_launch_spec, _ternary_raw_plan
+    options = configure_packed_ternary_tuning(
+        mode=mode,
+        cache_enabled=cache_enabled,
+        cache_path=cache_path,
+        fixed_config=fixed_tile,
+        warmup=warmup,
+        iterations=iterations,
+        verbose=verbose,
+    )
+    _ternary_raw_launch_spec = (
+        None
+        if options.mode != "fixed" or options.fixed_config is None
+        else _packed_launch_spec(options.fixed_config)
+    )
+    _ternary_raw_plan = {}
+    if _ternary_execution_path == "raw_plan":
+        if not options.cache_enabled:
+            raise ValueError("raw_plan requires bitlinear ternary tuning cache")
+        loaded = load_packed_tuning_plan(options.cache_path)
+        if not loaded:
+            raise RuntimeError(
+                f"raw_plan found no compatible entries in {options.cache_path}"
+            )
+        _ternary_raw_plan = {
+            key: _packed_launch_spec(config) for key, config in loaded.items()
+        }
+        if options.verbose:
+            for key, config in sorted(
+                loaded.items(),
+                key=lambda item: (
+                    item[0].backend,
+                    item[0].m,
+                    item[0].k,
+                    item[0].n,
+                    item[0].dtype,
+                    item[0].scale_per_output,
+                ),
+            ):
+                print(
+                    "[bitlinear-plan] "
+                    f"backend={key.backend} shape={key.m}x{key.k}x{key.n} "
+                    f"dtype={key.dtype} "
+                    f"scale={'per_output' if key.scale_per_output else 'tensorwise'} "
+                    f"tile={config.tile_string} warps={config.num_warps} "
+                    f"stages={config.num_stages} source=cache"
+                )
+    return {
+        "mode": options.mode,
+        "cache_enabled": options.cache_enabled,
+        "cache_path": None if options.cache_path is None else str(options.cache_path),
+        "fixed_tile": (
+            None if options.fixed_config is None else options.fixed_config.to_dict()
+        ),
+        "warmup": options.warmup,
+        "iterations": options.iterations,
+        "verbose": options.verbose,
+        "plan_entries": len(_ternary_raw_plan),
+    }
+
+
+def set_bitlinear_ternary_execution_path(path: str) -> str:
+    """Select the temporary packed launch boundary used for performance A/B."""
+    global _ternary_execution_path
+    normalized = str(path).lower().replace("-", "_")
+    if normalized not in _TERNARY_EXECUTION_PATHS:
+        raise ValueError(
+            f"unknown bitlinear ternary execution path: {path!r} "
+            f"(choices: {_TERNARY_EXECUTION_PATHS})"
+        )
+    _ternary_execution_path = normalized
     return normalized
 
 
@@ -830,16 +1403,15 @@ def _cast_a8_dequant_fp8_transposed(
     sx = inv_sx.contiguous()
     if sx.numel() != x2.size(0):
         raise ValueError(f"inv_sx must have M={x2.size(0)} values")
-    sx_max = sx.float().amax()
-    min_inv_sx = 1.0e-5 / 127.0
-    if sx_max > min_inv_sx:
-        scale = (sx_max * (127.0 / _FP8_MAX)).clamp_min(1e-12)
-    else:
-        row_qmax = torch.maximum(
-            x2.amax(dim=1).to(torch.int16),
-            -x2.amin(dim=1).to(torch.int16),
-        ).to(torch.float32)
-        scale = ((row_qmax * sx.float()).amax() / _FP8_MAX).clamp_min(1e-12)
+    # Exact absmax of the reconstructed A8 tensor. A Python branch on
+    # sx.amax() would materialize a CUDA scalar and synchronize once per
+    # BitLinear dW call. Non-floor rows have qmax=127, so this is also
+    # equivalent to the former sx_max * 127 fast path.
+    row_qmax = torch.maximum(
+        x2.amax(dim=1).to(torch.int16),
+        -x2.amin(dim=1).to(torch.int16),
+    ).to(torch.float32)
+    scale = ((row_qmax * sx.float()).amax() / _FP8_MAX).clamp_min(1e-12)
     if triton is None or not x2.is_cuda:
         x_q = x2.to(torch.float32) * sx.float().unsqueeze(1)
         return (
@@ -1119,15 +1691,19 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         w_packed: torch.Tensor,
         w_packed_t: torch.Tensor,
         row_scale: torch.Tensor,
-        grouped_decode: bool,
+        backend: str,
         out_sizes: tuple[int, ...],
         *shadow_weights: torch.Tensor,
     ) -> torch.Tensor:
         del shadow_weights
         ctx.input_shape = tuple(x.shape)
         ctx.out_sizes = out_sizes
-        ctx.grouped_decode = grouped_decode
-        x2 = x.reshape(-1, w_packed_t.size(0))
+        ctx.backend = backend
+        flags = _ternary_backend_flags(backend)
+        ctx.grouped_decode = flags["grouped_decode"]
+        ctx.kmajor_layout = flags["kmajor_layout"]
+        ctx.decode_v2 = flags["decode_v2"]
+        x2 = x.reshape(-1, ctx.input_shape[-1])
         x_int8, inv_sx = _quantize_a8_rows(x2)
         ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale)
         y = _packed_linear(
@@ -1138,7 +1714,10 @@ class TernaryBitLinearSTE(torch.autograd.Function):
             x2.size(1),
             row_scale.numel(),
             x.dtype,
-            grouped_decode=grouped_decode,
+            grouped_decode=ctx.grouped_decode,
+            kmajor_layout=ctx.kmajor_layout,
+            decode_v2=ctx.decode_v2,
+            backend=backend,
         )
         return y.reshape(*ctx.input_shape[:-1], row_scale.numel())
 
@@ -1158,9 +1737,12 @@ class TernaryBitLinearSTE(torch.autograd.Function):
                 w_packed_t,
                 one,
                 n,
-                w_packed_t.size(0),
+                ctx.input_shape[-1],
                 grad_output.dtype,
                 grouped_decode=ctx.grouped_decode,
+                kmajor_layout=ctx.kmajor_layout,
+                decode_v2=ctx.decode_v2,
+                backend=ctx.backend,
             ).reshape(ctx.input_shape)
 
         needs_w = ctx.needs_input_grad[6:]
@@ -1335,10 +1917,9 @@ class BitLinear(nn.Module):
             self._train_w_int8 = None
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
-            self._train_w_packed = pack_ternary_weight(w_int8)
-            self._train_w_packed_t = pack_ternary_weight(
-                w_int8.t().contiguous()
-            )
+            pack = _ternary_pack_fn(_ternary_backend)
+            self._train_w_packed = pack(w_int8)
+            self._train_w_packed_t = pack(w_int8.t().contiguous())
         elif self._fp8_mode != "off":
             self._train_w_int8 = w_int8.contiguous()
             self._train_w_fp8 = w_int8.to(_FP8_E4M3).contiguous()
@@ -1451,7 +2032,8 @@ class BitLinear(nn.Module):
             self._w_dq = (w_int.float() * scale).to(self.weight.dtype)
             use_packed = os.environ.get("ARBOR_PACKED_BITLINEAR_INFERENCE", "0") == "1"
             if use_packed and triton is not None and self.weight.is_cuda:
-                self._w_packed = pack_ternary_weight(w_int)
+                pack = _ternary_pack_fn(_ternary_backend)
+                self._w_packed = pack(w_int)
             else:
                 self._w_packed = None
             self._w_scale = scale
@@ -1484,10 +2066,12 @@ class BitLinear(nn.Module):
         ):
             scale = 127.0 / x2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5).float()
             x_q = (x2.float() * scale).round().clamp(-128, 127).to(torch.int8)
+            flags = _ternary_inference_flags(_ternary_backend)
             y = _packed_linear(
                 x_q, (1.0 / scale).reshape(-1), self._w_packed, self._w_scale,
                 self.in_features, self.out_features, torch.float32,
-                grouped_decode=True,
+                backend=_packed_backend_from_flags(**flags),
+                **flags,
             ).to(x.dtype)
         else:
             y = F.linear(self._quantize_act(x2), self._w_dq)
@@ -1512,7 +2096,7 @@ class BitLinear(nn.Module):
                 w_packed,
                 w_packed_t,
                 row_scale,
-                _ternary_backend == "dot",
+                _ternary_backend,
                 (self.out_features,),
                 self.weight,
             )
@@ -1657,10 +2241,9 @@ class BitLinearGroup(nn.Module):
         self._train_w_scale = torch.cat(row_scales, dim=0).float().contiguous()
         if self._fp8_mode == "ternary":
             w_int8 = self._train_w_int8
-            self._train_w_packed = pack_ternary_weight(w_int8)
-            self._train_w_packed_t = pack_ternary_weight(
-                w_int8.t().contiguous()
-            )
+            pack = _ternary_pack_fn(_ternary_backend)
+            self._train_w_packed = pack(w_int8)
+            self._train_w_packed_t = pack(w_int8.t().contiguous())
             self._train_w_int8 = None
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
@@ -1723,7 +2306,7 @@ class BitLinearGroup(nn.Module):
                 w_packed,
                 w_packed_t,
                 row_scale,
-                _ternary_backend == "dot",
+                _ternary_backend,
                 self.out_splits,
                 *weights,
             )

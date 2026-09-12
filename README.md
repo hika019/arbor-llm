@@ -55,9 +55,10 @@ VRAM制約がある場合のみ改良int8を明示選択する。
 
 `bitlinear_fp8=bwd`はforwardを従来BF16のまま維持し、backward GEMMだけをFP8化する。
 `bitlinear_fp8=int8`はnativeな
-`A8 INT8 × ternary INT8 → INT32 accumulation` forwardを使い、backwardは
+`A8 INT8 × ternary INT8 → INT32 accumulation` forwardを使う。既定の
+`bitlinear_fp8=ternary`は2bit packed weightをkernel内でdecodeし、backwardは
 optimizer step単位でcacheしたFP8 weightのN×K/K×N両layoutを使う。sm89+ (RTX
-4090/5090) で動く。既定 `configs/arbor.yaml` はこのint8経路 + patch_size=16 +
+4090/5090) で動く。既定 `configs/arbor.yaml` はこのpacked経路 + patch_size=16 +
 固定dim mean pooling + local encoder/decoder=1/2層で構成している。
 INT8 GEMMは`speed.bitlinear_int8_backend: auto|int_mm|triton`でA/Bできる。
 
@@ -66,9 +67,16 @@ INT8 GEMMは`speed.bitlinear_int8_backend: auto|int_mm|triton`でA/Bできる。
 document境界を跨ぐpatchを作らない。また新document先頭ではglobal residual入力も
 BOSへresetし、attention mask外のresidual経路から前文書が漏れるのを防ぐ。
 
-`grad_accum_steps>1`ではCUDA Graphsを使う`compile_mode=reduce-overhead`および
-`max-autotune`を起動時に拒否する。`default`または
-`max-autotune-no-cudagraphs`を使う。
+`grad_accum_steps>1`でCUDA Graphsを使う`compile_mode=reduce-overhead`または
+`max-autotune`を選ぶ場合は、parameter gradをgraph外の固定bufferとして事前確保し、
+各micro-step前にCUDAGraph Treesのstep境界を明示する。これにより次のforward replayが
+累積途中のgrad storageを上書きすることを防ぐ。固定buffer分のVRAMは起動時から確保される。
+`default`と`max-autotune-no-cudagraphs`は従来どおりCUDA Graphsを使わない。
+既定の1B/8k構成では `custom_op + auto + reduce-overhead` を使う。RTX 4090で
+A-B-B-A各120 step（step 21--120集計）した結果、旧
+`dot_current + legacy_raw + default`比で `bytes/s +19.0%`、step time `-16.1%`。
+peak allocatedは同等（10.92 vs 10.94 GiB）だが、Graph用poolによりpeak reservedは
+14.45 GiB（旧11.14 GiB）へ増える。
 
 checkpoint stepでは、まずmodel/optimizer/scheduler/dataloaderを含むrecovery
 checkpointを完全にpublishし、その後にvalidationを実行する。validation成功後は
@@ -234,13 +242,29 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   FP8化する`full`は追加丸めと速度低下があり得るため既定では使わない。
 - `speed.bitlinear_fp8: ternary` は実験的な学習経路。optimizer step後に
   forward用とdX用のternary weightをそれぞれ2bit（4 weights/byte）へpackし、
-  Triton kernel内でdecodeする。既定の `speed.bitlinear_ternary_backend: dot_current` は
-  旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
-  `dot` は4-way grouped decode比較用。dWは
+  Triton kernel内でdecodeする。`kmajor_single_dot` は packed weight を
+  `[K/4,N]` のGEMM向けlayoutから1回loadし、4 weightへregister内decode後、
+  dense INT8 fragmentへinterleaveして `tl.dot` を1回だけ呼ぶ。
+  `speed.bitlinear_ternary_backend` は計算backendだけを固定し、
+  `speed.bitlinear_ternary_tuning: auto` が実行GPU上でlaunch tileを測定する。
+  結果はGPU/torch/CUDA/Triton/kernel-versionを含むfingerprintで
+  `${XDG_CACHE_HOME:-~/.cache}/arbor/packed_ternary_autotune.json` に保存される。
+  `fixed`（`bitlinear_ternary_fixed_tile: BM,BN,BK,WARPS,STAGES` 必須）と
+  conservative configを使う`off`もdebug/reproduction用に選べる。
+  現行mean-pooling構成の実学習A-B-B-Aでは、`custom_op + auto`をCUDA Graphsで
+  captureする経路がlegacy/defaultより約19%高いthroughputを再現したため、これを
+  既定にする。`legacy_raw`は旧shape heuristicをraw Tritonで再現するrollback経路、
+  `raw`は固定tileの境界A/B用である。cache生成後は`raw_plan`を
+  選ぶと、fingerprintが一致する全shapeの固定launch planをcompile前に読み込み、
+  hot path内のcustom opとresolverを外せる。plan missは暗黙fallbackせずエラーにする。
+  設定契約は`legacy_* = dot_current + off`、`raw = fixed`、
+  `raw_plan = auto + cache`である。
+  `dot_current` は旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
+  `kmajor_current` はlayout単独比較、`dot` は4-way grouped decode比較用。dWは
   `speed.bitlinear_ternary_wgrad_backend: int8|fp8|auto` で選択できる。
   `int8` は `Q(dY)^T Q(X)` のdense INT8 GEMM、`fp8` はtensorwise FP8 GEMM、
   `auto` は現在の代表shape測定に基づき `N>=K` でFP8、それ以外でINT8を使う。
-  end-to-end検証前のため既定は従来通り `int8`。ternary自体も既定値にはしていない。
+  現行1B/8k構成ではpacked ternaryと`fp8` dWを既定にする。
 - `model.global_attn_impl: flex` は CUDA + `torch.compile` 必須。条件を満たさない
   場合はエラーになり、SDPAへ暗黙フォールバックしない。
 - `optim.state_precision: fp32` が既定。実データ1000-stepでloss 1.89まで安定して低下。
@@ -248,6 +272,10 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   無スケール`bf8`は発散を確認しており、実験用途以外では使わない。
 - `speed.sync_each_step: false` が既定。毎 step の `torch.cuda.synchronize()` は行わず、
   ログ/保存など scalar 化が必要な箇所でのみ同期する。
+- 性能A/Bには `--benchmark-steps N` を使う。指定optimizer step数だけ実行し、
+  checkpoint、validation、sampling、probeを省略する。終了時にCUDA peak
+  allocated/reserved memoryも表示し、metricsは通常runと混ぜず
+  `logs/benchmark_*.jsonl`へ保存する。
 - ログの throughput は `bytes/s`。entropy/space patching では `patches/s`,
   `bytes/patch`, `patches/seq`, `max_patch/seq`, `patch_headroom` も出す。
   `ByteLM_ms` / `patching_ms` / `Arbor_ms` は `profile_sections_every_steps` 間隔で
