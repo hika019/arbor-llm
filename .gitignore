@@ -39,6 +39,7 @@ Thumbs.db
 !arbor_packed_ternary_runtime_tuning_design.md
 !arbor_packed_ternary_runtime_tuning_findings.md
 !arbor_bitnet_launch_bound_investigation.md
+!arbor_launch_gap_analysis.md
 
 # logs
 *.log
