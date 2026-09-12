@@ -57,6 +57,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.model.ternary_pack import fused_pack_supported, pack_ternary_cache_
 from src.model.bitlinear_tuning import (
     PackedLaunchConfig,
     TuneKey,
@@ -130,13 +131,21 @@ def weight_quant(w: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return (w / scale).round().clamp(-1, 1) * scale
 
 
+_TERNARY_EPS = 1e-5
+
+
+def ternary_scale(w: torch.Tensor, eps: float = _TERNARY_EPS) -> torch.Tensor:
+    """absmean scale を shadow weight 自身の dtype で返す (0-d)."""
+    # 既定fake-quant経路と量子化境界・BF16丸めを一致させるため、absmeanと
+    # divisionはshadow weight自身のdtypeで行う。
+    return w.detach().abs().mean().clamp_min(eps)
+
+
 def ternary_quantize_int8(
-    w: torch.Tensor, eps: float = 1e-5
+    w: torch.Tensor, eps: float = _TERNARY_EPS
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """BF16/FP32 shadow weight を INT8 ternary と FP32 scalar scale に分解する."""
-    # 既定fake-quant経路と量子化境界・BF16丸めを一致させるため、absmeanと
-    # divisionはshadow weight自身のdtypeで行う。scaleだけcache用にFP32保持する。
-    scale = w.detach().abs().mean().clamp_min(eps)
+    scale = ternary_scale(w, eps)
     w_int8 = (w.detach() / scale).round().clamp(-1, 1).to(torch.int8)
     return w_int8, scale.float()
 
@@ -1201,6 +1210,76 @@ def _ternary_pack_fn(backend: str):
     return pack_ternary_weight
 
 
+def _ternary_pack_view_fn(backend: str):
+    """`_ternary_pack_fn` と同じ内容を、最終 layout の view (非連続可) で返す."""
+    if backend in ("kmajor_current", "kmajor_single_dot"):
+        return lambda w_q: pack_ternary_weight(w_q).t()
+    return pack_ternary_weight
+
+
+def _ternary_cache_shapes(
+    n: int, k: int, backend: str
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """backend の (packed, packed_t) cache shape."""
+    k4, n4 = math.ceil(k / 4), math.ceil(n / 4)
+    if backend in ("kmajor_current", "kmajor_single_dot"):
+        return (k4, n), (n4, k)
+    return (n, k4), (k, n4)
+
+
+def _fused_ternary_refresh_ready(
+    weight: torch.Tensor,
+    packed: torch.Tensor | None,
+    packed_t: torch.Tensor | None,
+    row_scale: torch.Tensor | None,
+    n_total: int,
+    backend: str,
+) -> bool:
+    """確保済み cache へ fused Triton kernel で直接書けるか.
+
+    初回 (buffer 未確保) や backend 変更で shape が合わない場合は純 PyTorch 経路で
+    確保し直す。CPU / Triton 無しでも同じ経路に落ちる。
+    """
+    if packed is None or packed_t is None or row_scale is None:
+        return False
+    if not fused_pack_supported(weight):
+        return False
+    expected, expected_t = _ternary_cache_shapes(n_total, weight.shape[1], backend)
+    return (
+        tuple(packed.shape) == expected
+        and tuple(packed_t.shape) == expected_t
+        and packed.is_contiguous()
+        and packed_t.is_contiguous()
+        and row_scale.dtype == torch.float32
+        and tuple(row_scale.shape) == (n_total,)
+        and row_scale.is_contiguous()
+    )
+
+
+def _refresh_cache_tensor(
+    current: torch.Tensor | None, value: torch.Tensor
+) -> torch.Tensor:
+    """訓練用 low-bit cache を device address を保ったまま更新する.
+
+    cache buffer は torch.compile した forward/backward の static input で、
+    CUDA Graph は capture 時の address を graph に焼き込む。毎 optimizer step で
+    新しい tensor に差し替えると address が変わり、CUDA Graph Trees は
+    forward/backward を再 capture する (1 update あたり数百 ms の GPU idle)。
+    既存 buffer と shape/dtype/device が一致する限り in-place copy で更新し、
+    初回 (または shape 変更時) だけ新規確保する。``value`` は非連続 view でも
+    よく、copy_ が transpose を含めて 1 kernel で書き込む。
+    """
+    if (
+        current is not None
+        and current.shape == value.shape
+        and current.dtype == value.dtype
+        and current.device == value.device
+    ):
+        current.copy_(value)
+        return current
+    return value.contiguous()
+
+
 def set_bitlinear_int8_backend(backend: str) -> str:
     """native INT8 forward backendを選ぶ (process-global, compile前に設定)."""
     global _int8_backend
@@ -1908,26 +1987,54 @@ class BitLinear(nn.Module):
 
     @torch.no_grad()
     def refresh_training_weight_cache(self) -> None:
+        # 各 buffer は _refresh_cache_tensor で address を保って更新する
+        # (CUDA Graph static input の再 capture 防止)。
         if not self._train_cache_enabled:
             return
+        if self._fp8_mode == "ternary" and _fused_ternary_refresh_ready(
+            self.weight,
+            self._train_w_packed,
+            self._train_w_packed_t,
+            self._train_w_scale,
+            self.out_features,
+            _ternary_backend,
+        ):
+            # 2 layout + row scale を 1 kernel で既存 buffer へ書く (launch 数削減)。
+            pack_ternary_cache_(
+                self.weight.detach(),
+                ternary_scale(self.weight),
+                self._train_w_packed,
+                self._train_w_packed_t,
+                self._train_w_scale,
+                backend=_ternary_backend,
+            )
+            return
         w_int8, scale = ternary_quantize_int8(self.weight)
-        row_scale = scale.expand(self.out_features).contiguous()
-        self._train_w_scale = row_scale
+        self._train_w_scale = _refresh_cache_tensor(
+            self._train_w_scale, scale.expand(self.out_features)
+        )
         if self._fp8_mode == "ternary":
             self._train_w_int8 = None
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
-            pack = _ternary_pack_fn(_ternary_backend)
-            self._train_w_packed = pack(w_int8)
-            self._train_w_packed_t = pack(w_int8.t().contiguous())
+            pack = _ternary_pack_view_fn(_ternary_backend)
+            self._train_w_packed = _refresh_cache_tensor(
+                self._train_w_packed, pack(w_int8)
+            )
+            self._train_w_packed_t = _refresh_cache_tensor(
+                self._train_w_packed_t, pack(w_int8.t().contiguous())
+            )
         elif self._fp8_mode != "off":
-            self._train_w_int8 = w_int8.contiguous()
-            self._train_w_fp8 = w_int8.to(_FP8_E4M3).contiguous()
-            self._train_w_fp8_t = self._train_w_fp8.t().contiguous()
+            self._train_w_int8 = _refresh_cache_tensor(self._train_w_int8, w_int8)
+            w_fp8 = w_int8.to(_FP8_E4M3)
+            self._train_w_fp8 = _refresh_cache_tensor(self._train_w_fp8, w_fp8)
+            self._train_w_fp8_t = _refresh_cache_tensor(
+                self._train_w_fp8_t, w_fp8.t()
+            )
             self._train_w_packed = None
             self._train_w_packed_t = None
         else:
-            self._train_w_int8 = w_int8.contiguous()
+            self._train_w_int8 = _refresh_cache_tensor(self._train_w_int8, w_int8)
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
             self._train_w_packed = None
@@ -2231,28 +2338,67 @@ class BitLinearGroup(nn.Module):
     def refresh_training_weight_cache(self) -> None:
         if not self._train_cache_enabled:
             return
+        members = tuple(self.members())
+        if (
+            self._fp8_mode == "ternary"
+            and all(member.out_features % 4 == 0 for member in members)
+            and _fused_ternary_refresh_ready(
+                members[0].weight,
+                self._train_w_packed,
+                self._train_w_packed_t,
+                self._train_w_scale,
+                sum(member.out_features for member in members),
+                _ternary_backend,
+            )
+        ):
+            # member ごとに連結 buffer の行 slice へ直接書く。member 境界が 4 行
+            # 単位に揃う場合だけで、それ以外は連結してから pack する経路を使う。
+            n_offset = 0
+            for member in members:
+                pack_ternary_cache_(
+                    member.weight.detach(),
+                    ternary_scale(member.weight),
+                    self._train_w_packed,
+                    self._train_w_packed_t,
+                    self._train_w_scale,
+                    backend=_ternary_backend,
+                    n_offset=n_offset,
+                )
+                n_offset += member.out_features
+            return
         quantized: list[torch.Tensor] = []
         row_scales: list[torch.Tensor] = []
-        for member in self.members():
+        for member in members:
             w_int8, scale = ternary_quantize_int8(member.weight)
             quantized.append(w_int8)
             row_scales.append(scale.expand(member.out_features))
-        self._train_w_int8 = torch.cat(quantized, dim=0).contiguous()
-        self._train_w_scale = torch.cat(row_scales, dim=0).float().contiguous()
+        w_int8 = torch.cat(quantized, dim=0)
+        # BitLinear と同じく address を保って更新する (CUDA Graph 再 capture 防止)。
+        self._train_w_scale = _refresh_cache_tensor(
+            self._train_w_scale, torch.cat(row_scales, dim=0).float()
+        )
         if self._fp8_mode == "ternary":
-            w_int8 = self._train_w_int8
-            pack = _ternary_pack_fn(_ternary_backend)
-            self._train_w_packed = pack(w_int8)
-            self._train_w_packed_t = pack(w_int8.t().contiguous())
+            pack = _ternary_pack_view_fn(_ternary_backend)
+            self._train_w_packed = _refresh_cache_tensor(
+                self._train_w_packed, pack(w_int8)
+            )
+            self._train_w_packed_t = _refresh_cache_tensor(
+                self._train_w_packed_t, pack(w_int8.t().contiguous())
+            )
             self._train_w_int8 = None
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
         elif self._fp8_mode != "off":
-            self._train_w_fp8 = self._train_w_int8.to(_FP8_E4M3).contiguous()
-            self._train_w_fp8_t = self._train_w_fp8.t().contiguous()
+            self._train_w_int8 = _refresh_cache_tensor(self._train_w_int8, w_int8)
+            w_fp8 = w_int8.to(_FP8_E4M3)
+            self._train_w_fp8 = _refresh_cache_tensor(self._train_w_fp8, w_fp8)
+            self._train_w_fp8_t = _refresh_cache_tensor(
+                self._train_w_fp8_t, w_fp8.t()
+            )
             self._train_w_packed = None
             self._train_w_packed_t = None
         else:
+            self._train_w_int8 = _refresh_cache_tensor(self._train_w_int8, w_int8)
             self._train_w_fp8 = None
             self._train_w_fp8_t = None
             self._train_w_packed = None

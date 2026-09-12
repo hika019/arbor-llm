@@ -41,6 +41,7 @@ Thumbs.db
 !arbor_bitnet_launch_bound_investigation.md
 !arbor_training_fusion_20260912.md
 !arbor_launch_gap_analysis.md
+!arbor_gpu_idle_root_cause_20260912.md
 
 # logs
 *.log
