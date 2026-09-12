@@ -487,7 +487,9 @@ def test_render_packed_tuning_report_builds_markdown(tmp_path):
     assert "winner_sources: arbor_base" in report
     assert "candidate_count: 54" in report
     assert "failed_count: 1" in report
-    assert "128x64x64 warps=4 stages=2" in report
+    assert "candidate ranking (coarse median, ascending)" in report
+    assert "**(winner)**" in report
+    assert "| 2 | 128x64x64 | 4 | 2 | 0.3 | - | arbor_base |" in report
 
 
 def test_nonzero_rank_does_not_measure_and_raises_on_miss(monkeypatch):
@@ -617,3 +619,39 @@ def test_preflight_rank0_failure_is_broadcast(monkeypatch):
             [(_key(), lambda config: config)], device=_device(), software=_software()
         )
     assert broadcast_status["status"]["ok"] is False
+
+
+def test_preflight_callable_rank0_only_tunes(monkeypatch):
+    import src.model.bitlinear_tuning as btl
+
+    tuned: list[bool] = []
+    reloaded: list[bool] = []
+    monkeypatch.setattr(btl, "_distributed_rank", lambda: 0)
+
+    def tune_all():
+        tuned.append(True)
+
+    monkeypatch.setattr(btl._GLOBAL_TUNER, "reload_persistent_cache", lambda: reloaded.append(True))
+    monkeypatch.setattr(btl.torch.distributed, "broadcast_object_list", lambda obj, src=0: None)
+    monkeypatch.setattr(btl.torch.distributed, "barrier", lambda: None)
+
+    btl.packed_ternary_preflight_callable(tune_all)
+    assert tuned == [True]
+    assert reloaded == [True]
+
+
+def test_preflight_callable_nonzero_does_not_tune(monkeypatch):
+    import src.model.bitlinear_tuning as btl
+
+    reloaded: list[bool] = []
+    monkeypatch.setattr(btl, "_distributed_rank", lambda: 1)
+
+    def must_not_tune():
+        raise AssertionError("non-zero rank must not tune")
+
+    monkeypatch.setattr(btl._GLOBAL_TUNER, "reload_persistent_cache", lambda: reloaded.append(True))
+    monkeypatch.setattr(btl.torch.distributed, "broadcast_object_list", lambda obj, src=0: None)
+    monkeypatch.setattr(btl.torch.distributed, "barrier", lambda: None)
+
+    btl.packed_ternary_preflight_callable(must_not_tune)
+    assert reloaded == [True]

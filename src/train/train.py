@@ -76,6 +76,54 @@ def uses_cudagraph_compile(speed: dict) -> bool:
     ) in _CUDAGRAPH_COMPILE_MODES
 
 
+def initialize_distributed() -> None:
+    """Initialize the default process group when launched under torchrun."""
+    if os.environ.get("RANK") is None or os.environ.get("WORLD_SIZE") is None:
+        return
+    if not torch.distributed.is_available() or torch.distributed.is_initialized():
+        return
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    torch.distributed.init_process_group(backend=backend)
+
+
+def _distributed_rank() -> int | None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return None
+
+
+def _preflight_packed_ternary_tuning(
+    base_model: torch.nn.Module,
+    device: torch.device,
+    cfg: dict,
+) -> None:
+    """Populate the packed-ternary tune cache on rank 0 before compile."""
+    if _distributed_rank() is None:
+        return  # single process autotunes lazily as before
+    speed_cfg = cfg.get("speed", {})
+    if str(speed_cfg.get("bitlinear_ternary_tuning", "off")).lower() != "auto":
+        return
+    from src.model.bitlinear_tuning import packed_ternary_preflight_callable
+
+    model_cfg = cfg.get("model", {})
+    micro_batch = int(speed_cfg.get("micro_batch_size", 2))
+    context = int(model_cfg.get("max_bytes", 8192))
+    vocab = int(model_cfg.get("vocab_size", 260))
+
+    def tune_on_rank0() -> None:
+        if _distributed_rank() == 0:
+            base_model.train(True)
+            input_ids = torch.randint(
+                4, vocab, (micro_batch, context), device=device, dtype=torch.long
+            )
+            base_model(input_ids).logits.float().mean().backward()
+            base_model.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+    packed_ternary_preflight_callable(tune_on_rank0)
+
+
 def prepare_cudagraph_gradient_buffers(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -919,6 +967,7 @@ def main() -> int:
 
     requested_device = str(cfg.get("speed", {}).get("device", "auto"))
     device = pick_device(requested_device)
+    initialize_distributed()
     cfg = adapt_config_for_device(cfg, device)
     torch.manual_seed(cfg.get("seed", 42))
     apply_speed_settings(cfg.get("speed", {}))
@@ -1075,6 +1124,7 @@ def main() -> int:
             f"ternary_wgrad_backend={ternary_wgrad_backend} "
             f"layers={fp8_info['layers']}"
         )
+        _preflight_packed_ternary_tuning(base_model, device, cfg)
 
     model = apply_compile_settings(model, cfg["speed"], device)
     validation_compile_cfg = (

@@ -217,12 +217,14 @@ class CandidateTiming:
     config: PackedLaunchConfig
     median_ms: float
     sources: frozenset[str] = frozenset()
+    precise_median_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "config": self.config.to_dict(),
             "median_ms": self.median_ms,
             "sources": sorted(self.sources),
+            "precise_median_ms": self.precise_median_ms,
         }
 
 
@@ -854,13 +856,15 @@ class PackedTernaryTuner:
 
             timings.sort(key=lambda item: item[0])
             median_ms, winner = timings[0]
+            precise_by_config = {config: ms for ms, config in timings}
             record_timings = tuple(
                 CandidateTiming(
                     config=config,
-                    median_ms=ms,
+                    median_ms=coarse_ms,
                     sources=candidate_map[config],
+                    precise_median_ms=precise_by_config.get(config),
                 )
-                for ms, config in timings
+                for coarse_ms, config in coarse
             )
             record_failures = tuple(
                 CandidateFailure(config=config, reason=reason)
@@ -1100,6 +1104,41 @@ def packed_ternary_preflight(
     _GLOBAL_TUNER.reload_persistent_cache()
 
 
+def packed_ternary_preflight_callable(tune_all: Callable[[], None]) -> None:
+    """Run ``tune_all`` on rank 0 only, then synchronize all ranks.
+
+    Unlike :func:`packed_ternary_preflight`, this accepts a side-effecting
+    callable (for example a dummy forward/backward that triggers the lazy
+    ``resolve`` autotune path) instead of an explicit key/launcher map.  That
+    is the integration point most convenient for training, where the actual
+    ``TuneKey`` set is discovered only when the packed ops first execute.
+    """
+    rank = _distributed_rank()
+    if rank is None:
+        tune_all()
+        return
+
+    status: dict[str, Any] = {"ok": True, "error": None}
+    if rank == 0:
+        try:
+            tune_all()
+        except Exception as exc:
+            status = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        else:
+            status = {"ok": True, "error": None}
+
+    status_list: list[dict[str, Any]] = [status]
+    torch.distributed.broadcast_object_list(status_list, src=0)
+    torch.distributed.barrier()
+
+    if not status_list[0]["ok"]:
+        raise RuntimeError(
+            "packed ternary autotune failed on global rank 0: "
+            f"{status_list[0]['error']}"
+        )
+    _GLOBAL_TUNER.reload_persistent_cache()
+
+
 def load_packed_tuning_plan(
     cache_path: str | os.PathLike[str] | None = None,
     *,
@@ -1211,8 +1250,12 @@ def render_packed_tuning_report(
         )
         lines.append(f"- boundary_winner: {bool(boundary)}")
         if isinstance(timings, list) and timings:
-            lines.append("- top timings:")
-            for position, item in enumerate(timings[:5], start=1):
+            lines.append("- candidate ranking (coarse median, ascending):")
+            lines.append(
+                "| rank | tile | warps | stages | coarse_ms | precise_ms | sources |"
+            )
+            lines.append("|---|---:|---|---:|---:|---:|---|")
+            for position, item in enumerate(timings, start=1):
                 if not isinstance(item, dict):
                     continue
                 try:
@@ -1220,15 +1263,29 @@ def render_packed_tuning_report(
                 except (KeyError, TypeError, ValueError):
                     continue
                 median = item.get("median_ms")
+                precise = item.get("precise_median_ms")
                 item_sources = _sources_from_json(item.get("sources"))
+                winner_mark = " **(winner)**" if config == winner else ""
                 lines.append(
-                    f"  {position}. {config.tile_string} "
-                    f"warps={config.num_warps} stages={config.num_stages} "
-                    f"median={median if isinstance(median, (int, float)) else '?'}ms "
-                    f"sources={','.join(sorted(item_sources)) or '-'}"
+                    f"| {position} | {config.tile_string} | {config.num_warps} | "
+                    f"{config.num_stages} | "
+                    f"{median if isinstance(median, (int, float)) else '?'} | "
+                    f"{precise if isinstance(precise, (int, float)) else '-'} | "
+                    f"{','.join(sorted(item_sources)) or '-'}{winner_mark} |"
                 )
         if isinstance(failures, list) and failures:
             lines.append(f"- failed_count: {len(failures)}")
+            for failure in failures:
+                if not isinstance(failure, dict):
+                    continue
+                try:
+                    config = PackedLaunchConfig.from_dict(failure["config"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                lines.append(
+                    f"  - {config.tile_string} warps={config.num_warps} "
+                    f"stages={config.num_stages}: {failure.get('reason', 'failed')}"
+                )
         lines.append("")
 
     if matched == 0:
