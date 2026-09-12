@@ -280,3 +280,28 @@ activation ではなく **gradient accumulation の grad 生存契約**と Graph
 - `legacy` にすると過剰圧縮が緩和されたという利用時観測 (未体系比較)。
 - BitNet 性能調査とは混ぜず、品質指標・速度/memory trade-off を分離して追試する。
 - 現在の標準 config は指示により `mean` のまま。未解決の低優先課題。
+
+## 9. Gated-FFN fusion PoC (2026-09-12)
+
+RTX 4090上で、`M×K×I = 1024/2048/4096 × 2048 × 5632`、BF16 output、
+tile `64×64×64`、warps=4、stages=2、warmup=10/iters=100を単一GPUで直列計測した。
+従来の `_packed_linear()` reference（runtime tuning/cacheを含み得る）とは別に、
+同じprequantized A8 input、K-major packed weight、scale、固定tileを使う
+`_packed_linear_execute()` ×2 + ReLU²/multiply の raw-vs-raw 比較を追加した。
+
+| M | production-path speedup | fixed raw-vs-raw speedup |
+|---:|---:|---:|
+| 1024 | 2.210× | 1.080× |
+| 2048 | 1.108× | 1.356× |
+| 4096 | 3.032× | 1.487× |
+
+M=1024 raw-vs-rawは再測でも1.189×（fixed ref 0.2836 ms、fused 0.2386 ms）であり、
+5% kernel-level閾値は満たす。一方でfused対fixed rawのM=1024数値差は最大相対
+2.027%、平均相対0.165%（最大absolute 8192）だった。これはBF16/accumulation順序の
+影響と推測できるが、semantic proofではない。またPoCはforward-only raw kernelであり、
+学習に必要なinput/weightのbackwardとSTEをまだ持たない。
+
+したがって**現時点では学習経路へ統合しない**。次段階は既存BitNet pathに対する
+許容誤差の定義、forward/backward/optimizer-step equivalence test、そしてend-to-end
+training impactの測定である。ベンチはkernel ceilingを示すものでproduction speedupを
+保証しない。

@@ -24,10 +24,12 @@ import triton.language as tl
 
 from src.model.bitlinear import (
     _packed_linear,
+    _packed_linear_execute,
     _quantize_a8_rows,
     pack_ternary_weight_kmajor,
     ternary_quantize_int8,
 )
+from src.model.bitlinear_tuning import PackedLaunchConfig
 
 
 @triton.jit
@@ -118,6 +120,7 @@ def fused_gated_ffn(
 
 
 def reference_gated_ffn(x_q, inv_sx, wg_packed, wu_packed, swg, swu, k, i, dtype):
+    """Existing production-path reference, including its runtime tuning path."""
     gate = _packed_linear(
         x_q, inv_sx, wg_packed, swg, k, i, dtype,
         grouped_decode=False, kmajor_layout=True, decode_v2=True,
@@ -129,6 +132,30 @@ def reference_gated_ffn(x_q, inv_sx, wg_packed, wu_packed, swg, swu, k, i, dtype
         grouped_decode=False, kmajor_layout=True, decode_v2=True,
         backend="kmajor_single_dot",
         launch_config=None,
+    )
+    a = torch.relu(gate)
+    return a * a * up
+
+
+def fixed_reference_gated_ffn(
+    x_q, inv_sx, wg_packed, wu_packed, swg, swu, k, i, dtype, launch_spec
+):
+    """Two fixed raw packed GEMMs plus the FFN epilogue.
+
+    This deliberately bypasses ``_packed_linear``'s runtime tuning/cache path.
+    It is the apples-to-apples kernel ceiling reference for ``fused_gated_ffn``:
+    both paths consume the same already-quantized activation, K-major packed
+    ternary weights, and per-row/per-output scales.
+    """
+    gate = _packed_linear_execute(
+        x_q, inv_sx, wg_packed, swg, k, i, dtype,
+        grouped_decode=False, kmajor_layout=True, decode_v2=True,
+        backend="kmajor_single_dot", launch_spec=launch_spec,
+    )
+    up = _packed_linear_execute(
+        x_q, inv_sx, wu_packed, swu, k, i, dtype,
+        grouped_decode=False, kmajor_layout=True, decode_v2=True,
+        backend="kmajor_single_dot", launch_spec=launch_spec,
     )
     a = torch.relu(gate)
     return a * a * up
@@ -159,6 +186,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", type=str, default="2048,2048,5632", help="M,K,I")
     parser.add_argument("--tile", type=str, default="64,64,64")
+    parser.add_argument(
+        "--fixed-reference-tile",
+        type=str,
+        default=None,
+        help="BM,BN,BK for the raw fixed reference (default: --tile)",
+    )
     parser.add_argument("--warps", type=int, default=4)
     parser.add_argument("--stages", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=10)
@@ -169,6 +202,22 @@ def main() -> int:
         raise SystemExit("CUDA is required")
     m, k, i = (int(part) for part in args.shape.split(","))
     bm, bn, bk = (int(part) for part in args.tile.split(","))
+    ref_tile = args.fixed_reference_tile or args.tile
+    rbm, rbn, rbk = (int(part) for part in ref_tile.split(","))
+    # Validate the reference launch eagerly, so a malformed CLI tile cannot
+    # silently turn the purported fixed raw comparison into a different path.
+    fixed_reference_config = PackedLaunchConfig(
+        rbm, rbn, rbk, args.warps, args.stages
+    )
+    if rbk % 4:
+        raise ValueError("--fixed-reference-tile BK must be divisible by 4")
+    fixed_reference_spec = (
+        fixed_reference_config.block_m,
+        fixed_reference_config.block_n,
+        fixed_reference_config.block_k,
+        fixed_reference_config.num_warps,
+        fixed_reference_config.num_stages,
+    )
     dtype = torch.bfloat16
     torch.manual_seed(0)
 
@@ -184,26 +233,54 @@ def main() -> int:
     fused = fused_gated_ffn(x_q, inv_sx, wg_packed, wu_packed, swg, swu, k=k, i=i,
                             block_m=bm, block_n=bn, block_k=bk,
                             num_warps=args.warps, num_stages=args.stages)
-    ref = reference_gated_ffn(x_q, inv_sx, wg_packed, wu_packed, swg, swu, k, i, dtype)
+    production_ref = reference_gated_ffn(
+        x_q, inv_sx, wg_packed, wu_packed, swg, swu, k, i, dtype
+    )
+    fixed_ref = fixed_reference_gated_ffn(
+        x_q, inv_sx, wg_packed, wu_packed, swg, swu, k, i, dtype,
+        fixed_reference_spec,
+    )
     if not args.no_check:
-        diff = (fused.float() - ref.float()).abs()
-        print(f"[check] gated_ffn_relu2 max_abs_diff={diff.max().item():.6g} "
-              f"mean_abs_diff={diff.mean().item():.6g}")
+        for name, ref in (("production", production_ref), ("fixed_raw", fixed_ref)):
+            diff = (fused.float() - ref.float()).abs()
+            relative = diff / ref.float().abs().clamp_min(1.0)
+            print(f"[check] fused_vs_{name} gated_ffn_relu2 "
+                  f"max_abs_diff={diff.max().item():.6g} "
+                  f"mean_abs_diff={diff.mean().item():.6g} "
+                  f"max_rel_diff={relative.max().item():.6g} "
+                  f"mean_rel_diff={relative.mean().item():.6g}")
 
-    ref_t = _measure(lambda: reference_gated_ffn(x_q, inv_sx, wg_packed, wu_packed,
-                                                  swg, swu, k, i, dtype),
-                    warmup=args.warmup, iters=args.iters)
+    production_ref_t = _measure(
+        lambda: reference_gated_ffn(x_q, inv_sx, wg_packed, wu_packed,
+                                    swg, swu, k, i, dtype),
+        warmup=args.warmup, iters=args.iters,
+    )
+    fixed_ref_t = _measure(
+        lambda: fixed_reference_gated_ffn(
+            x_q, inv_sx, wg_packed, wu_packed, swg, swu, k, i, dtype,
+            fixed_reference_spec,
+        ),
+        warmup=args.warmup, iters=args.iters,
+    )
     fused_t = _measure(lambda: fused_gated_ffn(x_q, inv_sx, wg_packed, wu_packed,
                                                 swg, swu, k=k, i=i, block_m=bm,
                                                 block_n=bn, block_k=bk,
                                                 num_warps=args.warps, num_stages=args.stages),
                       warmup=args.warmup, iters=args.iters)
     print(f"[A/B] shape={m}x{k}x{i} tile={bm}x{bn}x{bk} warps={args.warps} stages={args.stages}")
-    print(f"  reference 2xGEMM+act  median={ref_t['median']:.4f}ms "
-          f"p10={ref_t['p10']:.4f} p90={ref_t['p90']:.4f}")
+    print("[production-path result] reference uses _packed_linear runtime tuning/cache")
+    print(f"  production 2xGEMM+act median={production_ref_t['median']:.4f}ms "
+          f"p10={production_ref_t['p10']:.4f} p90={production_ref_t['p90']:.4f}")
     print(f"  fused gate/up+relu2  median={fused_t['median']:.4f}ms "
           f"p10={fused_t['p10']:.4f} p90={fused_t['p90']:.4f}")
-    print(f"  speedup={ref_t['median'] / fused_t['median']:.3f}x")
+    print(f"  speedup={production_ref_t['median'] / fused_t['median']:.3f}x")
+    print("[kernel-ceiling raw-vs-raw] both paths use fixed, prequantized K-major inputs")
+    print(f"  fixed reference 2xGEMM+act tile={fixed_reference_config.tile_string} "
+          f"median={fixed_ref_t['median']:.4f}ms p10={fixed_ref_t['p10']:.4f} "
+          f"p90={fixed_ref_t['p90']:.4f}")
+    print(f"  fused gate/up+relu2 tile={bm}x{bn}x{bk} median={fused_t['median']:.4f}ms "
+          f"p10={fused_t['p10']:.4f} p90={fused_t['p90']:.4f}")
+    print(f"  kernel-ceiling speedup={fixed_ref_t['median'] / fused_t['median']:.3f}x")
     return 0
 
 

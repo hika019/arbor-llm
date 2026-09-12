@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 # torch import / CUDA 初期化より前に効かせる必要がある env (env.sh と二重で保険).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -76,9 +77,44 @@ def uses_cudagraph_compile(speed: dict) -> bool:
     ) in _CUDAGRAPH_COMPILE_MODES
 
 
+def _torchrun_env(*, require_local_rank: bool = True) -> tuple[int, int, int] | None:
+    """Return ``(rank, world_size, local_rank)`` for a torchrun launch.
+
+    Treat a partially specified distributed environment as an error.  Silently
+    selecting CUDA:0 in that situation makes every NCCL process contend for
+    the same GPU and is considerably harder to diagnose than an early error.
+    """
+    values = {name: os.environ.get(name) for name in ("RANK", "WORLD_SIZE")}
+    local_rank_value = os.environ.get("LOCAL_RANK")
+    if not any(value is not None for value in (*values.values(), local_rank_value)):
+        return None
+    missing = [name for name, value in values.items() if value is None]
+    if require_local_rank and local_rank_value is None:
+        missing.append("LOCAL_RANK")
+    if missing:
+        raise RuntimeError(
+            "distributed launch requires RANK, WORLD_SIZE, and LOCAL_RANK; "
+            f"missing {', '.join(missing)}"
+        )
+    try:
+        rank = int(values["RANK"])
+        world_size = int(values["WORLD_SIZE"])
+        # CPU/MPS distributed runs never need CUDA binding.  Preserve their
+        # prior RANK/WORLD_SIZE-only behavior while keeping CUDA strict.
+        local_rank = 0 if local_rank_value is None else int(local_rank_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("RANK, WORLD_SIZE, and LOCAL_RANK must be integers") from exc
+    if world_size <= 0 or not 0 <= rank < world_size or local_rank < 0:
+        raise RuntimeError(
+            "invalid distributed launch coordinates: "
+            f"rank={rank} world_size={world_size} local_rank={local_rank}"
+        )
+    return rank, world_size, local_rank
+
+
 def initialize_distributed() -> None:
     """Initialize the default process group when launched under torchrun."""
-    if os.environ.get("RANK") is None or os.environ.get("WORLD_SIZE") is None:
+    if _torchrun_env(require_local_rank=False) is None:
         return
     if not torch.distributed.is_available() or torch.distributed.is_initialized():
         return
@@ -96,13 +132,13 @@ def _preflight_packed_ternary_tuning(
     base_model: torch.nn.Module,
     device: torch.device,
     cfg: dict,
-) -> None:
+) -> dict[str, float | int] | None:
     """Populate the packed-ternary tune cache on rank 0 before compile."""
     if _distributed_rank() is None:
-        return  # single process autotunes lazily as before
+        return None  # single process autotunes lazily as before
     speed_cfg = cfg.get("speed", {})
     if str(speed_cfg.get("bitlinear_ternary_tuning", "off")).lower() != "auto":
-        return
+        return None
     from src.model.bitlinear_tuning import packed_ternary_preflight_callable
 
     model_cfg = cfg.get("model", {})
@@ -110,18 +146,98 @@ def _preflight_packed_ternary_tuning(
     context = int(model_cfg.get("max_bytes", 8192))
     vocab = int(model_cfg.get("vocab_size", 260))
 
+    preflight_metrics: dict[str, float | int] | None = None
+
     def tune_on_rank0() -> None:
+        nonlocal preflight_metrics
         if _distributed_rank() == 0:
-            base_model.train(True)
-            input_ids = torch.randint(
-                4, vocab, (micro_batch, context), device=device, dtype=torch.long
+            preflight_metrics = _run_tuning_preflight_preserving_state(
+                base_model, device, micro_batch, context, vocab
             )
-            base_model(input_ids).logits.float().mean().backward()
-            base_model.zero_grad(set_to_none=True)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
 
     packed_ternary_preflight_callable(tune_on_rank0)
+    if preflight_metrics is not None:
+        print(
+            "[train] packed_ternary_preflight_memory "
+            f"peak_allocated={preflight_metrics['peak_allocated_bytes'] / 2**30:.2f}GiB "
+            f"peak_reserved={preflight_metrics['peak_reserved_bytes'] / 2**30:.2f}GiB "
+            f"delta_allocated={preflight_metrics['peak_allocated_delta_bytes'] / 2**30:.2f}GiB "
+            f"delta_reserved={preflight_metrics['peak_reserved_delta_bytes'] / 2**30:.2f}GiB"
+        )
+    # The callable intentionally returns only through rank 0; non-zero ranks
+    # reload rank-0's cache inside packed_ternary_preflight_callable.
+    return None
+
+
+def _run_tuning_preflight_preserving_state(
+    model: torch.nn.Module,
+    device: torch.device,
+    micro_batch: int,
+    context: int,
+    vocab: int,
+) -> dict[str, float | int]:
+    """Trigger lazy tuning without changing the subsequent training run.
+
+    This runs before optimizer/scheduler construction, so neither has state to
+    preserve yet.  We still restore every mutable model/RNG detail touched by
+    the dummy backward, including non-persistent buffers and pre-existing
+    gradients, rather than relying on the current Arbor implementation being
+    buffer-free.
+    """
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+    was_training = model.training
+    buffers = {name: value.detach().clone() for name, value in model.named_buffers()}
+    grads = {
+        name: None if parameter.grad is None else parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
+    baseline_allocated = baseline_reserved = 0
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        baseline_allocated = torch.cuda.memory_allocated(device)
+        baseline_reserved = torch.cuda.memory_reserved(device)
+    try:
+        model.train(True)
+        input_ids = torch.randint(
+            4, vocab, (micro_batch, context), device=device, dtype=torch.long
+        )
+        output = model(input_ids)
+        loss = output.logits.float().mean()
+        loss.backward()
+        # Explicitly release the large dummy activation graph before reporting
+        # peak memory and before compilation begins.  Do not empty_cache(): the
+        # allocator's retained blocks are normally useful to the real step.
+        del loss, output, input_ids
+        model.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            peak_allocated = torch.cuda.max_memory_allocated(device)
+            peak_reserved = torch.cuda.max_memory_reserved(device)
+        else:
+            peak_allocated = peak_reserved = 0
+        return {
+            "peak_allocated_bytes": peak_allocated,
+            "peak_reserved_bytes": peak_reserved,
+            "peak_allocated_delta_bytes": peak_allocated - baseline_allocated,
+            "peak_reserved_delta_bytes": peak_reserved - baseline_reserved,
+        }
+    finally:
+        current_buffers = dict(model.named_buffers())
+        for name, value in buffers.items():
+            # A changed/replaced buffer is a model bug worth surfacing rather
+            # than silently retaining preflight state.
+            if name not in current_buffers:
+                raise RuntimeError(f"preflight removed model buffer {name!r}")
+            current_buffers[name].copy_(value)
+        for name, parameter in model.named_parameters():
+            saved_grad = grads[name]
+            parameter.grad = None if saved_grad is None else saved_grad
+        model.train(was_training)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
 
 
 def prepare_cudagraph_gradient_buffers(
@@ -577,7 +693,7 @@ def pick_device(requested: str = "auto") -> torch.device:
                 "speed.device=cuda を指定したが CUDA は利用できません。"
                 "CPU/MPS への暗黙フォールバックは行いません"
             )
-        return torch.device("cuda")
+        return _bind_torchrun_cuda_device()
     if normalized == "mps":
         if not torch.backends.mps.is_available():
             reason = (
@@ -595,10 +711,26 @@ def pick_device(requested: str = "auto") -> torch.device:
     if normalized != "auto":
         raise ValueError(f"unknown speed.device: {requested}")
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return _bind_torchrun_cuda_device()
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _bind_torchrun_cuda_device() -> torch.device:
+    """Bind a torchrun CUDA process to its LOCAL_RANK before NCCL starts."""
+    launch = _torchrun_env()
+    if launch is None:
+        return torch.device("cuda")
+    _, _, local_rank = launch
+    device_count = torch.cuda.device_count()
+    if local_rank >= device_count:
+        raise RuntimeError(
+            "LOCAL_RANK selects an unavailable CUDA device: "
+            f"local_rank={local_rank} visible_cuda_devices={device_count}"
+        )
+    torch.cuda.set_device(local_rank)
+    return torch.device("cuda", local_rank)
 
 
 def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
@@ -973,7 +1105,15 @@ def main() -> int:
     apply_speed_settings(cfg.get("speed", {}))
     timing_mark("seed_and_speed_settings")
 
-    print(f"[train] device={device} torch={torch.__version__}")
+    launch = _torchrun_env(require_local_rank=False)
+    if launch is None:
+        print(f"[train] rank=0 world_size=1 local_rank=0 device={device} torch={torch.__version__}")
+    else:
+        rank, world_size, local_rank = launch
+        print(
+            f"[train] rank={rank} world_size={world_size} local_rank={local_rank} "
+            f"device={device} torch={torch.__version__}"
+        )
     if device.type == "cuda":
         free, total = torch.cuda.mem_get_info()
         print(f"[train] cuda_mem_free={free / 2**30:.2f}GiB total={total / 2**30:.2f}GiB")
@@ -1007,6 +1147,7 @@ def main() -> int:
     # (compile wrapper を保存すると state dict が _orig_mod. 付きになる)
     base_model = model
     bitnet_cache_info: dict | None = None
+    preflight_tune_keys: frozenset[Any] | None = None
 
     # ---- 重みのみの初期化 (--init-from): 長コンテキスト拡張などの continued pretraining ----
     # RoPE バッファは非永続 (config から再計算) なので max_bytes / rope_theta が
@@ -1036,9 +1177,11 @@ def main() -> int:
     try:
         from src.model.bitlinear import (
             configure_bitlinear_ternary_tuning,
+            clear_observed_packed_tune_keys,
             configure_bitlinear_training_cache,
             install_arbor_projection_fusions,
             refresh_bitlinear_training_cache,
+            observed_packed_tune_keys,
             set_bitlinear_fp8_mode,
             set_bitlinear_int8_backend,
             set_bitlinear_ternary_backend,
@@ -1124,7 +1267,22 @@ def main() -> int:
             f"ternary_wgrad_backend={ternary_wgrad_backend} "
             f"layers={fp8_info['layers']}"
         )
-        _preflight_packed_ternary_tuning(base_model, device, cfg)
+        if (
+            _distributed_rank() is not None
+            and str(ternary_tuning_raw).lower().replace("-", "_") == "auto"
+        ):
+            clear_observed_packed_tune_keys()
+            _preflight_packed_ternary_tuning(base_model, device, cfg)
+            # On rank 0 these are keys actually exercised by the dummy
+            # forward/backward; other ranks validate against their cache hit
+            # set on the first real step below.
+            preflight_tune_keys = observed_packed_tune_keys()
+            clear_observed_packed_tune_keys()
+            if _distributed_rank() == 0:
+                print(
+                    "[train] packed_ternary_preflight_keys="
+                    f"{len(preflight_tune_keys)}"
+                )
 
     model = apply_compile_settings(model, cfg["speed"], device)
     validation_compile_cfg = (
@@ -1861,6 +2019,25 @@ def main() -> int:
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=not preserve_grad_buffers)
             end_gpu_section("optimizer", opt_start)
+            if global_step == 0 and preflight_tune_keys is not None:
+                real_step_keys = observed_packed_tune_keys()
+                if _distributed_rank() == 0:
+                    if real_step_keys != preflight_tune_keys:
+                        raise RuntimeError(
+                            "packed ternary preflight TuneKey coverage mismatch: "
+                            "preflight="
+                            f"{sorted((key.to_dict() for key in preflight_tune_keys), key=lambda item: json.dumps(item, sort_keys=True))} "
+                            "first_step="
+                            f"{sorted((key.to_dict() for key in real_step_keys), key=lambda item: json.dumps(item, sort_keys=True))}"
+                        )
+                else:
+                    # Any missing rank-0 cache key already fails inside the
+                    # tuner.  Logging the observed set gives an actionable
+                    # confirmation that the rank did not tune lazily.
+                    print(
+                        "[train] packed_ternary_first_step_cache_keys="
+                        f"{len(real_step_keys)} rank={_distributed_rank()}"
+                    )
             if nsys_capturing:
                 torch.cuda.nvtx.range_pop()
 

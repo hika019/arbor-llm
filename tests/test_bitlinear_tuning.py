@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
+import torch
 
 from src.model.bitlinear_tuning import (
     DeviceInfo,
@@ -54,6 +56,106 @@ def _key(m: int = 1024) -> TuneKey:
     )
 
 
+def _gloo_preflight_worker(
+    rank: int,
+    world_size: int,
+    rendezvous_file: str,
+    cache_path: str,
+    result_dir: str,
+    fail_on_rank0: bool,
+) -> None:
+    """Exercise distributed preflight in a fresh CPU-only process."""
+    import json
+    import os
+    from pathlib import Path
+
+    import torch
+    import src.model.bitlinear_tuning as btl
+
+    # CI containers may not have a hostname resolvable to a local interface.
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        device = DeviceInfo(
+            device_index=0,
+            name="Gloo test device",
+            compute_capability=(9, 0),
+            total_memory=24 << 30,
+            multi_processor_count=128,
+            max_threads_per_multi_processor=1536,
+            shared_memory_per_block=64 << 10,
+            warp_size=32,
+        )
+        software = SoftwareInfo(
+            torch_version="gloo-test-torch",
+            cuda_version="gloo-test-cuda",
+            triton_version="gloo-test-triton",
+        )
+        key = TuneKey(
+            backend="kmajor_single_dot",
+            m=64,
+            k=64,
+            n=64,
+            dtype="bfloat16",
+            scale_per_output=True,
+        )
+        btl._GLOBAL_TUNER.configure(
+            PackedTuningOptions(
+                mode="auto",
+                cache_enabled=True,
+                cache_path=Path(cache_path),
+                warmup=0,
+                iterations=1,
+                coarse_iterations=1,
+                precise_candidates=1,
+            )
+        )
+        measure_calls = 0
+
+        def measure(*args, **kwargs):
+            del args, kwargs
+            nonlocal measure_calls
+            measure_calls += 1
+            if fail_on_rank0:
+                raise RuntimeError("intentional rank-0 tune failure")
+            # A deterministic CPU stand-in for CUDA event timing.  The real
+            # resolver/cache path remains intact while this keeps CI CPU-only.
+            return float(measure_calls)
+
+        btl._GLOBAL_TUNER._measure = measure
+        result: dict[str, object] = {"rank": rank, "measure_calls": 0}
+        try:
+            btl.packed_ternary_preflight(
+                [(key, lambda config: config)], device=device, software=software
+            )
+            selection = btl._GLOBAL_TUNER.resolve(
+                key=key,
+                device=device,
+                launcher=lambda config: config,
+                software=software,
+            )
+            result.update(
+                outcome="ok",
+                source=selection.source,
+                winner=selection.config.to_dict(),
+            )
+        except RuntimeError as exc:
+            result.update(outcome="error", error=str(exc))
+        finally:
+            result["measure_calls"] = measure_calls
+            (Path(result_dir) / f"rank-{rank}.json").write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 def test_tune_key_equality_and_hash_include_shape_and_semantics():
     assert _key() == _key()
     assert hash(_key()) == hash(_key())
@@ -66,6 +168,19 @@ def test_tune_key_equality_and_hash_include_shape_and_semantics():
         dtype="float16",
         scale_per_output=True,
     )
+
+
+def test_observed_tune_key_diagnostics_records_lazy_resolution():
+    import src.model.bitlinear_tuning as btl
+
+    btl.clear_observed_packed_tune_keys()
+    tuner = PackedTernaryTuner(PackedTuningOptions(mode="off", cache_enabled=False))
+    key = _key()
+    tuner.resolve(key=key, device=_device(), software=_software(), launcher=lambda _: None)
+
+    assert btl.observed_packed_tune_keys() == frozenset({key})
+    btl.clear_observed_packed_tune_keys()
+    assert btl.observed_packed_tune_keys() == frozenset()
 
 
 def test_candidate_generator_is_shape_table_free_for_representative_m_values():
@@ -655,3 +770,63 @@ def test_preflight_callable_nonzero_does_not_tune(monkeypatch):
 
     btl.packed_ternary_preflight_callable(must_not_tune)
     assert reloaded == [True]
+
+
+def test_preflight_gloo_multiprocess_rank0_cache_and_failure_propagation(tmp_path):
+    """Real CPU/Gloo coverage for rank-0-only tune coordination.
+
+    The worker replaces CUDA event timing only; cache persistence and all Gloo
+    collectives execute in independent spawned processes.
+    """
+    world_size = 2
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    cache_path = tmp_path / "packed-tuning-cache.json"
+
+    torch.multiprocessing.spawn(
+        _gloo_preflight_worker,
+        args=(
+            world_size,
+            str(tmp_path / "success-rendezvous"),
+            str(cache_path),
+            str(result_dir),
+            False,
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+
+    success = [
+        json.loads((result_dir / f"rank-{rank}.json").read_text(encoding="utf-8"))
+        for rank in range(world_size)
+    ]
+    assert cache_path.is_file()
+    cache_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert len(cache_payload["entries"]) == 1
+    assert [item["outcome"] for item in success] == ["ok", "ok"]
+    assert success[0]["measure_calls"] > 0
+    assert success[1]["measure_calls"] == 0
+    assert success[0]["source"] == success[1]["source"] == "cache"
+    assert success[0]["winner"] == success[1]["winner"]
+
+    failure_dir = tmp_path / "failure-results"
+    failure_dir.mkdir()
+    torch.multiprocessing.spawn(
+        _gloo_preflight_worker,
+        args=(
+            world_size,
+            str(tmp_path / "failure-rendezvous"),
+            str(tmp_path / "failure-cache.json"),
+            str(failure_dir),
+            True,
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+    failures = [
+        json.loads((failure_dir / f"rank-{rank}.json").read_text(encoding="utf-8"))
+        for rank in range(world_size)
+    ]
+    assert [item["outcome"] for item in failures] == ["error", "error"]
+    assert all("failed on global rank 0" in item["error"] for item in failures)
+    assert all("intentional rank-0 tune failure" in item["error"] for item in failures)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ from src.train.train import should_restore_dataloader_state
 from src.train.train import prepare_cudagraph_gradient_buffers
 from src.train.train import uses_cudagraph_compile
 from src.train.train import parse_args
+from src.train.train import _run_tuning_preflight_preserving_state
 
 
 def test_parse_args_accepts_positive_benchmark_steps(monkeypatch, tmp_path):
@@ -616,6 +618,57 @@ def test_pick_device_does_not_fallback_from_explicit_mps(monkeypatch):
 
     with pytest.raises(RuntimeError, match="暗黙フォールバック"):
         pick_device("mps")
+
+
+def test_pick_device_binds_torchrun_process_to_local_rank(monkeypatch):
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    bound: list[int] = []
+    monkeypatch.setattr(torch.cuda, "set_device", bound.append)
+
+    assert pick_device("cuda") == torch.device("cuda", 1)
+    assert bound == [1]
+
+
+def test_pick_device_rejects_incomplete_torchrun_environment(monkeypatch):
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    with pytest.raises(RuntimeError, match="LOCAL_RANK"):
+        pick_device("cuda")
+
+
+def test_tuning_preflight_restores_rng_buffers_grads_and_mode():
+    class PreflightModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 1)
+            self.register_buffer("counter", torch.zeros(()))
+
+        def forward(self, input_ids):
+            self.counter.add_(1)
+            logits = self.linear(input_ids.float().unsqueeze(-1))
+            return SimpleNamespace(logits=logits)
+
+    model = PreflightModel().eval()
+    model.linear.weight.grad = torch.full_like(model.linear.weight, 7)
+    rng_before = torch.get_rng_state().clone()
+
+    metrics = _run_tuning_preflight_preserving_state(
+        model, torch.device("cpu"), micro_batch=2, context=3, vocab=10
+    )
+
+    assert metrics["peak_allocated_bytes"] == 0
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert model.training is False
+    assert model.counter.item() == 0
+    assert torch.equal(model.linear.weight.grad, torch.full_like(model.linear.weight, 7))
+    assert model.linear.bias.grad is None
 
 
 def test_should_restore_dataloader_state_when_data_config_matches():

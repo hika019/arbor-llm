@@ -249,6 +249,10 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   `speed.bitlinear_ternary_tuning: auto` が実行GPU上でlaunch tileを測定する。
   結果はGPU/torch/CUDA/Triton/kernel-versionを含むfingerprintで
   `${XDG_CACHE_HOME:-~/.cache}/arbor/packed_ternary_autotune.json` に保存される。
+  `torchrun` で初期化済みのprocess groupでは、global rank 0だけがこの事前測定と
+  cache書き込みを行い、他rankは同期後に同じcacheを再読込する。この連携はautotune
+  の重複実行を防ぐためだけのもので、モデルをDDP/FSDPでwrapしたり、勾配同期・
+  データ分割を行う完全な分散学習を意味しない。
   `fixed`（`bitlinear_ternary_fixed_tile: BM,BN,BK,WARPS,STAGES` 必須）と
   conservative configを使う`off`もdebug/reproduction用に選べる。
   現行mean-pooling構成の実学習A-B-B-Aでは、`custom_op + auto`をCUDA Graphsで

@@ -30,6 +30,12 @@ PACKED_TERNARY_KERNEL_VERSION = "packed_ternary_v3_runtime_tuning"
 PACKED_BACKENDS = ("dot", "dot_current", "kmajor_current", "kmajor_single_dot")
 _TUNING_MODES = ("auto", "fixed", "off")
 
+# Diagnostics only: keep the exact lazy keys observed in the current process.
+# This makes it possible for training to prove that rank-0 preflight covered
+# the first real step, without encoding model-specific shape assumptions here.
+_OBSERVED_TUNE_KEYS: set["TuneKey"] = set()
+_OBSERVED_TUNE_KEYS_LOCK = threading.RLock()
+
 _CANDIDATE_SOURCE_ARBOR = "arbor_base"
 _CANDIDATE_SOURCE_TRITON_MATMUL = "triton_matmul"
 _CANDIDATE_SOURCE_TRITON_PERSISTENT = "triton_persistent_matmul"
@@ -177,6 +183,23 @@ class TuneKey:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def clear_observed_packed_tune_keys() -> None:
+    """Clear per-process TuneKey diagnostics (does not change tuning state)."""
+    with _OBSERVED_TUNE_KEYS_LOCK:
+        _OBSERVED_TUNE_KEYS.clear()
+
+
+def observed_packed_tune_keys() -> frozenset[TuneKey]:
+    """Return TuneKeys lazily resolved since the last diagnostics reset."""
+    with _OBSERVED_TUNE_KEYS_LOCK:
+        return frozenset(_OBSERVED_TUNE_KEYS)
+
+
+def _record_observed_packed_tune_key(key: TuneKey) -> None:
+    with _OBSERVED_TUNE_KEYS_LOCK:
+        _OBSERVED_TUNE_KEYS.add(key)
 
 
 @dataclass(frozen=True)
@@ -679,6 +702,7 @@ class PackedTernaryTuner:
         launcher: Callable[[PackedLaunchConfig], Any],
         software: SoftwareInfo | None = None,
     ) -> TuneSelection:
+        _record_observed_packed_tune_key(key)
         options = self._options
         if options.mode == "fixed":
             assert options.fixed_config is not None
