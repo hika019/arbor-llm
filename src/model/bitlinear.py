@@ -412,6 +412,80 @@ if triton is not None:
         tl.store(inv_scale_ptr + row, inv_scale)
 
     @triton.jit
+    def _dy_row_amax_kernel(
+        x_ptr, col_scale_ptr, inv_scale_ptr, row_amax_ptr,
+        n: tl.constexpr, stride_m: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """dY 1行分の amax を 2 種類まとめて取る (fused dY plumbing の pass 1).
+
+        - inv_scale: (dY * col_scale) の per-row A8 dequant scale (dX 用 INT8)
+        - row_amax : |dY| の行 amax。全体 amax (dW 用 tensorwise FP8 scale) は
+          この M 要素の max で得るので、dY を 3 回目に読まずに済む。
+        行長 n は BLOCK_N 単位で loop するので巨大行でも register tile を作らない。
+        """
+        row = tl.program_id(0)
+        amax_scaled = tl.zeros([BLOCK_N], dtype=tl.float32)
+        amax_raw = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for n0 in range(0, n, BLOCK_N):
+            offs = n0 + tl.arange(0, BLOCK_N)
+            mask = offs < n
+            x = tl.load(
+                x_ptr + row * stride_m + offs, mask=mask, other=0.0
+            ).to(tl.float32)
+            col_scale = tl.load(
+                col_scale_ptr + offs, mask=mask, other=0.0
+            ).to(tl.float32)
+            amax_raw = tl.maximum(amax_raw, tl.abs(x))
+            amax_scaled = tl.maximum(amax_scaled, tl.abs(x * col_scale))
+        amax = tl.max(amax_scaled, axis=0)
+        tl.store(inv_scale_ptr + row, tl.maximum(amax / 127.0, 1.0e-5 / 127.0))
+        tl.store(row_amax_ptr + row, tl.max(amax_raw, axis=0))
+
+    @triton.jit
+    def _dy_quant_dual_kernel(
+        x_ptr, col_scale_ptr, inv_scale_ptr, fp8_scale_ptr, q_ptr, t_ptr,
+        m: tl.constexpr, n: tl.constexpr, stride_m: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        """dY の tile を 1 回 load し、dX 用 INT8 行 と dW 用 FP8 転置 を同時に書く.
+
+        INT8 側は `_a8_quantize_rows_scaled_kernel` と同じ演算 (col_scale 適用、
+        round-half-to-even、clamp)。FP8 側は `_fp8_cast_transpose_kernel` と同じ
+        tensorwise scale の e4m3 cast で、[n, m] row-major へ tl.trans で
+        coalesced に store する。
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m[:, None] < m) & (offs_n[None, :] < n)
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_m + offs_n[None, :],
+            mask=mask, other=0.0,
+        ).to(tl.float32)
+        # ---- INT8 (row-scaled, dX 用) ----
+        col_scale = tl.load(
+            col_scale_ptr + offs_n, mask=offs_n < n, other=0.0
+        ).to(tl.float32)
+        inv_scale = tl.load(inv_scale_ptr + offs_m, mask=offs_m < m, other=1.0)
+        scaled = (x * col_scale[None, :]) / inv_scale[:, None]
+        nearest = tl.floor(scaled + 0.5)
+        is_tie = (nearest - scaled) == 0.5
+        is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
+        q = tl.where(is_tie & is_odd, nearest - 1.0, nearest)
+        q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
+        tl.store(q_ptr + offs_m[:, None] * n + offs_n[None, :], q, mask=mask)
+        # ---- FP8 転置 (tensorwise, dW 用) ----
+        fp8_scale = tl.load(fp8_scale_ptr)
+        f = tl.maximum(-448.0, tl.minimum(448.0, x / fp8_scale))
+        tl.store(
+            t_ptr + offs_n[:, None] * m + offs_m[None, :],
+            tl.trans(f),
+            mask=(offs_n[:, None] < n) & (offs_m[None, :] < m),
+        )
+
+    @triton.jit
     def _int8_bitlinear_kernel(
         x_ptr, w_ptr, inv_sx_ptr, sw_ptr, y_ptr,
         m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
@@ -1021,6 +1095,47 @@ def _quantize_a8_rows_scaled(
     return q, inv_scale
 
 
+def _quantize_dy_dual(
+    dy: torch.Tensor, col_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """packed ternary backward の dY plumbing を 2 pass に統合する.
+
+    戻り値: (dX 用 INT8 [M,N], その per-row dequant scale [M],
+             dW 用 tensorwise FP8 転置 [N,M], その scale (0-d fp32))。
+    分離実装 (`_quantize_a8_rows_scaled` + `_cast_fp8_tensorwise_transposed`
+    + 全体 amax) は dY を 3 回読むが、ここでは row amax pass と tile pass の
+    2 回で済む。各出力は分離実装と bit 一致する。
+    """
+    if triton is None or not dy.is_cuda:
+        raise RuntimeError("packed ternary dX/dW には CUDA + Triton が必要です")
+    x2 = dy.contiguous()
+    scale = col_scale.contiguous()
+    m, n = x2.shape
+    if scale.numel() != n:
+        raise ValueError(f"col_scale must have N={n} values")
+    inv_scale = torch.empty(m, device=dy.device, dtype=torch.float32)
+    row_amax = torch.empty(m, device=dy.device, dtype=torch.float32)
+    _dy_row_amax_kernel[(m,)](
+        x2, scale, inv_scale, row_amax,
+        n, x2.stride(0),
+        BLOCK_N=min(triton.next_power_of_2(n), 4096),
+        num_warps=8 if n >= 2048 else 4,
+    )
+    # max は結合順序に依らないので、分離実装の t.abs().amax() と同じ値になる。
+    fp8_scale = (row_amax.amax() / _FP8_MAX).clamp_min(1e-12)
+    q = torch.empty_like(x2, dtype=torch.int8)
+    t_f8 = torch.empty((n, m), device=dy.device, dtype=_FP8_E4M3)
+    block_m = 32 if m <= 2048 else 64
+    block_n = 128
+    _dy_quant_dual_kernel[(triton.cdiv(m, block_m), triton.cdiv(n, block_n))](
+        x2, scale, inv_scale, fp8_scale, q, t_f8,
+        m, n, x2.stride(0),
+        BLOCK_M=block_m, BLOCK_N=block_n,
+        num_warps=4,
+    )
+    return q, inv_scale, t_f8, fp8_scale
+
+
 def _quantize_int8_tensorwise(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1181,6 +1296,15 @@ _TERNARY_EXECUTION_PATHS = (
 _int8_backend = "auto"
 _ternary_backend = "dot_current"
 _ternary_wgrad_backend = "int8"
+# dY plumbing: True で `_quantize_dy_dual` (2 pass) を使う。False は分離実装
+# (INT8 行量子化 + FP8 転置 + 全体 amax の 3 pass) で、A/B と回帰テスト用。
+_fused_dy_plumbing = True
+
+
+def set_bitlinear_fused_dy_plumbing(enabled: bool) -> None:
+    global _fused_dy_plumbing
+    _fused_dy_plumbing = bool(enabled)
+
 _ternary_execution_path = "legacy_raw"
 _ternary_raw_launch_spec: tuple[int, int, int, int, int] | None = None
 _ternary_raw_plan: dict[TuneKey, tuple[int, int, int, int, int]] = {}
@@ -1567,6 +1691,17 @@ def _fp8_wgrad_from_a8(
 ) -> torch.Tensor:
     """FP8 dW using saved A8 activations without materializing BF16 x_q."""
     gt_f8, sg = _cast_fp8_tensorwise_transposed(grad_output)
+    return _fp8_wgrad_from_a8_pretransposed(gt_f8, sg, x_int8, inv_sx, out_dtype)
+
+
+def _fp8_wgrad_from_a8_pretransposed(
+    gt_f8: torch.Tensor,
+    sg: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """転置済み FP8 dY (`_quantize_dy_dual` の出力) から FP8 dW を計算する."""
     x_km, sx = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
     return _scaled_mm_tensorwise(
         gt_f8,
@@ -1805,10 +1940,23 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         x_int8, inv_sx, w_packed_t, row_scale = ctx.saved_tensors
         n = row_scale.numel()
         g2 = grad_output.reshape(-1, n)
+        needs_w = ctx.needs_input_grad[6:]
+        k = ctx.input_shape[-1]
+        # dX 用 INT8 と dW 用 FP8 転置を dY の 2 pass で同時に作る。dW が FP8
+        # backend でない場合は転置出力が要らないので分離実装のまま。
+        fuse_dy = (
+            _fused_dy_plumbing
+            and any(needs_w)
+            and _ternary_wgrad_uses_fp8(g2.size(0), k, n)
+        )
+        gt_f8 = sg = None
+        if fuse_dy:
+            g_int8, inv_sg, gt_f8, sg = _quantize_dy_dual(g2, row_scale)
+        elif ctx.needs_input_grad[0]:
+            g_int8, inv_sg = _quantize_a8_rows_scaled(g2, row_scale)
         grad_x = None
         if ctx.needs_input_grad[0]:
             # dX = (dY * weight_scale) @ ternary_code。
-            g_int8, inv_sg = _quantize_a8_rows_scaled(g2, row_scale)
             one = row_scale.new_ones(())
             grad_x = _packed_linear(
                 g_int8,
@@ -1824,14 +1972,18 @@ class TernaryBitLinearSTE(torch.autograd.Function):
                 backend=ctx.backend,
             ).reshape(ctx.input_shape)
 
-        needs_w = ctx.needs_input_grad[6:]
         if any(needs_w):
-            grad_w = _ternary_wgrad_from_a8(
-                g2,
-                x_int8,
-                inv_sx,
-                grad_output.dtype,
-            )
+            if fuse_dy:
+                grad_w = _fp8_wgrad_from_a8_pretransposed(
+                    gt_f8, sg, x_int8, inv_sx, grad_output.dtype
+                )
+            else:
+                grad_w = _ternary_wgrad_from_a8(
+                    g2,
+                    x_int8,
+                    inv_sx,
+                    grad_output.dtype,
+                )
             raw = grad_w.split(ctx.out_sizes, dim=0)
             grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
         else:

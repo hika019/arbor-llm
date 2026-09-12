@@ -79,6 +79,9 @@ static inputなので、optimizer step後の再生成は同じbufferへin-place�
 forward/backwardを再captureして数百msのGPU idleになる (詳細は
 `arbor_gpu_idle_root_cause_20260912.md`)。CUDA + Tritonではこの再生成を
 `src/model/ternary_pack.py` の1 kernel/層で行い、純PyTorch経路とbit一致する。
+packed ternary backwardのdY側plumbing (INT8行量子化 / FP8転置 / 全体amax) は
+`_quantize_dy_dual` がrow amax passとtile passの2 passで生成する
+(分離実装とbit一致、dWがFP8 backendのときのみ)。
 既定の1B/8k構成では `custom_op + auto + reduce-overhead` を使う。RTX 4090で
 A-B-B-A各120 step（step 21--120集計）した結果、旧
 `dot_current + legacy_raw + default`比で `bytes/s +19.0%`、step time `-16.1%`。
