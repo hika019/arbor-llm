@@ -81,7 +81,7 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
   G_stack になる。ByteLM 側の成長も同じ仕組みで可能。2B の形状設計と VRAM の壁
   (2k context 化 / micro_batch) が先。
 
-## 5. 長さ curriculum / 長さ bucket packing (B)
+## 5. 長さ curriculum / 長さ bucket packing (B) — arbor には当てはまらない (2026-09-13 計測)
 
 - 出典: Apple "Dataset Decomposition: Faster LLM Training with Variable Sequence Length
   Curriculum" (arXiv 2405.13226)。文書を長さ (2^k) の bucket に分解し、bucket 単位で batch を
@@ -91,9 +91,23 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
   arXiv 2108.06084) — 序盤の長系列は勾配分散を増やすので短く始めると安定。
 - 出典: "Curriculum Learning for LLM Pretraining: An Analysis of Learning Dynamics"
   (arXiv 2601.21698) — 難易度 curriculum の結果は **まちまち**。長さ以外の curriculum は期待薄。
-- arbor: 2k→8k の段階拡張は計画済み (`--init-from` + rope_theta 変更で strict ロード可)。
-  加えて `byte_dataset.py` の `packing: document` を長さ bucket 化すると文書跨ぎ attention の
-  無駄が消える。static patching では document 境界と patch 境界の整合が要る (既存コメント参照)。
+- **arbor での結論: 見送り**。論文の 6× は連結文書に O(T²) attention を掛ける無駄を消した分だが、
+  arbor は local attention が patch 内 (16 byte)、global attention は 512 patch しかなく flex の
+  BlockMask で既に文書ごと block 対角。per-byte コストは BitLinear GEMM で決まり系列長に線形。
+  実測 (2026-09-13, `scripts.bench_cuda`, 合成データ, compile 込み, 同一 16k bytes/micro):
+  **seq 2048×micro 8 = 86.1k bytes/s、seq 8192×micro 2 = 85.6k bytes/s** (差 0.6% = 誤差)。
+  2k で回しても速くならず、文脈が短い分 loss/byte が悪くなるだけ。長さ bucket packing も
+  狙う無駄 (文書跨ぎ attention) が既にほぼゼロなので不要 (形状可変化のコストだけ残る)。
+- 残る用途は **2B を 24GB に収めるために 2k で始める** (メモリの壁、速度ではない)。その場合の切替:
+  - batch 由来の lr 補正は不要 (2k×micro8 と 8k×micro2 は同じ 524k bytes/update)。
+  - `rope_theta_global` は両フェーズで同じ値 (10000) に固定。theta を変えると学習済みの位置感覚が
+    壊れる。切替は「global 位置 128〜511 が未見」の純粋な長さ拡張にとどめる。
+  - `--init-from` は step/optimizer/scheduler を新規にするので、8k 側 config は
+    `lr` = 2k フェーズ終了時点の lr、`warmup_steps` 500〜1000 (Adam モーメントがゼロから始まる
+    ので短い再 warmup で loss の跳ねを吸収)、`total_steps`/`min_lr_ratio`/`decay_end_ratio` は
+    残り step と新 `lr` 基準で「元の 1 本のスケジュールの続き」になるよう換算する。
+  - 8k フェーズは 20〜30% 以上取る。global の位置 128〜511 はここで初めて学習されるので、
+    Llama 3 の文脈拡張 (終盤の数%) では足りない。
 
 ## 6. µP + プロキシ実験 (C) — 方針として
 
@@ -138,8 +152,9 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 1. batch size warmup (実装済み) → ByteLM で効き確認 → 次 run に投入
 2. Muon を ByteLM で検証 (本走停止中)
 3. 次の 2B は G_stack で 1B base から
-4. 長さ bucket + 2k→8k curriculum
-5. anneal ×N + 重み平均
+4. anneal ×N + 重み平均
+
+(5 の長さ curriculum / bucket packing は計測の結果 arbor では効かないため優先順位から外した。)
 
 共通のエッセンス: **大きい run は一発勝負にして決め事は全部小さいモデルで済ませる**、
-**序盤は小 batch・短文脈で無駄を出さない**、**前のモデルを捨てずに次の初期値にする**。
+**序盤は小 batch で無駄を出さない** (短文脈は arbor では効かない)、**前のモデルを捨てずに次の初期値にする**。
