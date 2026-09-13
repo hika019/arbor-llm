@@ -26,7 +26,7 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
   bytes で持つなら再計算する。本走投入前に ByteLM (`bitnet: true`) で固定 accum vs schedule を
   1 時間ずつ比べて効きを確認する。
 
-## 2. Muon optimizer (A) — 実装済み、ByteLM で A/B 中 (2026-09-14)
+## 2. Muon optimizer (A) — 実装済み、ByteLM A/B で AdamW に負け → 本走は AdamW のまま (2026-09-14)
 
 - 出典: Moonshot "Muon is Scalable for LLM Training" (arXiv 2502.16982)。AdamW 比
   **約 2× の計算効率**、3B/16B MoE (Moonlight) を 5.7T token で実証。スケールさせるのに
@@ -51,7 +51,27 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 - A/B: `configs/bytelm_ab.yaml` (AdamW 基準) vs `configs/bytelm_ab_muon.yaml`。BitNet ByteLM
   19M、本走と同じ data mix / 8k / lr 8e-4 / wd 0.1 / stochastic rounding、15k step (≈1 時間)。
   差分は optimizer だけ。判定は train loss ema と validation (ja_web / english / code) の bpb。
-  結果はここに追記する。
+- **結果 (2026-09-14): Muon は AdamW に一貫して僅差で負け。** 「Bit-by-Bit」の報告どおり。
+
+  | step | AdamW ema | Muon ema | AdamW mean_bpb | Muon mean_bpb |
+  |---|---|---|---|---|
+  | 500 | 1.997 | 2.462 | — | — |
+  | 1000 | 1.465 | 1.746 | — | — |
+  | 2500 | — | — | 1.791 | 1.818 |
+  | 5000 | 1.061 | 1.064 | 1.617 | 1.623 |
+  | 10000 | 0.992 | 0.999 | 1.498 | 1.509 |
+  | 15000 | **0.976** | 0.982 | **1.476** | 1.488 |
+
+  - 序盤 (warmup 500 step 前後) は Muon が大きく遅れる (+0.47 @500)。直交化した更新は
+    全特異方向を同じ大きさで動かすため、三値化の閾値付近にある latent weight が一斉に
+    符号を跨ぎやすく、初期の ternary 構造が定まるまで荒れる (推定)。step 2000 で追いつき、
+    step 3000 で一度だけ逆転 (-0.003) するが、以後は +0.005〜0.007 / bpb +0.010 で固定。
+  - 最終 mean_bpb 1.488 vs 1.476 (+0.8%)、3 ドメインとも Muon が悪い。速度も Newton-Schulz
+    分だけ遅い (234 vs 159 ms/step、19M では opt が 53 ms)。
+  - 結論: ternary + STE では Muon の「2× 効率」は出ない。本走は AdamW のまま。実装は残す
+    (`optim.optimizer: muon`) が、再挑戦するなら (1) Muon 用に lr を別に振る (RMS 合わせは
+    FP 前提の係数)、(2) warmup を長くする / 序盤だけ AdamW で始めて切り替える、(3) momentum
+    0.95 → 0.9、あたりが候補。ただし本走への投入条件は「ByteLM で明確に勝つこと」。
 - 制約: 本走中は VRAM 22.5/23GB なので ByteLM でも同時実行は WSL 落ちの危険
   (推論同時実行で落ちた前例と同じ機構)。本走停止中に回す。
 
@@ -154,11 +174,11 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 ## 優先順位
 
 1. batch size warmup (実装済み) → ByteLM で効き確認 → 次 run に投入
-2. Muon を ByteLM で検証 (本走停止中)
-3. 次の 2B は G_stack で 1B base から
-4. anneal ×N + 重み平均
+2. 次の 2B は G_stack で 1B base から
+3. anneal ×N + 重み平均
 
-(5 の長さ curriculum / bucket packing は計測の結果 arbor では効かないため優先順位から外した。)
+(2 の Muon は ByteLM A/B で AdamW に負けたため、5 の長さ curriculum / bucket packing は
+計測の結果 arbor では効かないため、それぞれ優先順位から外した。)
 
 共通のエッセンス: **大きい run は一発勝負にして決め事は全部小さいモデルで済ませる**、
 **序盤は小 batch で無駄を出さない** (短文脈は arbor では効かない)、**前のモデルを捨てずに次の初期値にする**。
