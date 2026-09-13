@@ -121,9 +121,17 @@ data:
       weight_bytes: 0.06
       text_filter:
         preset: en_web_quality_v1
-    # NOTE: コード系データ (旧 opc_code_web / OpenCoder-LLM/opc-fineweb-code-corpus) は
-    # 提供元が非公開化したため除外した。weight_bytes は正規化されるため、残りソースの
-    # 相対比はそのまま保たれる (除外分 0.09 は他ソースへ比例配分される)。
+    - id: opc_code_web
+      path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書 (parquet, 非 gated)
+      revision: main
+      license_policy: "dataset card terms; code/web mixture"
+      # 旧 github_code_filtered (loubnabnl/github-code-more-filtering) は datasets 4.x が
+      # 廃止したスクリプト型データセットで読めない (現在は 401) ため、その比率をここへ統合。
+      # 2026-08-28 に「非公開化」として一度外したが、2026-09-13 に HF API で
+      # gated/private/disabled いずれも False・parquet 512 本を確認したので復帰。
+      weight_bytes: 0.09
+      text_filter:
+        preset: en_web_quality_v1
   streaming: true
   packing: document
   eos_token_id: 2
@@ -146,7 +154,15 @@ optim:
                                 # 節約したい時のみint8を選ぶ(fp32比で二次モーメントの
                                 # underflowを防ぐ非線形符号帳を使用)。
   fp32_backend: auto           # auto: 対応する連続CUDA tensorでAdamW演算を融合。eagerで従来版、tritonで明示必須。
-  lr: 2.0e-4
+  # parameter (bf16, fp32 master 無し) への書き戻し丸め。
+  #   nearest    … 最近接丸め。更新が半 ulp (相対 ~0.2%) 未満だと消える。lr*wd ~1e-5 の
+  #                weight decay は一度も効かず、lr が下がる後半は更新の大半が消える (実測)。
+  #   stochastic … 端数に比例した確率で切り上げる不偏丸め (torchao bf16_stochastic_round
+  #                / Ozkara+ 2025 と同方式)。追加メモリ無し、AdamW kernel 内で完結。
+  param_rounding: stochastic    # choices: nearest | stochastic
+  # BitNet b1.58 公式再現設定 (Training Tips, 1.3B): 1.2e-3 -> 8e-4、LLaMA FP 1.3B は 2e-4。
+  # 2e-4 は FP 側の値だった。8e-4 は旧 filter run (bnb 8bit) で実績あり。
+  lr: 8.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.1             # stage1 の weight decay (two_stage では stage2 で切替)
@@ -197,6 +213,13 @@ speed:
   grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)。
                                 # それでも溢れる時は gradient_checkpointing: true + torch_compile: false
                                 # (compile×ckpt 併用は torch2.5 で NaN になるため train.py が弾く)
+  # batch size warmup (Ai2 "Critical Batch Size Revisited", OLMo 1B で同 loss を 43% 少ない step で達成)。
+  # 序盤は臨界 batch が小さいので accum を小さく始め、step で段階的に定常値へ上げる。
+  # 最終値は grad_accum_steps と一致させる。区間中は lr を √(accum/final) 倍する
+  # (grad_accum_lr_scaling: sqrt | none)。step で決まるので resume は決定的、再コンパイルも無し。
+  # 序盤の bytes/step が減るので total_steps の bytes 換算は変わる (arbor_training_efficiency_notes.md)。
+  # grad_accum_schedule: [[0, 8], [10000, 16], [30000, 32]]
+  # grad_accum_lr_scaling: sqrt
 
 validation:
   enabled: true
@@ -230,7 +253,11 @@ validation:
       revision: main
       split: train
       skip_samples: 20000
-    # code ドメインは学習データ非公開化に伴い除外
+    code:
+      source: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      revision: main
+      split: train
+      skip_samples: 20000
 
 checkpoint:
   dir: ./checkpoints/arbor2_1b_8k_lowbit

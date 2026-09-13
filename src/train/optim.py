@@ -6,14 +6,24 @@ optimizer は `optim.optimizer` (adamw | lion) と `optim.state_precision`
 使えない場合に別 optimizer や別精度へ暗黙フォールバックしてはいけない。
 int8 は blockwise scale + 非線形dynamic符号帳、bf8 はfloat8_e5m2でmomentを保持し、
 更新演算はどちらもFP32で行う。
+parameter への書き戻しは `optim.param_rounding` (nearest | stochastic) で丸める。
+fp32 master を持たない BF16 parameter では stochastic が既定 (src/train/rounding.py)。
 """
 from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
+
+from src.train.rounding import (
+    check_param_rounding_dtype,
+    new_base_seed,
+    resolve_param_rounding,
+    round_to_param_dtype,
+    step_seed,
+)
 
 
 _INT8_STATE_BLOCK_SIZE = 2048
@@ -91,6 +101,23 @@ def _dequantize_int8_state(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return _dequantize_dynamic_state(q, scale, signed=True)
 
 
+def _apply_update(p: torch.Tensor, update32: torch.Tensor, decay: float, rounding: str) -> None:
+    """decoupled weight decay と update を parameter へ書き戻す。
+
+    nearest は従来どおり decay 後と update をそれぞれ parameter dtype へ丸める
+    (Triton 版と bit 一致させる契約)。stochastic は fp32 で new = p*(1-decay) - update
+    を作り、1 回だけ確率的に丸める。
+    """
+    if rounding == "nearest":
+        if decay:
+            p.mul_(1.0 - decay)
+        p.add_(update32.to(dtype=p.dtype), alpha=-1.0)
+        return
+    check_param_rounding_dtype(rounding, p.dtype)
+    new32 = p.float().mul_(1.0 - decay).sub_(update32)
+    p.copy_(round_to_param_dtype(new32, p.dtype, rounding))
+
+
 class AdamW8bit(torch.optim.Optimizer):
     """CUDA/MPS/CPU 共通の、8bit state を持つ AdamW。
 
@@ -109,7 +136,9 @@ class AdamW8bit(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        param_rounding: str = "nearest",
     ) -> None:
+        self.param_rounding = resolve_param_rounding(param_rounding)
         if lr <= 0:
             raise ValueError(f"lr must be positive: {lr}")
         if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
@@ -191,13 +220,11 @@ class AdamW8bit(torch.optim.Optimizer):
                     grad32, grad32, value=1.0 - beta2
                 )
 
-                if wd:
-                    p.mul_(1.0 - lr * wd)
                 bias_correction1 = 1.0 - beta1**step
                 bias_correction2 = 1.0 - beta2**step
                 denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
                 update = exp_avg.div(denom).mul_(lr / bias_correction1)
-                p.add_(update.to(dtype=p.dtype), alpha=-1.0)
+                _apply_update(p, update, lr * wd, self.param_rounding)
 
                 state["exp_avg"], state["exp_avg_scale"] = _quantize_dynamic_state(
                     exp_avg, signed=True
@@ -220,10 +247,12 @@ class AdamWFP32(torch.optim.Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         backend: str = "auto",
+        param_rounding: str = "nearest",
     ) -> None:
         if backend not in ("auto", "eager", "triton"):
             raise ValueError(f"unknown AdamWFP32 backend: {backend!r}")
         self.backend = backend
+        self.param_rounding = resolve_param_rounding(param_rounding)
         if lr <= 0:
             raise ValueError(f"lr must be positive: {lr}")
         if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
@@ -274,6 +303,13 @@ class AdamWFP32(torch.optim.Optimizer):
                 step = state["step"]
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
+                stochastic = self.param_rounding == "stochastic" and p.dtype != torch.float32
+                if stochastic:
+                    check_param_rounding_dtype(self.param_rounding, p.dtype)
+                    # parameter ごとの base seed は state に置き checkpoint に載る。
+                    # step と合成するので resume 後も同じ乱数列になる。
+                    if "sr_seed" not in state:
+                        state["sr_seed"] = new_base_seed()
                 if self.backend != "eager":
                     from src.train.adamw_triton import adamw_update, supported
 
@@ -286,6 +322,8 @@ class AdamWFP32(torch.optim.Optimizer):
                         adamw_update(
                             p, grad, exp_avg, exp_avg_sq,
                             lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, step=step,
+                            rounding=self.param_rounding,
+                            seed=step_seed(state["sr_seed"], step) if stochastic else 0,
                         )
                         continue
                     if self.backend == "triton":
@@ -300,13 +338,11 @@ class AdamWFP32(torch.optim.Optimizer):
                     grad32, grad32, value=1.0 - beta2
                 )
 
-                if wd:
-                    p.mul_(1.0 - lr * wd)
                 bias_correction1 = 1.0 - beta1**step
                 bias_correction2 = 1.0 - beta2**step
                 denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
                 update = exp_avg.div(denom).mul_(lr / bias_correction1)
-                p.add_(update.to(dtype=p.dtype), alpha=-1.0)
+                _apply_update(p, update, lr * wd, self.param_rounding)
 
         return loss
 
@@ -326,7 +362,9 @@ class AdamWBF8(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        param_rounding: str = "nearest",
     ) -> None:
+        self.param_rounding = resolve_param_rounding(param_rounding)
         if lr <= 0:
             raise ValueError(f"lr must be positive: {lr}")
         if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
@@ -380,13 +418,11 @@ class AdamWBF8(torch.optim.Optimizer):
                 exp_avg.mul_(beta1).add_(grad32, alpha=1.0 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad32, grad32, value=1.0 - beta2)
 
-                if wd:
-                    p.mul_(1.0 - lr * wd)
                 bias_correction1 = 1.0 - beta1**step
                 bias_correction2 = 1.0 - beta2**step
                 denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
                 update = exp_avg.div(denom).mul_(lr / bias_correction1)
-                p.add_(update.to(dtype=p.dtype), alpha=-1.0)
+                _apply_update(p, update, lr * wd, self.param_rounding)
 
                 state["exp_avg"] = exp_avg.to(_BF8_DTYPE)
                 state["exp_avg_sq"] = exp_avg_sq.to(_BF8_DTYPE)
@@ -479,6 +515,7 @@ def _build_adamw(
     eps: float,
     wd: float,
     fp32_backend: str = "auto",
+    param_rounding: str = "stochastic",
 ) -> torch.optim.Optimizer:
     """state_precision に従い、全 parameter で一様な AdamW を作る。
 
@@ -488,11 +525,12 @@ def _build_adamw(
     どちらも parameter を個別 dtype 例外なく一様に扱う (小さい層も除外しない)。
     別 device への暗黙フォールバックや別 optimizer への置換はしない。
     """
+    kwargs = dict(lr=lr, betas=betas, eps=eps, weight_decay=wd, param_rounding=param_rounding)
     if state_precision == "int8":
-        return AdamW8bit(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+        return AdamW8bit(params, **kwargs)
     if state_precision == "bf8":
-        return AdamWBF8(params, lr=lr, betas=betas, eps=eps, weight_decay=wd)
-    return AdamWFP32(params, lr=lr, betas=betas, eps=eps, weight_decay=wd, backend=fp32_backend)
+        return AdamWBF8(params, **kwargs)
+    return AdamWFP32(params, backend=fp32_backend, **kwargs)
 
 
 def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.optim.Optimizer:
@@ -511,6 +549,10 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
             raise ValueError(
                 "optim.state_precision は adamw 系専用です。lion では指定できません"
             )
+        if cfg.get("param_rounding") is not None:
+            raise ValueError(
+                "optim.param_rounding は adamw 系専用です。lion では指定できません"
+            )
         state_dtype_name = cfg.get("state_dtype")
         state_dtype = getattr(torch, state_dtype_name) if state_dtype_name else None
         return Lion(params, lr=lr, betas=betas, weight_decay=wd, state_dtype=state_dtype)
@@ -526,6 +568,7 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
         eps=eps,
         wd=wd,
         fp32_backend=str(cfg.get("fp32_backend", "auto")),
+        param_rounding=resolve_param_rounding(cfg.get("param_rounding")),
     )
 
 
@@ -592,9 +635,21 @@ def _scheduler_common(cfg: dict) -> tuple[int, int, float, float]:
     return warmup, total, min_ratio, decay_end_ratio
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: dict,
+    lr_scale: Callable[[int], float] | None = None,
+):
+    """lr_scale(step) を渡すと各 scheduler の lr_lambda に乗算する (batch size
+    warmup の √(accum/final) 補正用)。LambdaLR の base_lrs / state_dict /
+    rebase_scheduler_lr との互換はそのまま。"""
     name = cfg.get("scheduler", "cosine_warmup")
     warmup, total, min_ratio, decay_end_ratio = _scheduler_common(cfg)
+
+    def with_scale(fn: Callable[[int], float]) -> Callable[[int], float]:
+        if lr_scale is None:
+            return fn
+        return lambda step: fn(step) * lr_scale(step)
 
     if name == "cosine_warmup":
         decay_end = max(warmup + 1, round(total * decay_end_ratio))
@@ -606,7 +661,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
             cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
             return min_ratio + (1.0 - min_ratio) * cos
 
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, with_scale(lr_lambda))
 
     if name == "two_stage":
         # BitNet 公式 2 段レシピ。stage2_start_ratio で stage を切り替え、stage1 は
@@ -644,7 +699,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
             return min_ratio + (stage2_peak - min_ratio) * cos
 
         return TwoStageCooldownLR(
-            optimizer, lr_lambda,
+            optimizer, with_scale(lr_lambda),
             wd_stage1=wd_stage1, wd_stage2=wd_stage2, stage2_start_step=s2,
         )
 

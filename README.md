@@ -290,6 +290,15 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   従来演算を使う。`eager`で従来版、`triton`で融合必須（非対応入力はエラー）。
   backendはcheckpointに固定されず、resume時のconfigで選ぶ。
   単体比較: `python -m scripts.bench_adamw --config configs/arbor.yaml`。
+- `optim.param_rounding: stochastic` が既定。parameter は bf16 で fp32 master を
+  持たないため、`nearest` (最近接丸め) だと半 ulp (相対 ~0.2%) 未満の更新が消える。
+  実重みで確認した範囲では lr*wd ~1e-5 の weight decay は一度も効かず、lr が下がる
+  後半は更新の大半が消える。`stochastic` は fp32 で計算した新値を bf16 へ書き戻す時に
+  下位 16bit へ一様乱数を足して切り捨てる不偏丸め (torchao の bf16_stochastic_round /
+  Ozkara+ 2025 と同方式)。追加メモリ無し、fused AdamW kernel 内で完結し step 時間は
+  変わらない。parameter ごとの seed は optimizer state に載るので resume 後も再現する。
+  BitNet 原論文は latent weight を高精度で保持する前提 (fp32 master 相当) なので、
+  bf16 単独で学習する本実装では `stochastic` がそれに相当する。`nearest` は旧挙動の A/B 用。
 - `speed.sync_each_step: false` が既定。毎 step の `torch.cuda.synchronize()` は行わず、
   ログ/保存など scalar 化が必要な箇所でのみ同期する。
 - 性能A/Bには `--benchmark-steps N` を使う。指定optimizer step数だけ実行し、
