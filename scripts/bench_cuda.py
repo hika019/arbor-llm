@@ -236,7 +236,7 @@ def main() -> None:
     if args.production_optimizer:
         from src.train.optim import build_optimizer, build_scheduler
 
-        opt = build_optimizer(model.parameters(), cfg["optim"])
+        opt = build_optimizer(model.parameters(), cfg["optim"], model=model)
         scheduler = build_scheduler(opt, cfg["optim"])
         print(
             f"[bench] optimizer=config:{type(opt).__name__} "

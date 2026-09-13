@@ -1499,7 +1499,7 @@ def main() -> int:
         )
 
     # ---- optimizer / scheduler ----
-    optimizer = build_optimizer(model.parameters(), cfg["optim"])
+    optimizer = build_optimizer(model.parameters(), cfg["optim"], model=base_model)
     timing_mark("optimizer_created", device)
     # batch size warmup: accum が定常値未満の区間は lr を √(accum/final) 倍する
     accum_schedule = GradAccumSchedule.from_speed_cfg(cfg["speed"])

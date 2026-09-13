@@ -1,0 +1,150 @@
+# ByteLM (BitNet) をプロキシにした ablation 用 config (arbor_training_efficiency_notes.md §6)。
+# 1B 本走の決め事 (optimizer / schedule / 小技) を 19M・15k step (≈1 時間) で相対比較する。
+#
+#   python -m src.train.train --config configs/bytelm_ab.yaml        # 基準 (AdamW)
+#   python -m src.train.train --config configs/bytelm_ab_muon.yaml   # 比較 (Muon)
+#
+# 本走 (arbor.yaml) と揃える点: BitNet W1.58/A8、データ混合 (document packing)、
+# 8k context、lr 8e-4 / wd 0.1 / stochastic rounding。ByteLM 用 (entropy_lm.yaml)
+# とはデータ混合と optimizer 設定が違うので、entropy patching の境界判定には使わない。
+# 比較する run 同士は seed / data / schedule を同一にし、差分だけを変える。
+# 差分は各 config 冒頭の "A/B 差分" に明記する。
+
+run_name: bytelm_ab_adamw
+seed: 2
+
+model:
+  arch: byte_lm
+  vocab_size: 260
+  max_bytes: 8192
+  hidden_size: 512
+  num_heads: 8
+  num_kv_heads: 4
+  intermediate_size: 1536
+  num_hidden_layers: 6
+  rope_theta: 10000.0
+  bitnet: true                  # 本走と同じ W1.58/A8 (Muon × ternary STE の相性を見る)
+  activation_precision: int8
+  gradient_checkpointing: false
+
+data:
+  sources:
+    - id: fineweb2_ja
+      path: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      revision: main
+      weight_bytes: 0.465
+      text_filter:
+        preset: ja_web_v1
+    - id: wikipedia_ja
+      path: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      revision: main
+      weight_bytes: 0.19
+    - id: aozora_modern
+      path: "globis-university/aozorabunko-clean"
+      revision: main
+      weight_bytes: 0.02
+      max_epochs: 3
+    - id: japan_law
+      path: "y2lan/japan-law"
+      text_column: "body"
+      revision: main
+      weight_bytes: 0.005
+      max_epochs: 5
+    - id: fineweb_edu_en
+      path: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      weight_bytes: 0.12
+    - id: fineweb_en
+      path: "HuggingFaceFW/fineweb"
+      revision: main
+      weight_bytes: 0.05
+    - id: finemath_4plus
+      path: "HuggingFaceTB/finemath"
+      name: "finemath-4plus"
+      revision: main
+      weight_bytes: 0.06
+      text_filter:
+        preset: en_web_quality_v1
+    - id: opc_code_web
+      path: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      revision: main
+      weight_bytes: 0.09
+      text_filter:
+        preset: en_web_quality_v1
+  streaming: true
+  packing: document
+  eos_token_id: 2
+  pad_token_id: 3
+  shuffle_buffer: 2000
+  context_length: 8192
+  num_workers: 0
+  pin_memory: true
+  micro_batch_size: 8
+
+optim:
+  optimizer: adamw              # A/B 差分: adamw (基準)
+  state_precision: fp32
+  fp32_backend: auto
+  param_rounding: stochastic
+  lr: 8.0e-4                    # 本走と同じ。Muon は 0.2·√max(A,B) スケールで AdamW と lr/wd を共有
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  grad_clip: 1.0
+  scheduler: cosine_warmup
+  min_lr_ratio: 0.02
+  decay_end_ratio: 0.8
+  warmup_steps: 500
+  total_steps: 15000            # 8 seq × 8192 B = 65.5k bytes/step → 15k step ≈ 1 GB ≈ 1 時間
+
+speed:
+  device: auto
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: false
+  torch_compile: true
+  cuda_prefetch: true
+  cpu_prefetch_depth: 3
+  sync_each_step: false
+  micro_batch_size: 8
+  grad_accum_steps: 1
+
+validation:
+  enabled: true
+  torch_compile: false
+  compile_mode: default
+  max_batches: 16
+  micro_batch_size: 8
+  domains:
+    ja_web:
+      source: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      revision: main
+      split: train
+      skip_samples: 200000
+    english:
+      source: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      split: train
+      skip_samples: 200000
+    code:
+      source: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      revision: main
+      split: train
+      skip_samples: 20000
+
+checkpoint:
+  dir: ./checkpoints/bytelm_ab_adamw
+  save_every_steps: 2500
+  keep_last_k: 1
+  keep_every_n_steps: null
+  async_save: false
+
+sampling:
+  enabled: false
+
+logging:
+  log_every_steps: 50
+  throughput_window: 50

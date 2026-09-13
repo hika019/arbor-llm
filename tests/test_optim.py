@@ -522,3 +522,126 @@ def test_two_stage_scheduler_validation():
         build_scheduler(opt, _two_stage_cfg(stage2_peak_lr_ratio=1.5))
     with pytest.raises(ValueError):
         build_scheduler(opt, _two_stage_cfg(stage2_peak_lr_ratio=0.0, min_lr_ratio=0.02))
+
+
+# ---- Muon ---------------------------------------------------------------------
+def _tiny_byte_lm(bitnet: bool = False):
+    from src.model.arbor import ByteLM
+
+    torch.manual_seed(0)
+    return ByteLM({
+        "vocab_size": 260, "max_bytes": 64, "hidden_size": 32, "num_heads": 4,
+        "num_kv_heads": 2, "intermediate_size": 48, "num_hidden_layers": 2,
+        "bitnet": bitnet,
+    })
+
+
+def test_newton_schulz_orthogonalizes_singular_values():
+    from src.train.optim import _newton_schulz_orthogonalize
+
+    torch.manual_seed(1)
+    for shape in ((16, 48), (48, 16), (32, 32)):
+        g = torch.randn(shape)
+        o = _newton_schulz_orthogonalize(g, steps=5).float()
+        assert o.shape == g.shape
+        sv = torch.linalg.svdvals(o)
+        # KellerJordan 係数は 5 反復で特異値を概ね [0.7, 1.2] に寄せる (厳密な 1 ではない)
+        assert sv.min() > 0.5 and sv.max() < 1.3, sv
+
+
+def test_muon_param_split_targets_block_2d_weights_only():
+    from src.train.optim import muon_param_split
+
+    model = _tiny_byte_lm()
+    muon, adamw = muon_param_split(model)
+    names = dict((id(p), n) for n, p in model.named_parameters())
+    muon_names = sorted(names[id(p)] for p in muon)
+    adamw_names = sorted(names[id(p)] for p in adamw)
+    assert all(".attn.w" in n or ".ffn." in n for n in muon_names), muon_names
+    assert all(p.ndim == 2 for p in muon)
+    assert "embed.weight" in adamw_names and "head.weight" in adamw_names
+    assert all("norm" in n or n in ("embed.weight", "head.weight") for n in adamw_names), adamw_names
+    assert len(muon) + len(adamw) == len(list(model.parameters()))
+
+
+def test_muon_step_updates_both_groups_and_matches_rms_scale():
+    from src.train.optim import Muon, muon_param_split
+
+    model = _tiny_byte_lm()
+    muon, adamw = muon_param_split(model)
+    opt = Muon(muon, adamw, lr=1e-2, weight_decay=0.0, param_rounding="nearest")
+    assert len(opt.param_groups) == 2 and opt.param_groups[0]["use_muon"]
+    before = {id(p): p.detach().clone() for p in model.parameters()}
+    x = torch.randint(0, 260, (2, 16))
+    model(x).logits.float().logsumexp(-1).mean().backward()
+    opt.step()
+    for p in muon:
+        delta = (p.detach() - before[id(p)]).float()
+        assert delta.abs().sum() > 0
+        # 更新 RMS ≈ lr · 0.2 · √max(A,B) · rms(直交行列) = lr · 0.2 · √(max/min) 程度
+        rows, cols = p.shape
+        expected = 1e-2 * 0.2 * (max(rows, cols) / min(rows, cols)) ** 0.5
+        rms = delta.pow(2).mean().sqrt().item()
+        assert 0.4 * expected < rms < 1.6 * expected, (p.shape, rms, expected)
+        assert opt.state[p]["momentum_buffer"].dtype == torch.float32
+    for p in adamw:
+        assert (p.detach() - before[id(p)]).abs().sum() > 0
+        assert opt.state[p]["exp_avg"].dtype == torch.float32
+
+
+def test_muon_skips_params_without_grad_and_rejects_non_2d():
+    from src.train.optim import Muon
+
+    w = torch.nn.Parameter(torch.randn(4, 8))
+    b = torch.nn.Parameter(torch.zeros(4))
+    opt = Muon([w], [b], lr=1e-2)
+    w.grad = None
+    b.grad = torch.ones_like(b)
+    opt.step()
+    assert w not in opt.state or len(opt.state[w]) == 0
+    assert "exp_avg" in opt.state[b]
+    with pytest.raises(ValueError, match="2D"):
+        Muon([b], [w], lr=1e-2)
+    with pytest.raises(ValueError, match="Block"):
+        Muon([], [w], lr=1e-2)
+
+
+def test_muon_state_dict_roundtrip_keeps_fp32_state_on_bf16_params():
+    from src.train.optim import Muon
+
+    w = torch.nn.Parameter(torch.randn(4, 8).to(torch.bfloat16))
+    b = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+    opt = Muon([w], [b], lr=1e-2, param_rounding="stochastic")
+    w.grad = torch.randn_like(w)
+    b.grad = torch.randn_like(b)
+    opt.step()
+    sd = copy.deepcopy(opt.state_dict())
+    w2 = torch.nn.Parameter(w.detach().clone())
+    b2 = torch.nn.Parameter(b.detach().clone())
+    opt2 = Muon([w2], [b2], lr=1e-2, param_rounding="stochastic")
+    opt2.load_state_dict(sd)
+    assert opt2.state[w2]["momentum_buffer"].dtype == torch.float32
+    assert opt2.state[b2]["exp_avg_sq"].dtype == torch.float32
+    torch.testing.assert_close(opt2.state[w2]["momentum_buffer"], opt.state[w]["momentum_buffer"])
+
+
+def test_build_optimizer_muon_requires_model_and_fp32_state():
+    from src.train.optim import Muon
+
+    model = _tiny_byte_lm()
+    cfg = {"optimizer": "muon", "lr": 1e-3, "weight_decay": 0.1, "muon_adamw_lr": 5e-4}
+    with pytest.raises(ValueError, match="model="):
+        build_optimizer(model.parameters(), cfg)
+    with pytest.raises(ValueError, match="fp32"):
+        build_optimizer(model.parameters(), {**cfg, "state_precision": "int8"}, model=model)
+    opt = build_optimizer(model.parameters(), cfg, model=model)
+    assert isinstance(opt, Muon)
+    assert opt.param_groups[0]["lr"] == pytest.approx(1e-3)
+    assert opt.param_groups[1]["lr"] == pytest.approx(5e-4)
+    # scheduler は 2 group に同じ倍率を掛ける (adamw_lr の比を保つ)
+    sched = build_scheduler(opt, {"total_steps": 100, "warmup_steps": 10, "min_lr_ratio": 0.1})
+    for _ in range(5):
+        opt.step()
+        sched.step()
+    lrs = sched.get_last_lr()
+    assert lrs[0] == pytest.approx(1e-3 * 0.5) and lrs[1] == pytest.approx(5e-4 * 0.5)

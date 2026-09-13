@@ -1,7 +1,8 @@
 """Optimizer / LR scheduler ファクトリ。
 
-optimizer は `optim.optimizer` (adamw | lion) と `optim.state_precision`
-(fp32 | int8 | bf8) で選ぶ。state_precision は adamw の optimizer state形式を表し、
+optimizer は `optim.optimizer` (adamw | muon | lion) と `optim.state_precision`
+(fp32 | int8 | bf8) で選ぶ。muon は transformer Block 内の 2D 重みだけを Muon で更新し、
+残り (embedding / head / norm / patch_proj 等) は fp32 state の AdamW で更新する。state_precision は adamw の optimizer state形式を表し、
 全 parameter に一様に適用される (小さい層も除外しない)。指定した実装/精度が
 使えない場合に別 optimizer や別精度へ暗黙フォールバックしてはいけない。
 int8 は blockwise scale + 非線形dynamic符号帳、bf8 はfloat8_e5m2でmomentを保持し、
@@ -490,6 +491,202 @@ class Lion(torch.optim.Optimizer):
 _STATE_PRECISIONS = ("fp32", "int8", "bf8")
 
 
+# ---- Muon (Moonshot 版: weight decay + AdamW と RMS を揃えるスケール) -------------
+# 出典: "Muon is Scalable for LLM Training" (arXiv 2502.16982)。更新は
+#   M = μM + G,  U = G + μM (nesterov),  O = NewtonSchulz5(U),
+#   W = W (1 - lr·wd) - lr · 0.2·√max(rows, cols) · O
+# 0.2·√max(A,B) は AdamW の更新 RMS (~0.2〜0.4) に合わせる係数で、これにより
+# lr / weight_decay を AdamW と共有できる。Newton-Schulz は bf16 で回す (公式実装と同じ)。
+# 2D でない parameter や Block 外 (embedding / head / patch_proj / global_to_local /
+# RMSNorm) は Moonshot / スピードランと同じく AdamW に任せる。
+_NS_COEFFS = (3.4445, -4.7750, 2.0315)
+_MUON_RMS_MATCH = 0.2
+
+
+def _newton_schulz_orthogonalize(g: torch.Tensor, steps: int, eps: float = 1e-7) -> torch.Tensor:
+    """G の極分解の直交因子 U·Vᵀ を Newton-Schulz 5 次反復で近似する (bf16)。
+
+    係数は 5 反復で特異値を [0.7, 1.2] 程度へ寄せる KellerJordan 版 (厳密な 1 には
+    収束しない代わりに反復が少なくて済む)。細長い行列は転置して小さい側で反復する。
+    """
+    if g.ndim != 2:
+        raise ValueError(f"Muon expects 2D parameters, got shape {tuple(g.shape)}")
+    a, b, c = _NS_COEFFS
+    x = g.to(torch.bfloat16)
+    transposed = x.shape[0] > x.shape[1]
+    if transposed:
+        x = x.mT
+    x = x / (x.norm() + eps)
+    for _ in range(steps):
+        aa = x @ x.mT
+        bb = b * aa + c * (aa @ aa)
+        x = a * x + bb @ x
+    if transposed:
+        x = x.mT
+    return x
+
+
+def _adamw_update_eager(
+    p: torch.Tensor, grad: torch.Tensor, state: dict, *,
+    lr: float, beta1: float, beta2: float, eps: float, wd: float, rounding: str,
+) -> None:
+    """fp32 moment state の AdamW 1 step (eager)。AdamWFP32 の非融合経路と同じ式。"""
+    if len(state) == 0:
+        state["step"] = 0
+        state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+    state["step"] += 1
+    step = state["step"]
+    exp_avg = state["exp_avg"]
+    exp_avg_sq = state["exp_avg_sq"]
+    grad32 = grad.float()
+    exp_avg.mul_(beta1).add_(grad32, alpha=1.0 - beta1)
+    exp_avg_sq.mul_(beta2).addcmul_(grad32, grad32, value=1.0 - beta2)
+    bias_correction1 = 1.0 - beta1**step
+    bias_correction2 = 1.0 - beta2**step
+    denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+    update = exp_avg.div(denom).mul_(lr / bias_correction1)
+    _apply_update(p, update, lr * wd, rounding)
+
+
+def muon_param_split(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    """(Muon 対象, AdamW 対象) に分ける。Muon 対象 = transformer Block 内の 2D 重み。
+
+    ByteLM / Arbor とも attention (wq/wk/wv/wo) と FFN (gate/up/down) は Block の中に
+    あり、embedding / head / patch_proj / global_to_local / RMSNorm は外にあるので、
+    名前に依存せず Block の所属だけで Moonshot と同じ分担になる。
+    """
+    from src.model.arbor import Block
+
+    muon_ids: set[int] = set()
+    for module in model.modules():
+        if isinstance(module, Block):
+            for p in module.parameters():
+                if p.ndim == 2:
+                    muon_ids.add(id(p))
+    muon: list[torch.nn.Parameter] = []
+    adamw: list[torch.nn.Parameter] = []
+    for p in model.parameters():
+        (muon if id(p) in muon_ids else adamw).append(p)
+    return muon, adamw
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon (Block 内 2D 重み) + AdamW (それ以外) の複合 optimizer。
+
+    param_groups は 2 つ: group[0] が Muon (`use_muon=True`)、group[1] が AdamW。
+    LambdaLR は各 group の initial_lr に同じ倍率を掛けるので、scheduler /
+    rebase_scheduler_lr / TwoStageCooldownLR の weight decay 切替はそのまま効く。
+    Muon の momentum は fp32 (AdamW の半分の state)。AdamW 側は fp32 state の eager 経路
+    (対象が embedding / head / norm 程度で小さいため融合は不要)。
+    parameter への書き戻しは両 group とも `_apply_update` (param_rounding 対応)。
+    """
+
+    def __init__(
+        self,
+        muon_params: Iterable[torch.nn.Parameter],
+        adamw_params: Iterable[torch.nn.Parameter],
+        *,
+        lr: float,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        weight_decay: float = 0.0,
+        adamw_lr: float | None = None,
+        betas: tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+        param_rounding: str = "stochastic",
+    ) -> None:
+        self.param_rounding = resolve_param_rounding(param_rounding)
+        muon_params = list(muon_params)
+        adamw_params = list(adamw_params)
+        if not muon_params:
+            raise ValueError("Muon: 対象 parameter (Block 内の 2D 重み) がありません")
+        for p in muon_params:
+            if p.ndim != 2:
+                raise ValueError(f"Muon: 2D 以外の parameter が対象に含まれています: {tuple(p.shape)}")
+        if lr <= 0:
+            raise ValueError(f"lr must be positive: {lr}")
+        if adamw_lr is not None and adamw_lr <= 0:
+            raise ValueError(f"adamw_lr must be positive: {adamw_lr}")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"momentum must be in [0, 1): {momentum}")
+        if ns_steps < 1:
+            raise ValueError(f"ns_steps must be >= 1: {ns_steps}")
+        if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
+            raise ValueError(f"betas must be in [0, 1): {betas}")
+        if eps <= 0:
+            raise ValueError(f"eps must be positive: {eps}")
+        if weight_decay < 0:
+            raise ValueError(f"weight_decay must be non-negative: {weight_decay}")
+        defaults = dict(
+            lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=bool(nesterov),
+            ns_steps=int(ns_steps), betas=tuple(betas), eps=eps, use_muon=False,
+        )
+        groups = [dict(params=muon_params, use_muon=True)]
+        if adamw_params:
+            groups.append(dict(params=adamw_params, lr=adamw_lr if adamw_lr is not None else lr))
+        super().__init__(groups, defaults)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """fp32 state を parameter dtype へ落とさずに復元する (AdamWFP32 と同じ契約)。"""
+        super().load_state_dict(state_dict)
+        for saved_group, group in zip(state_dict["param_groups"], self.param_groups):
+            for saved_id, p in zip(saved_group["params"], group["params"]):
+                saved = state_dict["state"].get(saved_id, {})
+                for key in ("momentum_buffer", "exp_avg", "exp_avg_sq"):
+                    if key in saved:
+                        self.state[p][key] = saved[key].to(device=p.device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            if group["use_muon"]:
+                mu = group["momentum"]
+                nesterov = group["nesterov"]
+                ns_steps = group["ns_steps"]
+                for p in group["params"]:
+                    grad = p.grad
+                    if grad is None:
+                        continue
+                    if grad.is_sparse:
+                        raise RuntimeError("Muon does not support sparse gradients")
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["step"] = 0
+                        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["step"] += 1
+                    buf = state["momentum_buffer"]
+                    grad32 = grad.float()
+                    buf.mul_(mu).add_(grad32)
+                    u = grad32.add(buf, alpha=mu) if nesterov else buf
+                    ortho = _newton_schulz_orthogonalize(u, ns_steps).float()
+                    scale = lr * _MUON_RMS_MATCH * math.sqrt(max(p.shape))
+                    _apply_update(p, ortho.mul_(scale), lr * wd, self.param_rounding)
+            else:
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                for p in group["params"]:
+                    grad = p.grad
+                    if grad is None:
+                        continue
+                    if grad.is_sparse:
+                        raise RuntimeError("Muon does not support sparse gradients")
+                    _adamw_update_eager(
+                        p, grad, self.state[p],
+                        lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd,
+                        rounding=self.param_rounding,
+                    )
+        return loss
+
+
 def resolve_state_precision(value: str | None) -> str:
     """optim.state_precision を正規化する (fp32 | int8 | bf8)。別値は暗黙変換せずエラー。"""
     if value is None:
@@ -533,7 +730,10 @@ def _build_adamw(
     return AdamWFP32(params, backend=fp32_backend, **kwargs)
 
 
-def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.optim.Optimizer:
+def build_optimizer(
+    params: Iterable[torch.nn.Parameter], cfg: dict, model: torch.nn.Module | None = None,
+) -> torch.optim.Optimizer:
+    """`model` は muon の parameter 分担 (Block 内 2D 重み / それ以外) に使う。muon 以外は不要。"""
     params = list(params)
     if not params:
         raise ValueError("optimizer parameter list is empty")
@@ -543,6 +743,30 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
     eps = cfg.get("eps", 1e-8)
     wd = cfg.get("weight_decay", 0.0)
     cfg_precision = cfg.get("state_precision")
+
+    if name == "muon":
+        if model is None:
+            raise ValueError("optim.optimizer: muon は build_optimizer(model=...) が必要です")
+        if resolve_state_precision(cfg_precision) != "fp32":
+            raise ValueError(
+                "optim.state_precision は muon では fp32 のみ対応 (momentum / AdamW state を fp32 で保持)"
+            )
+        muon_params, adamw_params = muon_param_split(model)
+        given = {id(p) for p in params}
+        muon_params = [p for p in muon_params if id(p) in given]
+        adamw_params = [p for p in adamw_params if id(p) in given]
+        return Muon(
+            muon_params, adamw_params,
+            lr=lr,
+            momentum=float(cfg.get("muon_momentum", 0.95)),
+            nesterov=bool(cfg.get("muon_nesterov", True)),
+            ns_steps=int(cfg.get("muon_ns_steps", 5)),
+            weight_decay=wd,
+            adamw_lr=cfg.get("muon_adamw_lr"),
+            betas=betas,
+            eps=eps,
+            param_rounding=resolve_param_rounding(cfg.get("param_rounding")),
+        )
 
     if name == "lion":
         if cfg_precision is not None:
@@ -558,7 +782,7 @@ def build_optimizer(params: Iterable[torch.nn.Parameter], cfg: dict) -> torch.op
         return Lion(params, lr=lr, betas=betas, weight_decay=wd, state_dtype=state_dtype)
 
     if name != "adamw":
-        raise ValueError(f"unknown optimizer: {name}")
+        raise ValueError(f"unknown optimizer: {name} (choices: adamw | muon | lion)")
 
     return _build_adamw(
         params,
