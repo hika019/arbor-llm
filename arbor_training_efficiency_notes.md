@@ -26,7 +26,7 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
   bytes で持つなら再計算する。本走投入前に ByteLM (`bitnet: true`) で固定 accum vs schedule を
   1 時間ずつ比べて効きを確認する。
 
-## 2. Muon optimizer (A) — ByteLM で検証してから
+## 2. Muon optimizer (A) — 実装済み、ByteLM で A/B 中 (2026-09-14)
 
 - 出典: Moonshot "Muon is Scalable for LLM Training" (arXiv 2502.16982)。AdamW 比
   **約 2× の計算効率**、3B/16B MoE (Moonlight) を 5.7T token で実証。スケールさせるのに
@@ -40,14 +40,18 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 - Muon 自体の state 量子化: "Effective Quantization of Muon Optimizer States"
   (arXiv 2509.23106)、"MuonQ" (arXiv 2605.11396)。直交化が特異ベクトル方向の量子化誤差を
   増幅するので、8bit blockwise までは安全、4bit は工夫が要る。
-- arbor での手順:
-  1. `src/train/optim.py` に `Muon` を追加 (~80 行): momentum → Newton-Schulz 5 反復 →
-     Moonshot のスケール → 既存 `_apply_update` で stochastic rounding 込みの書き戻し。
-  2. 2D の BitLinear 重みだけ Muon。embedding / head / RMSNorm / `patch_proj` /
-     `global_to_local` は AdamW のまま (Moonshot / スピードランと同じ分担)。
-  3. `configs/entropy_lm.yaml` を `bitnet: true` にして adamw vs muon を同 step 数で比較
-     (19M, 15k step ≈ 1 時間/run)。
-  4. 副産物: 二次モーメント不要で optimizer state が半分 → 24GB の VRAM に効く。
+- 実装 (82ab40f): `optim.optimizer: muon` (`src/train/optim.py` の `Muon`)。
+  momentum (fp32) → Newton-Schulz 5 反復 (bf16) → `0.2·√max(rows, cols)` の RMS 合わせ →
+  既存 `_apply_update` (stochastic rounding)。対象は transformer `Block` 内の 2D 重みだけで、
+  embedding / head / RMSNorm / `patch_proj` / `global_to_local` は fp32 state の AdamW
+  (param_groups[1])。`muon_momentum` / `muon_nesterov` / `muon_ns_steps` / `muon_adamw_lr`。
+  lr / wd は AdamW と共有 (Moonshot のスケールの狙い)。`state_precision` は fp32 のみ。
+  副産物: 二次モーメント不要で optimizer state が半分 → 24GB の VRAM に効く。
+  コスト見積: 1B の Newton-Schulz は ~53 TFLOP/step ≈ +0.35 s (5.2 s/step の +7%)。
+- A/B: `configs/bytelm_ab.yaml` (AdamW 基準) vs `configs/bytelm_ab_muon.yaml`。BitNet ByteLM
+  19M、本走と同じ data mix / 8k / lr 8e-4 / wd 0.1 / stochastic rounding、15k step (≈1 時間)。
+  差分は optimizer だけ。判定は train loss ema と validation (ja_web / english / code) の bpb。
+  結果はここに追記する。
 - 制約: 本走中は VRAM 22.5/23GB なので ByteLM でも同時実行は WSL 落ちの危険
   (推論同時実行で落ちた前例と同じ機構)。本走停止中に回す。
 
