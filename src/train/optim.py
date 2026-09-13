@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 
@@ -635,9 +635,21 @@ def _scheduler_common(cfg: dict) -> tuple[int, int, float, float]:
     return warmup, total, min_ratio, decay_end_ratio
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: dict,
+    lr_scale: Callable[[int], float] | None = None,
+):
+    """lr_scale(step) を渡すと各 scheduler の lr_lambda に乗算する (batch size
+    warmup の √(accum/final) 補正用)。LambdaLR の base_lrs / state_dict /
+    rebase_scheduler_lr との互換はそのまま。"""
     name = cfg.get("scheduler", "cosine_warmup")
     warmup, total, min_ratio, decay_end_ratio = _scheduler_common(cfg)
+
+    def with_scale(fn: Callable[[int], float]) -> Callable[[int], float]:
+        if lr_scale is None:
+            return fn
+        return lambda step: fn(step) * lr_scale(step)
 
     if name == "cosine_warmup":
         decay_end = max(warmup + 1, round(total * decay_end_ratio))
@@ -649,7 +661,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
             cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
             return min_ratio + (1.0 - min_ratio) * cos
 
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, with_scale(lr_lambda))
 
     if name == "two_stage":
         # BitNet 公式 2 段レシピ。stage2_start_ratio で stage を切り替え、stage1 は
@@ -687,7 +699,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict):
             return min_ratio + (stage2_peak - min_ratio) * cos
 
         return TwoStageCooldownLR(
-            optimizer, lr_lambda,
+            optimizer, with_scale(lr_lambda),
             wd_stage1=wd_stage1, wd_stage2=wd_stage2, stage2_start_step=s2,
         )
 

@@ -52,3 +52,4 @@ logs/torch_profile_*.json
 
 .deps/*
 .torch_extensions/
+!arbor_training_efficiency_notes.md

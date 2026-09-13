@@ -44,6 +44,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.train.checkpoint import CheckpointManager, CheckpointMeta  # noqa: E402
+from src.train.grad_accum import GradAccumSchedule  # noqa: E402
 from src.train.optim import build_optimizer, build_scheduler  # noqa: E402
 from src.train.signals import StopFlag  # noqa: E402
 from src.train.throughput import ThroughputMeter  # noqa: E402
@@ -971,6 +972,11 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     if micro_batch > 1:
         speed_cfg["micro_batch_size"] = 1
         speed_cfg["grad_accum_steps"] = grad_accum * micro_batch
+        if speed_cfg.get("grad_accum_schedule") is not None:
+            speed_cfg["grad_accum_schedule"] = [
+                [int(step), int(accum) * micro_batch]
+                for step, accum in speed_cfg["grad_accum_schedule"]
+            ]
         print(
             "[train] MPS: micro_batch_size=1 grad_accum_steps={} "
             "(effective batch preserved: {} sequences)".format(
@@ -1198,7 +1204,7 @@ def configure_training_bitnet(base_model, device, cfg):
     bitnet_cache_info = configure_bitlinear_training_cache(
         base_model,
         enabled=speed_cfg.get("bitnet_weight_cache", "auto"),
-        grad_accum_steps=int(speed_cfg.get("grad_accum_steps", 1)),
+        grad_accum_steps=GradAccumSchedule.from_speed_cfg(speed_cfg).max_accum,
         max_cache_gib=speed_cfg.get("bitnet_weight_cache_gib", 1.25),
         min_numel=int(speed_cfg.get("bitnet_weight_cache_min_numel", 65536)),
     )
@@ -1495,7 +1501,13 @@ def main() -> int:
     # ---- optimizer / scheduler ----
     optimizer = build_optimizer(model.parameters(), cfg["optim"])
     timing_mark("optimizer_created", device)
-    scheduler = build_scheduler(optimizer, cfg["optim"])
+    # batch size warmup: accum が定常値未満の区間は lr を √(accum/final) 倍する
+    accum_schedule = GradAccumSchedule.from_speed_cfg(cfg["speed"])
+    scheduler = build_scheduler(
+        optimizer,
+        cfg["optim"],
+        lr_scale=None if accum_schedule.is_constant else accum_schedule.lr_scale_at,
+    )
     timing_mark("scheduler_created", device)
 
     # ---- チェックポイント (manager は tuning skip 判定のため構築済み) ----
@@ -1630,7 +1642,9 @@ def main() -> int:
     cfg_hash = config_hash(effective_cfg)
     run_info = run_metadata(args, device)
     save_every = ckpt_cfg["save_every_steps"]
-    grad_accum = cfg["speed"].get("grad_accum_steps", 1)
+    grad_accum = accum_schedule.final_accum
+    if not accum_schedule.is_constant:
+        print(f"[train] grad_accum_schedule={accum_schedule.describe()}")
     sync_each_step = bool(cfg["speed"].get("sync_each_step", False))
     cuda_prefetch = bool(cfg["speed"].get("cuda_prefetch", False)) and device.type == "cuda"
     # CPU 側 packing の先読み深さ。num_workers>0 なら DataLoader が既に並列なので無効。
@@ -1818,7 +1832,7 @@ def main() -> int:
     preserve_grad_buffers = (
         device.type == "cuda"
         and uses_cudagraph_compile(cfg["speed"])
-        and int(cfg["speed"].get("grad_accum_steps", 1)) > 1
+        and accum_schedule.max_accum > 1
     )
     if preserve_grad_buffers:
         grad_buffer_count, grad_buffer_bytes = prepare_cudagraph_gradient_buffers(
@@ -2020,6 +2034,7 @@ def main() -> int:
                 torch.cuda.nvtx.range_push("arbor.step")
             step_t0 = time.perf_counter()
             bytes_this_step = 0
+            grad_accum = accum_schedule.accum_at(global_step)
             for micro in range(grad_accum):
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_next_batch", device)
@@ -2365,7 +2380,8 @@ def main() -> int:
                     f"pack_fill={avg_fill_ratio * 100:.1f}% "
                     f"fwd_ms={fwd_ms:.1f} bwd_ms={bwd_ms:.1f} opt_ms={opt_ms:.1f} "
                     f"batch_ms={batch_ms:.1f} h2d_ms={h2d_ms:.1f} step_ms={step_ms:.1f} "
-                    f"phase={phase} lr={cur_lr:.2e}{profile_text}"
+                    f"phase={phase} lr={cur_lr:.2e}"
+                    f"{'' if accum_schedule.is_constant else f' accum={grad_accum}'}{profile_text}"
                 )
                 with metrics_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps({
@@ -2373,6 +2389,7 @@ def main() -> int:
                         "loss": round(cur_loss, 6),
                         "ema": round(cur_ema, 6),
                         "lr": cur_lr,
+                        "grad_accum": int(grad_accum),
                         "bytes_s": round(cur_bytes_s),
                         "patches_s": round(cur_patches_s),
                         "bytes_per_patch": round(bytes_per_patch, 6),

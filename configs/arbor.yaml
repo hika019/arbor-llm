@@ -213,6 +213,13 @@ speed:
   grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)。
                                 # それでも溢れる時は gradient_checkpointing: true + torch_compile: false
                                 # (compile×ckpt 併用は torch2.5 で NaN になるため train.py が弾く)
+  # batch size warmup (Ai2 "Critical Batch Size Revisited", OLMo 1B で同 loss を 43% 少ない step で達成)。
+  # 序盤は臨界 batch が小さいので accum を小さく始め、step で段階的に定常値へ上げる。
+  # 最終値は grad_accum_steps と一致させる。区間中は lr を √(accum/final) 倍する
+  # (grad_accum_lr_scaling: sqrt | none)。step で決まるので resume は決定的、再コンパイルも無し。
+  # 序盤の bytes/step が減るので total_steps の bytes 換算は変わる (arbor_training_efficiency_notes.md)。
+  # grad_accum_schedule: [[0, 8], [10000, 16], [30000, 32]]
+  # grad_accum_lr_scaling: sqrt
 
 validation:
   enabled: true
