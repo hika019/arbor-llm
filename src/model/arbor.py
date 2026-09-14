@@ -61,6 +61,13 @@ BYTE_OFFSET = 4  # 生バイト b は token id (b + 4)
 # 動的 patching の local attention を窓化する際の chunk 長 (T はこの倍数のとき窓経路)
 _WINDOW_CHUNK = 128
 
+# 素の causal SDPA で系列長がこれ以下なら mem-efficient backend を明示する。
+# SDPA の backend 選択は固定優先度 (flash > efficient > math) で形状を見ないため、
+# static patching の local attention (T = patch_size = 16) では flash が 128 行 tile の
+# 1/8 しか使えず、efficient (64×64 tile) の 2.7 倍遅い。RTX 4090 / head_dim 64 の実測
+# (fwd+bwd, 同 token 数) で T=16: 2.69x, 64: 1.56x, 256: 1.20x, 512: 0.99x なので 256 で切る。
+_SHORT_SEQ_EFFICIENT_SDPA_MAX = 256
+
 
 def _is_block_mask(m: object) -> bool:
     """flex_attention の BlockMask かどうか (torch 未対応環境でも壊れないよう名前で判定)."""
@@ -310,6 +317,14 @@ class Attention(nn.Module):
             if t != 1:
                 raise ValueError("KV cache への追記は 1 トークンずつ行うこと")
             out = F.scaled_dot_product_attention(q, k, v)
+        elif q.is_cuda and t <= _SHORT_SEQ_EFFICIENT_SDPA_MAX and not native_gqa:
+            # 短系列 (static patching の local 層) は flash の tile が空振りするので
+            # mem-efficient backend を明示する。efficient は enable_gqa 非対応 (kernel 無し
+            # エラー) なので native GQA の場合は既定の選択に任せる。
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal, enable_gqa=native_gqa)
         out = out.transpose(1, 2).reshape(b, t, -1)

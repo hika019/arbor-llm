@@ -488,3 +488,44 @@ def test_global_attn_flex_matches_sdpa():
     assert torch.allclose(la, lb, atol=1e-4), (
         f"flex と sdpa の logits 不一致 (max diff={(la - lb).abs().max().item():.2e})"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("compiled", [False, True])
+def test_short_seq_attention_uses_efficient_sdpa(monkeypatch, compiled):
+    """static patching の local attention (T=16) が mem-efficient SDPA を使い、flash と
+    同じ値を返すこと (#CUDA speed path)。
+
+    flash は 128 行 tile を 16 行にしか使えず 2.7 倍遅い (nsys 実測 2026-09-14)。
+    数値は厳密 attention 同士なので bf16 の加算順の差だけ。
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from torch.profiler import ProfilerActivity, profile
+
+    import src.model.arbor as arbor_mod
+    from src.model.arbor import Attention, RotaryEmbedding
+
+    torch.manual_seed(0)
+    dim, heads, t = 64, 2, 16
+    rope = RotaryEmbedding(dim // heads, max_pos=t, theta=10000.0).cuda()
+    attn = Attention(dim, heads, heads, rope, bitnet=False, norm_eps=1e-5, causal=True).cuda().to(torch.bfloat16)
+    x = torch.randn(8, t, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    fn = torch.compile(attn) if compiled else attn
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        out = fn(x)
+        out.float().sum().backward()
+        torch.cuda.synchronize()
+    names = [e.key for e in prof.key_averages()]
+    assert any("fmha_cutlass" in n for n in names), names
+    assert not any("flash_fwd" in n for n in names), names
+    grad_eff = x.grad.clone()
+    x.grad = None
+
+    # 参照: しきい値を 0 にして既定の選択 (flash) を通す
+    monkeypatch.setattr(arbor_mod, "_SHORT_SEQ_EFFICIENT_SDPA_MAX", 0)
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        ref = attn(x)
+        ref.float().sum().backward()
+    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    assert torch.allclose(grad_eff.float(), x.grad.float(), atol=2e-2, rtol=2e-2)
