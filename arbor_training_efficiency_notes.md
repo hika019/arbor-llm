@@ -13,7 +13,7 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 
 ## 1. batch size warmup (A) — 実装済み
 
-`speed.grad_accum_schedule` (`src/train/grad_accum.py`)。詳細は configs/arbor.yaml のコメント参照。
+`speed.grad_accum_steps` に [[step, accum], ...] (`src/train/grad_accum.py`)。詳細は configs/arbor.yaml のコメント参照。
 
 - 出典: Ai2 "Critical Batch Size Revisited: A Simple Empirical Approach to Large-Batch
   Language Model Training" (arXiv 2505.23971) / [Ai2 blog](https://allenai.org/blog/critical-batch-size)。

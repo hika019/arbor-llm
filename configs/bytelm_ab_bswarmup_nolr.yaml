@@ -3,7 +3,7 @@
 #   bytelm_ab.yaml           … accum 1 固定 (65.5k bytes/step, 15000 step)  ← 実施済み (小 batch 参照)
 #   bytelm_ab_accum4.yaml    … accum 4 固定 (262k bytes/step, 3750 step)   ← 本走相当の大 batch 基準
 #   bytelm_ab_bswarmup.yaml  … [[0,1],[5000,2],[7500,4]] + lr √(accum/4) 補正 (8750 step)
-# 「同 bytes で warmup の方が低 loss」なら本走 (arbor.yaml) の grad_accum_schedule を有効化する。
+# 「同 bytes で warmup の方が低 loss」なら本走 (arbor.yaml) の grad_accum_steps を schedule にする。
 # A/B 差分: bytelm_ab_bswarmup と同じ schedule で lr 補正なし (小 accum 区間も lr 8e-4)。sqrt 則の是非を切り分ける。
 
 run_name: bytelm_ab_bswarmup_nolr
@@ -105,8 +105,7 @@ speed:
   cpu_prefetch_depth: 3
   sync_each_step: false
   micro_batch_size: 8
-  grad_accum_steps: 4
-  grad_accum_schedule: [[0, 1], [5000, 2], [7500, 4]]
+  grad_accum_steps: [[0, 1], [5000, 2], [7500, 4]]
   grad_accum_lr_scaling: none
 
 validation:

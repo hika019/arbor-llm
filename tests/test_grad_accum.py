@@ -21,8 +21,7 @@ def test_constant_schedule_when_config_has_no_schedule():
 
 def test_schedule_is_step_function_and_lr_scales_by_sqrt():
     sched = GradAccumSchedule.from_speed_cfg({
-        "grad_accum_steps": 32,
-        "grad_accum_schedule": [[0, 8], [100, 16], [300, 32]],
+        "grad_accum_steps": [[0, 8], [100, 16], [300, 32]],
     })
     assert not sched.is_constant
     assert [sched.accum_at(s) for s in (0, 99, 100, 299, 300, 10_000)] == [8, 8, 16, 16, 32, 32]
@@ -34,8 +33,7 @@ def test_schedule_is_step_function_and_lr_scales_by_sqrt():
 
 def test_lr_scaling_none_keeps_lr():
     sched = GradAccumSchedule.from_speed_cfg({
-        "grad_accum_steps": 4,
-        "grad_accum_schedule": [[0, 1], [10, 4]],
+        "grad_accum_steps": [[0, 1], [10, 4]],
         "grad_accum_lr_scaling": "none",
     })
     assert sched.lr_scale_at(0) == 1.0
@@ -44,12 +42,12 @@ def test_lr_scaling_none_keeps_lr():
 @pytest.mark.parametrize(
     "speed_cfg, message",
     [
-        ({"grad_accum_steps": 32, "grad_accum_schedule": [[0, 8], [100, 16]]}, "一致"),
-        ({"grad_accum_steps": 16, "grad_accum_schedule": [[5, 8], [100, 16]]}, "最初の step"),
-        ({"grad_accum_steps": 16, "grad_accum_schedule": [[0, 8], [100, 4], [50, 16]]}, "昇順"),
-        ({"grad_accum_steps": 16, "grad_accum_schedule": [[0, 0], [100, 16]]}, "1 以上"),
-        ({"grad_accum_steps": 16, "grad_accum_schedule": [[0, 8], [100, 16]], "grad_accum_lr_scaling": "linear"}, "grad_accum_lr_scaling"),
-        ({"grad_accum_steps": 16, "grad_accum_schedule": [8, 16]}, "形"),
+        ({"grad_accum_steps": 32, "grad_accum_schedule": [[0, 8], [100, 32]]}, "廃止"),
+        ({"grad_accum_steps": [[5, 8], [100, 16]]}, "step 0"),
+        ({"grad_accum_steps": [[0, 8], [100, 4], [50, 16]]}, "昇順"),
+        ({"grad_accum_steps": [[0, 0], [100, 16]]}, "1 以上"),
+        ({"grad_accum_steps": [[0, 8], [100, 16]], "grad_accum_lr_scaling": "linear"}, "grad_accum_lr_scaling"),
+        ({"grad_accum_steps": [8, 16]}, "形"),
     ],
 )
 def test_invalid_schedules_are_rejected(speed_cfg, message):
@@ -60,8 +58,7 @@ def test_invalid_schedules_are_rejected(speed_cfg, message):
 @pytest.mark.parametrize("name", ["cosine_warmup", "two_stage"])
 def test_build_scheduler_applies_lr_scale_to_every_scheduler(name):
     sched = GradAccumSchedule.from_speed_cfg({
-        "grad_accum_steps": 4,
-        "grad_accum_schedule": [[0, 1], [20, 4]],
+        "grad_accum_steps": [[0, 1], [20, 4]],
     })
     optim_cfg = {
         "scheduler": name,
@@ -103,13 +100,11 @@ def test_mps_adaptation_scales_schedule_with_micro_batch():
         "optim": {"optimizer": "adamw", "state_precision": "fp32"},
         "speed": {
             "micro_batch_size": 2,
-            "grad_accum_steps": 32,
-            "grad_accum_schedule": [[0, 8], [1000, 32]],
+            "grad_accum_steps": [[0, 8], [1000, 32]],
         },
     }
     resolved = adapt_config_for_device(cfg, torch.device("mps"))
-    assert resolved["speed"]["grad_accum_steps"] == 64
-    assert resolved["speed"]["grad_accum_schedule"] == [[0, 16], [1000, 64]]
+    assert resolved["speed"]["grad_accum_steps"] == [[0, 16], [1000, 64]]
     # 振替後も schedule と定常値の整合が保たれる
     sched = GradAccumSchedule.from_speed_cfg(resolved["speed"])
     assert sched.final_accum == 64
@@ -118,8 +113,7 @@ def test_mps_adaptation_scales_schedule_with_micro_batch():
 
 def test_cumulative_accum_and_bytes_fraction():
     sched = GradAccumSchedule.from_speed_cfg({
-        "grad_accum_steps": 4,
-        "grad_accum_schedule": [[0, 1], [10, 2], [15, 4]],
+        "grad_accum_steps": [[0, 1], [10, 2], [15, 4]],
     })
     assert sched.cumulative_accum(0) == 0
     assert sched.cumulative_accum(10) == 10
@@ -147,7 +141,7 @@ def test_scheduler_progress_by_bytes_matches_constant_run_at_equal_bytes(name):
     }
     # 固定 accum 4 を 100 step = 400 micro-step。schedule 側は accum 1 を 100 step + accum 4 を 75 step = 400 micro-step。
     sched = GradAccumSchedule.from_speed_cfg({
-        "grad_accum_steps": 4, "grad_accum_schedule": [[0, 1], [100, 4]],
+        "grad_accum_steps": [[0, 1], [100, 4]],
     })
 
     def curve(total, progress, steps):

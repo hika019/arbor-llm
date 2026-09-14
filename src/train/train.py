@@ -968,19 +968,17 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
         print("[train] MPS: gradient_checkpointing=ON (model shape/precision unchanged)")
 
     micro_batch = int(speed_cfg.get("micro_batch_size", 1))
-    grad_accum = int(speed_cfg.get("grad_accum_steps", 1))
+    schedule = GradAccumSchedule.from_speed_cfg(speed_cfg)
     if micro_batch > 1:
         speed_cfg["micro_batch_size"] = 1
-        speed_cfg["grad_accum_steps"] = grad_accum * micro_batch
-        if speed_cfg.get("grad_accum_schedule") is not None:
-            speed_cfg["grad_accum_schedule"] = [
-                [int(step), int(accum) * micro_batch]
-                for step, accum in speed_cfg["grad_accum_schedule"]
-            ]
+        scaled = schedule.scaled(micro_batch)
+        speed_cfg["grad_accum_steps"] = (
+            scaled.final_accum if scaled.is_constant else [list(pt) for pt in scaled.points]
+        )
         print(
             "[train] MPS: micro_batch_size=1 grad_accum_steps={} "
             "(effective batch preserved: {} sequences)".format(
-                speed_cfg["grad_accum_steps"], micro_batch * grad_accum
+                speed_cfg["grad_accum_steps"], micro_batch * schedule.final_accum
             )
         )
 
@@ -1646,7 +1644,7 @@ def main() -> int:
     save_every = ckpt_cfg["save_every_steps"]
     grad_accum = accum_schedule.final_accum
     if not accum_schedule.is_constant:
-        print(f"[train] grad_accum_schedule={accum_schedule.describe()}")
+        print(f"[train] grad_accum_steps={accum_schedule.describe()}")
     sync_each_step = bool(cfg["speed"].get("sync_each_step", False))
     cuda_prefetch = bool(cfg["speed"].get("cuda_prefetch", False)) and device.type == "cuda"
     # CPU 側 packing の先読み深さ。num_workers>0 なら DataLoader が既に並列なので無効。

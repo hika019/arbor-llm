@@ -176,7 +176,7 @@ optim:
   min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
   decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
-  total_steps: 230000           # grad_accum_schedule 込みで 105GB (= 旧 200k step × 524k bytes)
+  total_steps: 230000           # grad_accum_steps の schedule 込みで 105GB (= 旧 200k step × 524k bytes)
 
 # ---- スループット ----
 speed:
@@ -210,14 +210,11 @@ speed:
   bitnet_weight_cache_min_numel: 0
   sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
   micro_batch_size: 2           # patch16 + local 1/2層で余裕があれば 4 も A/B 候補
-  grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)。
-                                # それでも溢れる時は gradient_checkpointing: true + torch_compile: false
-                                # (compile×ckpt 併用は torch2.5 で NaN になるため train.py が弾く)
-  # batch size warmup (Ai2 "Critical Batch Size Revisited"): 序盤は臨界 batch が小さいので accum を
-  # 小さく始める。[[step, accum], ...] の step 関数、最終値 = grad_accum_steps。lr schedule の進行は
-  # 消費 bytes 割合で測る。ByteLM A/B (2026-09-14): 1→2→4 warmup は accum 4 固定より bpb -0.043。
-  # accum 8 で 2.6GB、16 で 7.9GB、以後 32。総量 105GB を保つため total_steps 200k → 230k。
-  grad_accum_schedule: [[0, 8], [20000, 16], [50000, 32]]
+  # 固定値 (例: 32) か [[step, accum], ...] の step 関数 (batch size warmup, Ai2 "Critical Batch Size
+  # Revisited": 序盤は臨界 batch が小さいので小さく始める)。VRAM には影響しない (micro_batch_size が決める)。
+  # lr schedule の進行は消費 bytes 割合で測る。ByteLM A/B (2026-09-14): 1→2→4 warmup は固定より bpb -0.043。
+  # accum 8 (131k B/update) で 2.6GB、16 で 7.9GB、以後 32 (524k)。総量 105GB を保つため total_steps 230k。
+  grad_accum_steps: [[0, 8], [20000, 16], [50000, 32]]
   grad_accum_lr_scaling: sqrt   # choices: sqrt | none。区間中の lr を √(accum/final) 倍
 
 validation:
