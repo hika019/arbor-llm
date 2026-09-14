@@ -118,9 +118,9 @@ class ArborConfig:
     # ---- patching ----
     patching_mode: str = "static"  # choices: static | utf8 | space | entropy
     patch_size: int = 4            # static 用: 1 patch のバイト数
-    # legacy: static=concat / dynamic=max (旧checkpoint互換)。
-    # mean/max: static/dynamic共通の固定 local_hidden dim pooling。
-    patch_pooling: str = "legacy"  # choices: legacy | mean | max
+    # concat: patch 内 byte を連結して p*dl→dg 射影 (static 専用、情報を落とさない)。
+    # mean/max: 固定 local_hidden dim pooling (static/dynamic 共通、patch_size 非依存)。
+    patch_pooling: str = "concat"  # choices: concat | mean | max
     min_patch_len: int = 2         # 動的用: これ未満では区切らない
     max_patch_len: int = 16        # 動的用: これに達したら強制的に区切る
     max_patches: int | None = None # 動的用: 固定 pad する patch 数。None なら worst-case
@@ -583,10 +583,15 @@ class ArborModel(nn.Module):
         super().__init__()
         if cfg.patching_mode not in ("static", "utf8", "space", "entropy"):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
-        if cfg.patch_pooling not in ("legacy", "mean", "max"):
+        if cfg.patch_pooling not in ("concat", "mean", "max"):
             raise ValueError(
                 f"unknown patch_pooling: {cfg.patch_pooling!r} "
-                "(choices: legacy | mean | max)"
+                "(choices: concat | mean | max)"
+            )
+        if cfg.patch_pooling == "concat" and cfg.patching_mode != "static":
+            raise ValueError(
+                "patch_pooling=concat は patch 長固定の static 専用 "
+                f"(patching_mode={cfg.patching_mode!r} では mean | max を使う)"
             )
         if cfg.global_attn_impl not in ("sdpa", "flex"):
             raise ValueError(
@@ -631,13 +636,8 @@ class ArborModel(nn.Module):
                   causal=False, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_encoder_layers)
         )
-        # 新構造ではstatic/dynamicとも固定dim pooling。legacyだけ旧checkpointの
-        # static concat projection shapeを維持する。
-        patch_input_dim = (
-            p * dl
-            if cfg.patch_pooling == "legacy" and not self.dynamic
-            else dl
-        )
+        # concat は patch 長固定 (static) 前提の p*dl 入力。mean/max は dl 固定。
+        patch_input_dim = p * dl if cfg.patch_pooling == "concat" else dl
         self.patch_proj = nn.Linear(patch_input_dim, dg, bias=False)
         nn.init.trunc_normal_(self.patch_proj.weight, std=0.02, a=-0.06, b=0.06)
         # 右シフトの先頭 patch。ゼロ初期化禁止: 厳密ゼロ行は全層で 0 のまま伝播し、
@@ -797,7 +797,7 @@ class ArborModel(nn.Module):
         for layer in self.encoder_layers:
             h = self._maybe_ckpt(layer, h)
         h_patch = h.view(b, k, p, -1)
-        if self.cfg.patch_pooling == "legacy":
+        if self.cfg.patch_pooling == "concat":
             pooled = h_patch.flatten(2)
         elif self.cfg.patch_pooling == "mean":
             pooled = h_patch.mean(dim=2)
@@ -903,7 +903,7 @@ class ArborModel(nn.Module):
             for layer in self.encoder_layers:
                 h = self._maybe_ckpt(layer, h, enc_mask)
 
-            # patchごとの固定dim pooling。legacy dynamicは旧挙動(max)。
+            # patchごとの固定dim pooling (mean | max。concat は __init__ で弾く)。
             # pad patchは0埋めでdecoderからgatherされないため勾配は流れない。
             idx = patch_id.unsqueeze(-1).expand(-1, -1, h.size(-1))
             if cfg.patch_pooling == "mean":
@@ -1148,8 +1148,8 @@ class ArborByteGenerator:
         for layer in self.m.encoder_layers:
             x = layer(x, pos_offset=pos)
         pooling = self.cfg.patch_pooling
-        if pooling == "legacy" and not self.m.dynamic:
-            patch_emb = self.m.patch_proj(x.reshape(1, -1))  # concat (1, dg)
+        if pooling == "concat":
+            patch_emb = self.m.patch_proj(x.reshape(1, -1))  # (1, p*dl) -> (1, dg)
         elif pooling == "mean":
             patch_emb = self.m.patch_proj(x.mean(dim=1))
         else:

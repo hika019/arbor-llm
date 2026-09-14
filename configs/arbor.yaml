@@ -25,10 +25,12 @@ model:
   #   entropy … ByteLM の予測エントロピー閾値で区切る (entropy_lm_config 必須)
   patching_mode: static         # choices: static | utf8 | space | entropy
   patch_size: 16                # static 専用: 1 patch = N byte。8192/16=512 global patches
-  # patch 表現の pooling。mean/max は patch_size 非依存の固定 local_hidden dim
-  # projection なので patch_size を変えても patch_proj shape が変わらない。
-  #   legacy … 旧挙動 (static=concat / dynamic=max)。旧 checkpoint 互換用。
-  patch_pooling: mean           # choices: legacy | mean | max
+  # patch 表現の pooling。
+  #   concat … patch 内 byte を連結して p*dl→dg 射影 (static 専用。動的モードはエラー)
+  #   mean/max … patch_size 非依存の固定 local_hidden dim projection
+  # 小型 Arbor A/B (2026-09-14, 効率化メモ §8): concat が mean に mean_bpb −0.031 (全ドメイン)。
+  # 1B では +25M FP params / +1.2% step 時間 / +0.2 GiB。
+  patch_pooling: concat         # choices: concat | mean | max
   min_patch_len: 3              # utf8/space/entropy 専用。range: 1..max_patch_len
   max_patch_len: 16             # utf8/space/entropy 専用。range: >=min_patch_len
   entropy_threshold: 2.0        # entropy 専用: 次 byte H (nats)。range: >0 (小さいほど細切れ)

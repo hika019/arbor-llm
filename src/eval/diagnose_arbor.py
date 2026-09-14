@@ -248,7 +248,7 @@ def static_forward_parts(
 
     enc_patch = enc.view(b, k, p, -1)
 
-    if model.cfg.patch_pooling == "legacy":
+    if model.cfg.patch_pooling == "concat":
         pooled = enc_patch.flatten(2)
     elif model.cfg.patch_pooling == "mean":
         pooled = enc_patch.mean(dim=2)
