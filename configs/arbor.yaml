@@ -218,6 +218,8 @@ speed:
   # 最終値は grad_accum_steps と一致させる。区間中は lr を √(accum/final) 倍する
   # (grad_accum_lr_scaling: sqrt | none)。step で決まるので resume は決定的、再コンパイルも無し。
   # 序盤の bytes/step が減るので total_steps の bytes 換算は変わる (arbor_training_efficiency_notes.md)。
+  # schedule 有効時は lr の cosine / decay_end_ratio / stage2_start_ratio の進行を step 割合では
+  # なく消費 bytes 割合で測る (固定 accum と「同じ bytes で同じ lr」)。warmup_steps は step。
   # grad_accum_schedule: [[0, 8], [10000, 16], [30000, 32]]
   # grad_accum_lr_scaling: sqrt
 

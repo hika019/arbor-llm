@@ -114,3 +114,57 @@ def test_mps_adaptation_scales_schedule_with_micro_batch():
     sched = GradAccumSchedule.from_speed_cfg(resolved["speed"])
     assert sched.final_accum == 64
     assert sched.accum_at(0) == 16
+
+
+def test_cumulative_accum_and_bytes_fraction():
+    sched = GradAccumSchedule.from_speed_cfg({
+        "grad_accum_steps": 4,
+        "grad_accum_schedule": [[0, 1], [10, 2], [15, 4]],
+    })
+    assert sched.cumulative_accum(0) == 0
+    assert sched.cumulative_accum(10) == 10
+    assert sched.cumulative_accum(15) == 10 + 5 * 2
+    assert sched.cumulative_accum(20) == 20 + 5 * 4
+    frac = sched.bytes_fraction_fn(20)
+    assert frac(0) == 0.0
+    assert frac(10) == pytest.approx(10 / 40)
+    assert frac(15) == pytest.approx(20 / 40)
+    assert frac(20) == 1.0 and frac(25) == 1.0
+    # 固定 accum では step 割合と一致
+    const = GradAccumSchedule.from_speed_cfg({"grad_accum_steps": 3}).bytes_fraction_fn(50)
+    assert const(25) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("name", ["cosine_warmup", "two_stage"])
+def test_scheduler_progress_by_bytes_matches_constant_run_at_equal_bytes(name):
+    """accum 1→4 の run は、同じ bytes を消費した時点で固定 accum 4 の run と同じ lr (補正前) になる。"""
+    # warmup は step 単位なので、warmup 中に消費する bytes は両者で違う (cosine の起点が
+    # bytes 上でわずかにずれる)。等価性を厳密に見るため warmup 0 で比べる。
+    optim_cfg = {
+        "scheduler": name, "lr": 1e-3, "warmup_steps": 0, "min_lr_ratio": 0.1,
+        "decay_end_ratio": 0.8, "stage2_start_ratio": 0.5, "stage2_peak_lr_ratio": 0.5,
+        "weight_decay": 0.1, "weight_decay_stage2": 0.0,
+    }
+    # 固定 accum 4 を 100 step = 400 micro-step。schedule 側は accum 1 を 100 step + accum 4 を 75 step = 400 micro-step。
+    sched = GradAccumSchedule.from_speed_cfg({
+        "grad_accum_steps": 4, "grad_accum_schedule": [[0, 1], [100, 4]],
+    })
+
+    def curve(total, progress, steps):
+        p = torch.nn.Parameter(torch.zeros(2))
+        opt = torch.optim.SGD([p], lr=1e-3)
+        s = build_scheduler(opt, {**optim_cfg, "total_steps": total}, progress=progress)
+        out = []
+        for _ in range(steps):
+            out.append(s.get_last_lr()[0])
+            opt.step()
+            s.step()
+        return out
+
+    const = curve(100, None, 100)
+    warm = curve(175, sched.bytes_fraction_fn(175), 175)
+    # schedule run の step k>=100 は bytes = 100 + 4(k-100) micro-step、固定 run の step (25 + (k-100)) と同じ bytes
+    for k in range(100, 175):
+        assert warm[k] == pytest.approx(const[25 + (k - 100)], rel=1e-6), (k, name)
+    # 序盤 (accum 1) は bytes が少ないので lr の減衰が遅い
+    assert warm[50] > const[50]

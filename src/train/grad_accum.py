@@ -76,6 +76,33 @@ class GradAccumSchedule:
             return 1.0
         return math.sqrt(self.accum_at(step) / self.final_accum)
 
+    def cumulative_accum(self, step: int) -> int:
+        """step 0..step-1 の accum の総和 (= micro-step 数 ∝ 消費 bytes)."""
+        total = 0
+        for i, (start, accum) in enumerate(self.points):
+            if step <= start:
+                break
+            end = self.points[i + 1][0] if i + 1 < len(self.points) else step
+            total += accum * (min(step, end) - start)
+        return total
+
+    def bytes_fraction_fn(self, total_steps: int):
+        """step → 消費 bytes の割合 [0, 1] を返す関数。
+
+        accum が変わる run では step 割合と bytes 割合がずれる (序盤ほど bytes/step が
+        小さい)。lr の cosine / decay_end / stage2 の進行を bytes 割合で測ることで、
+        固定 accum の run と「同じ bytes で同じ lr」になる (batch size warmup の
+        A/B が lr schedule の違いに汚染されないため)。
+        """
+        if total_steps < 1:
+            raise ValueError(f"total_steps must be >= 1: {total_steps}")
+        denom = float(self.cumulative_accum(total_steps))
+
+        def fraction(step: int) -> float:
+            return min(1.0, self.cumulative_accum(max(0, step)) / denom)
+
+        return fraction
+
     def scaled(self, factor: int) -> "GradAccumSchedule":
         """全区間の accum を factor 倍する (MPS の micro_batch→accum 振替用)."""
         return GradAccumSchedule(
