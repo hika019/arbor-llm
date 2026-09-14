@@ -48,8 +48,8 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
   lr / wd は AdamW と共有 (Moonshot のスケールの狙い)。`state_precision` は fp32 のみ。
   副産物: 二次モーメント不要で optimizer state が半分 → 24GB の VRAM に効く。
   コスト見積: 1B の Newton-Schulz は ~53 TFLOP/step ≈ +0.35 s (5.2 s/step の +7%)。
-- A/B: `configs/bytelm_ab.yaml` (AdamW 基準) vs `configs/bytelm_ab_muon.yaml`。BitNet ByteLM
-  19M、本走と同じ data mix / 8k / lr 8e-4 / wd 0.1 / stochastic rounding、15k step (≈1 時間)。
+- A/B (config は削除済み。再現は entropy_lm.yaml の model に `bitnet: true` + arbor.yaml の data mix):
+  BitNet ByteLM 19M、8k / micro 8 / lr 8e-4 / wd 0.1 / stochastic rounding、15k step (≈40 分)。
   差分は optimizer だけ。判定は train loss ema と validation (ja_web / english / code) の bpb。
 - **結果 (2026-09-14): Muon は AdamW に一貫して僅差で負け。** 「Bit-by-Bit」の報告どおり。
 
