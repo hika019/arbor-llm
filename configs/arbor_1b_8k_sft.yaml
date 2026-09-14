@@ -40,13 +40,11 @@ data:
     - id: dolly_ja
       path: "kunishou/databricks-dolly-15k-ja"   # instruction/input/output
       revision: main
-      license_policy: "CC BY-SA 3.0 (Dolly由来)"
       weight_bytes: 0.5
       sft_format: instruction
     - id: oasst2_ja
       path: "llm-jp/oasst2-33k-ja"               # conversations [{role,content}]
       revision: main
-      license_policy: "Apache-2.0 tag"
       weight_bytes: 0.5
       sft_format: messages
   streaming: true
@@ -56,7 +54,6 @@ data:
   shuffle_buffer: 2000
   context_length: 4096          # 会話は短いので 8192→4096 で padding 無駄を半減
   num_workers: 0
-  prefetch_factor: 4
   pin_memory: true
   sft_loss_on: completion       # completion (応答のみ) | all
   sft_add_eos: true             # 応答末尾に EOS を付け loss をかける (停止を学習)
@@ -133,7 +130,6 @@ sampling:
   use_cache: true
 
 logging:
-  wandb_project: arbor-llm
   log_every_steps: 20
   throughput_window: 50
   byte_kind_metrics: true

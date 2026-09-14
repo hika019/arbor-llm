@@ -80,7 +80,6 @@ data:
       path: "HuggingFaceFW/fineweb-2"   # 日本語 web
       name: "jpn_Jpan"
       revision: main
-      license_policy: "dataset card terms; web crawl mixture"
       weight_bytes: 0.465
       text_filter:
         preset: ja_web_v1
@@ -88,43 +87,36 @@ data:
       path: "wikimedia/wikipedia"
       name: "20231101.ja"
       revision: main
-      license_policy: "CC BY-SA/GFDL attribution requirements"
       weight_bytes: 0.19
     - id: aozora_modern
       path: "globis-university/aozorabunko-clean"
       revision: main
-      license_policy: "Aozora public-domain/copyright-expired texts; prefer modern kana subset"
       weight_bytes: 0.02
       max_epochs: 3
     - id: japan_law
       path: "y2lan/japan-law"           # 法令 (条文体。小規模)
       text_column: "body"
       revision: main
-      license_policy: "Japanese government legal text terms"
       weight_bytes: 0.005
       max_epochs: 5
     - id: fineweb_edu_en
       path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
       revision: main
-      license_policy: "dataset card terms; web crawl mixture"
       weight_bytes: 0.12
     - id: fineweb_en
       path: "HuggingFaceFW/fineweb"
       revision: main
-      license_policy: "dataset card terms; web crawl mixture"
       weight_bytes: 0.05
     - id: finemath_4plus
       path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
       name: "finemath-4plus"
       revision: main
-      license_policy: "dataset card terms; math web mixture"
       weight_bytes: 0.06
       text_filter:
         preset: en_web_quality_v1
     - id: opc_code_web
       path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書 (parquet, 非 gated)
       revision: main
-      license_policy: "dataset card terms; code/web mixture"
       # 旧 github_code_filtered (loubnabnl/github-code-more-filtering) は datasets 4.x が
       # 廃止したスクリプト型データセットで読めない (現在は 401) ため、その比率をここへ統合。
       # 2026-08-28 に「非公開化」として一度外したが、2026-09-13 に HF API で
@@ -139,7 +131,6 @@ data:
   shuffle_buffer: 2000
   context_length: 8192          # bytes。patch_size の倍数にする
   num_workers: 0                # 正確 resume は単一プロセス前提
-  prefetch_factor: 4
   pin_memory: true
 
 # ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
@@ -292,7 +283,6 @@ probes:
         - "天然記念物になるという。"
 
 logging:
-  wandb_project: arbor-llm
   log_every_steps: 20
   throughput_window: 50
   byte_kind_metrics: true

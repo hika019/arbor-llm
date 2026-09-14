@@ -46,7 +46,6 @@ data:
     - id: fineweb2_edu_ja
       path: "hotchpotch/fineweb-2-edu-japanese"
       revision: main
-      license_policy: "derived from fineweb-2 (CC); edu-scored subset"
       weight_bytes: 0.30
       min_score: 3.0
       score_column: "score"
@@ -56,14 +55,12 @@ data:
       path: "wikimedia/wikipedia"
       name: "20231101.ja"
       revision: main
-      license_policy: "CC BY-SA/GFDL attribution requirements"
       weight_bytes: 0.18
     # 日本語 合成教科書 (phi 系高密度)。100k 件と小さいので epoch を制限。
     - id: cosmopedia_ja
       path: "aixsatoshi/cosmopedia-japanese-100k"
       text_column: "japanese"
       revision: main
-      license_policy: "synthetic (Mixtral-generated); dataset card terms"
       weight_bytes: 0.06
       max_epochs: 3
     # 日本語 Wikibooks (説明的プロース=教科書体)
@@ -71,41 +68,35 @@ data:
       path: "hatakeyama-llm-team/WikiBookJa"
       text_column: "text"
       revision: main
-      license_policy: "CC BY-SA (Wikibooks)"
       weight_bytes: 0.02
       max_epochs: 3
     - id: aozora_modern
       path: "globis-university/aozorabunko-clean"
       revision: main
-      license_policy: "Aozora public-domain/copyright-expired texts"
       weight_bytes: 0.02
       max_epochs: 3
     - id: japan_law
       path: "y2lan/japan-law"
       text_column: "body"
       revision: main
-      license_policy: "Japanese government legal text terms"
       weight_bytes: 0.005
       max_epochs: 5
     # 英語 edu (高品質土台)
     - id: fineweb_edu_en
       path: "HuggingFaceFW/fineweb-edu"
       revision: main
-      license_policy: "dataset card terms; web crawl mixture"
       weight_bytes: 0.10
     # 英語 合成教科書 (Cosmopedia web_samples_v2 = 最大サブセット)
     - id: cosmopedia_en
       path: "HuggingFaceTB/cosmopedia"
       name: "web_samples_v2"
       revision: main
-      license_policy: "synthetic (Mixtral-generated); Apache-2.0"
       weight_bytes: 0.06
     # 数学 (web 由来の高品質 + Swallow Math)
     - id: finemath_4plus
       path: "HuggingFaceTB/finemath"
       name: "finemath-4plus"
       revision: main
-      license_policy: "dataset card terms; math web mixture"
       weight_bytes: 0.045
       text_filter:
         preset: en_web_quality_v1
@@ -113,19 +104,16 @@ data:
       path: "tokyotech-llm/swallow-math"
       text_column: "text"
       revision: main
-      license_policy: "dataset card terms"
       weight_bytes: 0.03
     # コード (既存の filter 済み + コード解説 web)
     - id: github_code_filtered
       path: "loubnabnl/github-code-more-filtering"
       text_column: "code"
       revision: main
-      license_policy: "per-file licenses only; exclude generated/vendor/secrets/duplicates"
       weight_bytes: 0.08
     - id: opc_code_web
       path: "OpenCoder-LLM/opc-fineweb-code-corpus"
       revision: main
-      license_policy: "dataset card terms; code/web mixture"
       weight_bytes: 0.01
       text_filter:
         preset: en_web_quality_v1
@@ -136,7 +124,6 @@ data:
   shuffle_buffer: 2000
   context_length: 8192
   num_workers: 0
-  prefetch_factor: 4
   pin_memory: true
 
 # ---- 最適化: 継続学習は base ピークより低い lr・短い step ----
@@ -241,7 +228,6 @@ probes:
         - "天然記念物になるという。"
 
 logging:
-  wandb_project: arbor-llm
   log_every_steps: 20
   throughput_window: 50
   byte_kind_metrics: true

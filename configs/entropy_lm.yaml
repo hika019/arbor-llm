@@ -102,7 +102,6 @@ data:
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)
   num_workers: 0
   pin_memory: true
-  micro_batch_size: 4
 
 optim:
   optimizer: adamw
@@ -133,7 +132,6 @@ checkpoint:
   dir: ./checkpoints/entropy_lm
   save_every_steps: 1500
   keep_last_k: 2
-  keep_every_n_steps: null
   async_save: false
 
 sampling:
