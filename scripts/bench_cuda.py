@@ -16,6 +16,7 @@ compile_mode, micro_batch, seq を切り替えて A/B するための最小ツ�
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import time
 
@@ -23,6 +24,11 @@ import torch
 import yaml
 
 from src.model.arbor import build_arbor
+from src.train.train import (
+    configure_training_bitnet,
+    prepare_cudagraph_gradient_buffers,
+    uses_cudagraph_compile,
+)
 
 
 def _sync(device: torch.device) -> None:
@@ -145,92 +151,43 @@ def main() -> None:
 
     model = build_arbor(mcfg).to(device=device, dtype=dtype)
     model.train()
-    speed_cfg = cfg.get("speed", {})
-    from src.model.bitlinear import (
-        configure_bitlinear_training_cache,
-        install_arbor_projection_fusions,
-        refresh_bitlinear_training_cache,
-        set_bitlinear_fp8_mode,
-        set_bitlinear_int8_backend,
-        set_bitlinear_ternary_backend,
-        set_bitlinear_ternary_wgrad_backend,
-    )
-
-    int8_backend = set_bitlinear_int8_backend(
-        args.int8_backend
-        or str(speed_cfg.get("bitlinear_int8_backend", "auto"))
-    )
-    ternary_backend = set_bitlinear_ternary_backend(
-        args.ternary_backend
-        or str(speed_cfg.get("bitlinear_ternary_backend", "dot"))
-    )
-    ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
-        args.ternary_wgrad_backend
-        or str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
-    )
-    fp8_mode = args.bitlinear_fp8
-    if fp8_mode is None:
-        legacy = speed_cfg.get("bitlinear_fp8")
-        canonical = speed_cfg.get("bitlinear_compute_mode")
-
-        def _normalize(value):
-            if value in (None, False):
-                return "off"
-            value = str(value).lower()
-            return "int8" if value == "native" else value
-
-        legacy_norm = None if legacy is None else _normalize(legacy)
-        canonical_norm = None if canonical is None else _normalize(canonical)
-        if (
-            canonical_norm is not None
-            and legacy_norm is not None
-            and canonical_norm != legacy_norm
-        ):
-            raise ValueError(
-                "conflicting speed.bitlinear_compute_mode="
-                f"{canonical_norm!r} and speed.bitlinear_fp8={legacy_norm!r}"
-            )
-        fp8_mode = (
-            canonical_norm
-            if canonical_norm is not None
-            else (legacy_norm if legacy_norm is not None else "off")
-        )
-    if fp8_mode in (None, False):
-        fp8_mode = "off"
-    install_arbor_projection_fusions(model)
-    fp8_info = set_bitlinear_fp8_mode(model, str(fp8_mode))
-    cache_mode = args.weight_cache
-    if cache_mode is None:
-        cache_mode = speed_cfg.get("bitnet_weight_cache", "auto")
-    cache_gib = (
-        args.weight_cache_gib
-        if args.weight_cache_gib is not None
-        else speed_cfg.get("bitnet_weight_cache_gib", 1.25)
-    )
-    cache_info = configure_bitlinear_training_cache(
-        model,
-        enabled=cache_mode,
-        grad_accum_steps=args.grad_accum,
-        max_cache_gib=cache_gib,
-        min_numel=int(speed_cfg.get("bitnet_weight_cache_min_numel", 65536)),
-    )
+    # BitLinear の low-bit 経路 (compute mode / backend / ternary execution+tuning /
+    # weight cache) は train.py の configure_training_bitnet をそのまま使う。bench 独自の
+    # 簡略版は ternary execution path と tuning を設定しないため、本走と別の kernel 経路
+    # (legacy_raw) で計測していた。CLI 上書きは speed へ反映する。
+    speed_cfg = cfg.setdefault("speed", {})
+    speed_cfg["grad_accum_steps"] = args.grad_accum
+    if args.bitlinear_fp8 is not None:
+        speed_cfg.pop("bitlinear_fp8", None)
+        speed_cfg["bitlinear_compute_mode"] = args.bitlinear_fp8
+    for key, value in (
+        ("bitlinear_int8_backend", args.int8_backend),
+        ("bitlinear_ternary_backend", args.ternary_backend),
+        ("bitlinear_ternary_wgrad_backend", args.ternary_wgrad_backend),
+        ("bitnet_weight_cache", args.weight_cache),
+        ("bitnet_weight_cache_gib", args.weight_cache_gib),
+    ):
+        if value is not None:
+            speed_cfg[key] = value
+    refresh_bitlinear_training_cache, _ = configure_training_bitnet(model, device, cfg)
     print(f"[bench] device={device} dtype={args.dtype} seq={seq} "
           f"micro_batch={args.micro_batch} grad_accum={args.grad_accum} "
           f"global_attn_impl={mcfg.get('global_attn_impl','sdpa')} "
           f"compile={args.compile}({args.compile_mode})")
-    print(
-        "[bench] "
-        f"weight_cache={cache_info['mode']} cached_layers={cache_info['cached_layers']} "
-        f"cache={cache_info['cache_gib']:.2f}GiB "
-        f"format={cache_info['cache_format']} "
-        f"fp8={fp8_info['mode']} int8_backend={int8_backend} "
-        f"ternary_backend={ternary_backend} "
-        f"ternary_wgrad_backend={ternary_wgrad_backend}"
-    )
 
     run = model
     if args.compile and device.type == "cuda":
         run = torch.compile(model, mode=args.compile_mode)
+    # train.py と同じ CUDA Graphs (reduce-overhead / max-autotune) の作法:
+    # micro-step 境界を明示し、grad accum は graph 外の固定 buffer へ溜める。
+    # 既知の未解決 (2026-09-14): これを入れても --grad-accum >= 2 では 2 個目の
+    # micro-step の backward で「byte_emb 出力が後続 run に上書きされた」エラーになる
+    # (train.py 本体は同条件で通る。--grad-accum 1 は通る)。差分は未特定。
+    # reduce-overhead の accum 込み計測は train.py --benchmark-steps を使うこと。
+    cudagraphs = (
+        args.compile and device.type == "cuda"
+        and uses_cudagraph_compile({"torch_compile": True, "compile_mode": args.compile_mode})
+    )
 
     scheduler = None
     if args.production_optimizer:
@@ -249,6 +206,18 @@ def main() -> None:
             fused=(device.type == "cuda"),
         )
         print("[bench] optimizer=fused AdamW (benchmark)")
+    preserve_grad_buffers = cudagraphs and args.grad_accum > 1 and not args.fwd_only
+    if preserve_grad_buffers:
+        n_buf, buf_bytes = prepare_cudagraph_gradient_buffers(model, opt)
+        print(f"[bench] cudagraph_grad_buffers=persistent tensors={n_buf} memory={buf_bytes / 2**30:.2f}GiB")
+
+    # train.py と同じく bf16/fp16 は autocast 下で forward する (CUDA のみ)。
+    use_autocast = device.type == "cuda" and dtype != torch.float32
+
+    def amp_context():
+        if use_autocast:
+            return torch.autocast(device_type=device.type, dtype=dtype)
+        return contextlib.nullcontext()
 
     def rand_batch() -> torch.Tensor:
         return torch.randint(4, 260, (args.micro_batch, seq), device=device)
@@ -306,10 +275,17 @@ def main() -> None:
             x = rand_batch()
             cpu_sections["batch_ms"] += (time.perf_counter() - t0) * 1000.0
             fwd_start = start_gpu_section("forward")
-            logits = run(x).logits
+            if cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
+            with amp_context():
+                logits = run(x).logits
             end_gpu_section("forward", fwd_start)
+            # train.py と同じ形 (label を右シフトして ignore_index、logits は flatten のみ)。
+            labels = torch.cat(
+                [x[:, 1:], x.new_full((x.size(0), 1), -100)], dim=1
+            )
             loss = torch.nn.functional.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)).float(), x[:, 1:].reshape(-1)
+                logits.flatten(0, 1), labels.flatten(), ignore_index=-100
             ) / args.grad_accum
             if not args.fwd_only:
                 bwd_start = start_gpu_section("backward")
@@ -327,7 +303,7 @@ def main() -> None:
             refresh_bitlinear_training_cache(model)
             if scheduler is not None:
                 scheduler.step()
-            opt.zero_grad(set_to_none=True)
+            opt.zero_grad(set_to_none=not preserve_grad_buffers)
             end_gpu_section("optimizer", opt_start)
         assert total is not None
         return total, grad_norm, cpu_sections
