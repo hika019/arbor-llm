@@ -213,18 +213,12 @@ speed:
   grad_accum_steps: 32          # 実効バッチ 64 seq 相当 (= 524k bytes/update)。
                                 # それでも溢れる時は gradient_checkpointing: true + torch_compile: false
                                 # (compile×ckpt 併用は torch2.5 で NaN になるため train.py が弾く)
-  # batch size warmup (Ai2 "Critical Batch Size Revisited", OLMo 1B で同 loss を 43% 少ない step で達成)。
-  # 序盤は臨界 batch が小さいので accum を小さく始め、step で段階的に定常値へ上げる。
-  # 最終値は grad_accum_steps と一致させる。step で決まるので resume は決定的、再コンパイルも無し
-  # (compile 単位は micro-step、CUDA Graphs の step 境界も micro-step ごと)。
-  # schedule 有効時は lr の cosine / decay_end_ratio / stage2_start_ratio の進行を step 割合では
-  # なく消費 bytes 割合で測る (固定 accum と「同じ bytes で同じ lr」)。warmup_steps は step。
-  # ByteLM A/B (2026-09-14, 同 983M bytes): 1→2→4 warmup は accum 4 固定より bpb -0.043、
-  # 小 batch ほど序盤の byte 効率が良い (arbor_training_efficiency_notes.md §1)。
-  # 区間は bytes で設計: accum 8 (131k B/update) で 2.6GB、16 (262k) で 7.9GB、以後 32 (524k)。
-  # 総量 105GB を保つため total_steps は 200k → 230k (bytes/s は accum 非依存なので所要時間は同じ)。
+  # batch size warmup (Ai2 "Critical Batch Size Revisited"): 序盤は臨界 batch が小さいので accum を
+  # 小さく始める。[[step, accum], ...] の step 関数、最終値 = grad_accum_steps。lr schedule の進行は
+  # 消費 bytes 割合で測る。ByteLM A/B (2026-09-14): 1→2→4 warmup は accum 4 固定より bpb -0.043。
+  # accum 8 で 2.6GB、16 で 7.9GB、以後 32。総量 105GB を保つため total_steps 200k → 230k。
   grad_accum_schedule: [[0, 8], [20000, 16], [50000, 32]]
-  grad_accum_lr_scaling: sqrt   # choices: sqrt | none。区間中の lr を √(accum/final) 倍 (Ai2 の square-root 則)
+  grad_accum_lr_scaling: sqrt   # choices: sqrt | none。区間中の lr を √(accum/final) 倍
 
 validation:
   enabled: true

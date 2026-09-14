@@ -862,40 +862,40 @@ def _scheduler_common(cfg: dict) -> tuple[int, int, float, float]:
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     cfg: dict,
-    lr_scale: Callable[[int], float] | None = None,
+    lr_scale: Callable[[int], float] = lambda step: 1.0,
     progress: Callable[[int], float] | None = None,
 ):
-    """lr_scale(step) を渡すと各 scheduler の lr_lambda に乗算する (batch size
-    warmup の √(accum/final) 補正用)。progress(step) を渡すと cosine / decay_end /
-    stage2 の進行を step 割合ではなく progress の値 (消費 bytes 割合 [0,1]) で測る
-    (accum が変わる run で固定 accum と同じ「bytes 対 lr」にするため。warmup は
-    step のまま)。LambdaLR の base_lrs / state_dict / rebase_scheduler_lr との互換はそのまま。"""
+    """lr_scale(step) は lr_lambda に乗算する係数 (batch size warmup の √(accum/final))。
+    progress(step) は学習の進行 [0,1] (消費 bytes 割合。省略時は step/total)。cosine /
+    decay_end_ratio / stage2_start_ratio はこの進行で測るので、accum が変わる run でも
+    固定 accum と「同じ bytes で同じ lr」になる。warmup は step。LambdaLR の base_lrs /
+    state_dict / rebase_scheduler_lr との互換はそのまま。"""
     name = cfg.get("scheduler", "cosine_warmup")
     warmup, total, min_ratio, decay_end_ratio = _scheduler_common(cfg)
+    if progress is None:
+        progress = lambda step: min(1.0, step / total)  # noqa: E731
 
-    def with_scale(fn: Callable[[int], float]) -> Callable[[int], float]:
-        if lr_scale is None:
-            return fn
-        return lambda step: fn(step) * lr_scale(step)
+    def step_at(ratio: float, after: int) -> int:
+        """進行が ratio に最初に達する step (after より後)。"""
+        return next((k for k in range(after + 1, total + 1) if progress(k) >= ratio), total)
 
-    def segment_progress(step: int, start_ratio: float, end_ratio: float, start_step: int, end_step: int) -> float:
-        """[start, end) 区間内の進行 [0,1]。progress 有りなら bytes 割合、無ければ step。"""
-        if progress is None:
-            return min(1.0, (step - start_step) / max(1, end_step - start_step))
-        f0 = progress(start_step) if start_ratio is None else start_ratio
-        return min(1.0, max(0.0, (progress(step) - f0) / max(1e-9, end_ratio - f0)))
+    def segment(step: int, start: int, end: int) -> float:
+        """[start, end] 区間内の進行 [0,1] (進行の差で測る)。"""
+        f0, f1 = progress(start), progress(end)
+        return min(1.0, max(0.0, (progress(step) - f0) / max(1e-9, f1 - f0)))
+
+    def cosine(p: float, hi: float, lo: float) -> float:
+        return lo + (hi - lo) * 0.5 * (1.0 + math.cos(math.pi * p))
 
     if name == "cosine_warmup":
-        decay_end = max(warmup + 1, round(total * decay_end_ratio))
+        decay_end = step_at(decay_end_ratio, warmup)
 
         def lr_lambda(step: int) -> float:
             if step < warmup:
                 return step / max(1, warmup)
-            p = segment_progress(step, None, decay_end_ratio, warmup, decay_end)
-            cos = 0.5 * (1.0 + math.cos(math.pi * p))
-            return min_ratio + (1.0 - min_ratio) * cos
+            return cosine(segment(step, warmup, decay_end), 1.0, min_ratio)
 
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, with_scale(lr_lambda))
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_lambda(step) * lr_scale(step))
 
     if name == "two_stage":
         # BitNet 公式 2 段レシピ。stage2_start_ratio で stage を切り替え、stage1 は
@@ -918,26 +918,18 @@ def build_scheduler(
         wd_stage2 = float(cfg.get("weight_decay_stage2", 0.0))
         if wd_stage2 < 0:
             raise ValueError(f"weight_decay_stage2 は非負で指定: {wd_stage2}")
-        s2 = max(warmup + 1, round(total * stage2_start_ratio))
-        decay_end = max(s2 + 1, round(total * decay_end_ratio))
-
-        if progress is not None:
-            # stage2 の開始 step は bytes 割合 stage2_start_ratio に最初に達する step
-            s2 = next((k for k in range(warmup + 1, total + 1) if progress(k) >= stage2_start_ratio), total)
+        s2 = step_at(stage2_start_ratio, warmup)
+        decay_end = step_at(decay_end_ratio, s2)
 
         def lr_lambda(step: int) -> float:
             if step < warmup:
                 return step / max(1, warmup)
             if step < s2:
-                p = segment_progress(step, None, stage2_start_ratio, warmup, s2)
-                cos = 0.5 * (1.0 + math.cos(math.pi * p))
-                return stage2_peak + (1.0 - stage2_peak) * cos
-            p = segment_progress(step, stage2_start_ratio, decay_end_ratio, s2, decay_end)
-            cos = 0.5 * (1.0 + math.cos(math.pi * p))
-            return min_ratio + (stage2_peak - min_ratio) * cos
+                return cosine(segment(step, warmup, s2), 1.0, stage2_peak)
+            return cosine(segment(step, s2, decay_end), stage2_peak, min_ratio)
 
         return TwoStageCooldownLR(
-            optimizer, with_scale(lr_lambda),
+            optimizer, lambda step: lr_lambda(step) * lr_scale(step),
             wd_stage1=wd_stage1, wd_stage2=wd_stage2, stage2_start_step=s2,
         )
 

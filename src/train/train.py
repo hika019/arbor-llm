@@ -1503,14 +1503,12 @@ def main() -> int:
     timing_mark("optimizer_created", device)
     # batch size warmup: accum が定常値未満の区間は lr を √(accum/final) 倍する
     accum_schedule = GradAccumSchedule.from_speed_cfg(cfg["speed"])
-    # accum が変わる run では cosine / decay_end / stage2 の進行を消費 bytes 割合で測る
-    # (固定 accum と「同じ bytes で同じ lr」にする。warmup は step)。
+    # lr schedule の進行は消費 bytes 割合 (accum が変わっても固定 accum と同じ bytes で同じ lr)
     scheduler = build_scheduler(
         optimizer,
         cfg["optim"],
-        lr_scale=None if accum_schedule.is_constant else accum_schedule.lr_scale_at,
-        progress=None if accum_schedule.is_constant
-        else accum_schedule.bytes_fraction_fn(int(cfg["optim"]["total_steps"])),
+        lr_scale=accum_schedule.lr_scale_at,
+        progress=accum_schedule.bytes_fraction_fn(int(cfg["optim"]["total_steps"])),
     )
     timing_mark("scheduler_created", device)
 

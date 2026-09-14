@@ -79,7 +79,7 @@ def test_build_scheduler_applies_lr_scale_to_every_scheduler(name):
     def run(lr_scale):
         p = torch.nn.Parameter(torch.zeros(2))
         opt = torch.optim.SGD([p], lr=1e-3)
-        s = build_scheduler(opt, optim_cfg, lr_scale=lr_scale)
+        s = build_scheduler(opt, optim_cfg, lr_scale=lr_scale) if lr_scale else build_scheduler(opt, optim_cfg)
         lrs = []
         for _ in range(40):
             lrs.append(s.get_last_lr()[0])
