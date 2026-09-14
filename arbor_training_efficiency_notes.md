@@ -11,9 +11,28 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 - **B. token あたりの計算量を減らす**
 - **C. 小さい実験で当てて、大きい run で外さない** (experiment efficiency)
 
-## 1. batch size warmup (A) — 実装済み
+## 1. batch size warmup (A) — 実装済み、ByteLM A/B で効きを確認し本走に採用 (2026-09-14)
 
 `speed.grad_accum_steps` に [[step, accum], ...] (`src/train/grad_accum.py`)。詳細は configs/arbor.yaml のコメント参照。
+lr schedule (cosine / decay_end / stage2) の進行は消費 bytes 割合で測る (accum が変わっても
+固定 accum と同じ bytes で同じ lr。最初の A/B はこれが step 割合だったため無効になった)。
+
+- **A/B 結果** (BitNet ByteLM 19M、本走 mix、8k、lr 8e-4、同 983M bytes):
+
+  | run | 最終 ema | 最終 mean_bpb |
+  |---|---|---|
+  | accum 1 固定 (65.5k B/update, 15000 step) | **0.976** | **1.476** |
+  | 1→2→4 warmup, lr √(accum/4) 補正 (8750 step) | 1.010 | 1.531 |
+  | 1→2→4 warmup, lr 補正なし (8750 step) | 1.021 | 1.540 |
+  | accum 4 固定 (262k B/update, 3750 step) | 1.041 | 1.574 |
+
+  - warmup は「最初から大 batch」に bpb −0.043 (2.7%) で勝つ。Ai2 の主張を方向として再現。
+  - 小 batch を高 lr で最後まで回すのが最強 = 19M × 1GB では臨界 batch が 262k bytes に届かない。
+    1B × 105GB は後半で臨界を超えるので schedule が要る (切替点は bytes 比率で仮置き)。
+  - lr 補正: `none` は序盤 (bytes 1/3 で bpb 1.679 vs 1.721) 有利だが最終は `sqrt` が僅差で勝つ
+    (1.531 vs 1.540)。**`sqrt` を採用**。
+- 本走 (arbor.yaml): `grad_accum_steps: [[0, 8], [20000, 16], [50000, 32]]`、`sqrt`、total_steps 230k
+  (105GB 維持)。
 
 - 出典: Ai2 "Critical Batch Size Revisited: A Simple Empirical Approach to Large-Batch
   Language Model Training" (arXiv 2505.23971) / [Ai2 blog](https://allenai.org/blog/critical-batch-size)。
@@ -22,9 +41,7 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
   「小さい batch 全てに loss で劣らない最大の batch」として測る (branched training)。
 - 関連: "How to Set the Batch Size for Large-Scale Pre-training" (arXiv 2601.05034) —
   WSD スケジュールと組み合わせ、固定 batch より増加 batch の方が loss/下流とも良い。
-- arbor での注意: 序盤の bytes/step が減るので `total_steps` の bytes 換算が変わる。予算を
-  bytes で持つなら再計算する。本走投入前に ByteLM (`bitnet: true`) で固定 accum vs schedule を
-  1 時間ずつ比べて効きを確認する。
+- arbor での注意: 序盤の bytes/step が減るので `total_steps` の bytes 換算が変わる (再計算済み)。
 
 ## 2. Muon optimizer (A) — 実装済み、ByteLM A/B で AdamW に負け → 本走は AdamW のまま (2026-09-14)
 
@@ -173,9 +190,10 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 
 ## 優先順位
 
-1. batch size warmup (実装済み) → ByteLM で効き確認 → 次 run に投入
-2. 次の 2B は G_stack で 1B base から
-3. anneal ×N + 重み平均
+1. 次の 2B は G_stack で 1B base から
+2. anneal ×N + 重み平均
+
+(1 の batch size warmup は ByteLM A/B で効きを確認し本走 config に採用済み。)
 
 (2 の Muon は ByteLM A/B で AdamW に負けたため、5 の長さ curriculum / bucket packing は
 計測の結果 arbor では効かないため、それぞれ優先順位から外した。)
