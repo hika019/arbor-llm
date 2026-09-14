@@ -59,7 +59,7 @@ VRAM制約がある場合のみ改良int8を明示選択する。
 `speed.bitlinear_compute_mode=ternary`は2bit packed weightをkernel内でdecodeし、backwardは
 optimizer step単位でcacheしたFP8 weightのN×K/K×N両layoutを使う。sm89+ (RTX
 4090/5090) で動く。既定 `configs/arbor.yaml` はこのpacked経路 + patch_size=16 +
-固定dim mean pooling + local encoder/decoder=1/2層で構成している。
+concat pooling (arbor_training_efficiency_notes.md §8) + local encoder/decoder=1/2層で構成している。
 INT8 GEMMは`speed.bitlinear_int8_backend: auto|int_mm|triton`でA/Bできる。
 互換のため旧表記`speed.bitlinear_fp8`も引き続き受理する。
 
@@ -265,7 +265,7 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   データ分割を行う完全な分散学習を意味しない。
   `fixed`（`bitlinear_ternary_fixed_tile: BM,BN,BK,WARPS,STAGES` 必須）と
   conservative configを使う`off`もdebug/reproduction用に選べる。
-  現行mean-pooling構成の実学習A-B-B-Aでは、`custom_op + auto`をCUDA Graphsで
+  mean-pooling構成 (当時) の実学習A-B-B-Aでは、`custom_op + auto`をCUDA Graphsで
   captureする経路がlegacy/defaultより約19%高いthroughputを再現したため、これを
   既定にする。`legacy_raw`は旧shape heuristicをraw Tritonで再現するrollback経路、
   `raw`は固定tileの境界A/B用である。cache生成後は`raw_plan`を

@@ -32,7 +32,7 @@ _ARBOR_FIELDS = (
 )
 
 _ARBOR_DEFAULTS = dict(
-    vocab_size=260, patch_size=4, patch_pooling="legacy", max_bytes=2048,
+    vocab_size=260, patch_size=4, patch_pooling="concat", max_bytes=2048,
     patching_mode="static", min_patch_len=2, max_patch_len=16,
     entropy_threshold=1.5, entropy_model=None,
     hidden_size=2048, num_heads=16, num_kv_heads=4, intermediate_size=5632,

@@ -28,6 +28,8 @@ TINY_ENTROPY_LM = dict(hidden_size=32, num_heads=2, num_kv_heads=2,
 
 def tiny_cfg(mode: str) -> dict:
     cfg = dict(TINY, patching_mode=mode)
+    if mode != "static":
+        cfg["patch_pooling"] = "max"  # 動的モードは concat 不可 (既定 concat は static 用)
     if mode == "entropy":
         cfg["entropy_model"] = TINY_ENTROPY_LM
     return cfg
@@ -62,6 +64,16 @@ def test_unknown_patch_pooling_is_error():
     cfg = ArborConfig.from_dict(dict(TINY, patch_pooling="attention"))
     with pytest.raises(ValueError, match="patch_pooling"):
         ArborModel(cfg)
+
+
+def test_concat_patch_pooling_is_rejected_in_dynamic_modes():
+    """concat は patch 長固定 (static) 専用。動的モードで黙って max に化けないこと."""
+    for mode in ("utf8", "space", "entropy"):
+        cfg = ArborConfig.from_dict(dict(tiny_cfg(mode), patch_pooling="concat"))
+        with pytest.raises(ValueError, match="concat"):
+            ArborModel(cfg)
+    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg("static"), patch_pooling="concat")))
+    assert m.patch_proj.in_features == TINY["patch_size"] * TINY["local_hidden_size"]
 
 
 @pytest.mark.parametrize("pooling", ["mean", "max"])

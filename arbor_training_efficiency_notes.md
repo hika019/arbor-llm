@@ -175,6 +175,35 @@ lr schedule (cosine / decay_end / stage2) の進行は消費 bytes 割合で測�
   ReLU² は採用済み。byte vocab 260 なので FP8 head / tied embedding は効かない。
 - 各 1〜3% 程度。ByteLM で 1 時間/run の ablation 対象。
 
+## 8. patch_pooling: concat vs mean (A) — 小型 Arbor A/B で concat が勝ち、本走に採用 (2026-09-14)
+
+`model.patch_pooling` は `concat | mean | max` の 3 値 (旧 `legacy` は廃止。static=concat /
+dynamic=max に化ける二重挙動だったため、concat は static 専用として動的モードでは起動時エラー)。
+問い: mean は local encoder → patch_proj (dl → dg) で patch 内 16 byte の情報を 1 ベクトルに
+潰しており、global 側の学習を妨げていないか。
+
+- **A/B 結果** (config は削除済み。再現は arbor.yaml の model で global を 768/12 heads/kv4/ffn2048/8 層に縮小し patch_pooling だけ変える、optim/schedule は bytelm_ab と同じ: 小型 Arbor、local 側は本走と同一
+  (dl 768 / enc 1 / dec 2 / patch 16 / 8k)、global 768×8 層、本走 mix、lr 8e-4、同 983M bytes):
+
+  | step | mean | concat | Δ |
+  |---|---|---|---|
+  | 2500 | 2.347 | 2.300 | −0.047 |
+  | 5000 | 2.152 | 2.118 | −0.034 |
+  | 10000 | 1.970 | 1.938 | −0.031 |
+  | 15000 (最終) | 1.938 | **1.907** | **−0.031** |
+
+  - 全 5 ドメインで concat が良い (ja_web −0.029 / wiki −0.021 / en −0.036 / code −0.037 / math −0.032)。
+    train ema も 1.244 → 1.222。差は step 5000 以降 −0.03 で安定 (縮まらない)。
+  - 注意: concat は patch_proj が p·dl→dg で、プロキシでは +8.8M params (73.2M → 82.0M、+12%)。
+    1B では +25M (2.5%) なので、小型での差の一部はパラメータ増の寄与を含む。ただし FP の射影 1 枚で
+    global 20 層の BitLinear と同じ 0.03 bpb を稼げるなら安い。
+  - 1B 本走 config での実測 (`scripts.bench_cuda`, micro2×accum8, compile default):
+    mean 780 ms / 10.4 GiB → concat 790 ms / 10.6 GiB (+1.2% 時間、+0.2 GiB)。
+- **本走 (arbor.yaml) は `patch_pooling: concat` に変更**。旧 checkpoint (filter/cpt/sft) は
+  config に patch_pooling キーが無く既定 concat で従来どおりロードされる。
+- entropy patching に戻す場合は mean/max しか使えない (patch 長可変)。concat 相当が欲しければ
+  「max_patch_len へ右 pad して concat」を別途実装する (未実装)。
+
 ## 見送り
 
 - **Multi-token prediction**: DeepSeek-V3 (arXiv 2412.19437) 採用。ただし "Pre-Training
