@@ -366,31 +366,29 @@ def test_ternary_wgrad_auto_selects_backend_by_shape(monkeypatch):
 
 
 def test_a8_dequant_fp8_transposed_matches_materialized_xq_cpu():
-    cases = [
-        (
-            torch.tensor(
-                [
-                    [0, 0, 0, 0],
-                    [1, -2, 3, -4],
-                    [127, -126, 0, 64],
-                    [-128, 0, 5, -7],
-                ],
-                dtype=torch.int8,
-            ),
-            torch.tensor([1e-5 / 127.0, 1e-5 / 127.0, 0.25, 0.125]),
-        ),
-        (
-            torch.tensor([[0, 0, 0, 0], [1, -2, 0, 3]], dtype=torch.int8),
-            torch.full((2,), 1e-5 / 127.0),
-        ),
-    ]
-    for x_int8, inv_sx in cases:
-        x_q = x_int8.to(torch.float32) * inv_sx.unsqueeze(1)
-        actual, actual_scale = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
-        expected, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
+    """per-token absmax 量子化の出力 (各行の最大が ±127) では、x_int8 を読み直さずに
+    127 * max(inv_sx) で求める tensorwise scale が materialized x_q の absmax と一致する."""
+    torch.manual_seed(0)
+    x = torch.randn(8, 16) * torch.logspace(-3, 1, 8).unsqueeze(1)
+    x[2] *= 1e-9  # 一部の行は absmax < 1e-5 で inv_scale が下限 clamp される
+    amax = x.abs().amax(dim=1)
+    inv_sx = (amax / 127.0).clamp_min(1e-5 / 127.0)
+    x_int8 = torch.round(x / inv_sx.unsqueeze(1)).clamp(-128, 127).to(torch.int8)
+    x_q = x_int8.to(torch.float32) * inv_sx.unsqueeze(1)
+    actual, actual_scale = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+    expected, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
+    torch.testing.assert_close(actual_scale, expected_scale, atol=0, rtol=0)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
 
-        torch.testing.assert_close(actual_scale, expected_scale)
-        torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
+    # 全行が下限 clamp (ほぼ 0 の活性) のときだけ scale は上界 (>= 厳密値) になり、
+    # 値は overflow せずに小さく丸まる
+    x_int8 = torch.tensor([[0, 0, 0, 0], [1, -2, 0, 3]], dtype=torch.int8)
+    inv_sx = torch.full((2,), 1e-5 / 127.0)
+    x_q = x_int8.to(torch.float32) * inv_sx.unsqueeze(1)
+    actual, actual_scale = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+    _, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
+    assert actual_scale >= expected_scale
+    torch.testing.assert_close(actual.float() * actual_scale, x_q.t(), atol=0.0, rtol=0.0625)
 
 
 def test_lowbit_wgrad_tile_presets_cover_small_and_arbor_shapes():

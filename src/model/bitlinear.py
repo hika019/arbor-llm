@@ -361,31 +361,6 @@ if triton is not None:
         )
 
     @triton.jit
-    def _a8_quantize_rows_kernel(
-        x_ptr, q_ptr, inv_scale_ptr,
-        m: tl.constexpr, k: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        """1 program/row で absmax reduction と INT8 write をまとめる."""
-        row = tl.program_id(0)
-        offs = tl.arange(0, BLOCK_K)
-        mask = offs < k
-        x = tl.load(x_ptr + row * k + offs, mask=mask, other=0.0).to(tl.float32)
-        amax = tl.max(tl.abs(x), axis=0)
-        inv_scale = tl.maximum(amax / 127.0, 1.0e-5 / 127.0)
-        scaled = x / inv_scale
-        # torch.round と同じ round-half-to-even にする (既定 fake-quant path の
-        # (x*scale).round() と rounding 規則を一致させる)。外部 libdevice alias は
-        # torch.compile の Triton source 抽出で失われるため kernel 内演算だけで行う。
-        nearest = tl.floor(scaled + 0.5)
-        is_tie = (nearest - scaled) == 0.5
-        is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
-        q = tl.where(is_tie & is_odd, nearest - 1.0, nearest)
-        q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
-        tl.store(q_ptr + row * k + offs, q, mask=mask)
-        tl.store(inv_scale_ptr + row, inv_scale)
-
-    @triton.jit
     def _a8_quantize_rows_scaled_kernel(
         x_ptr, col_scale_ptr, q_ptr, inv_scale_ptr,
         m: tl.constexpr, k: tl.constexpr,
@@ -410,37 +385,6 @@ if triton is not None:
         q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
         tl.store(q_ptr + row * k + offs, q, mask=mask)
         tl.store(inv_scale_ptr + row, inv_scale)
-
-    @triton.jit
-    def _dy_row_amax_kernel(
-        x_ptr, col_scale_ptr, inv_scale_ptr, row_amax_ptr,
-        n: tl.constexpr, stride_m: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """dY 1行分の amax を 2 種類まとめて取る (fused dY plumbing の pass 1).
-
-        - inv_scale: (dY * col_scale) の per-row A8 dequant scale (dX 用 INT8)
-        - row_amax : |dY| の行 amax。全体 amax (dW 用 tensorwise FP8 scale) は
-          この M 要素の max で得るので、dY を 3 回目に読まずに済む。
-        行長 n は BLOCK_N 単位で loop するので巨大行でも register tile を作らない。
-        """
-        row = tl.program_id(0)
-        amax_scaled = tl.zeros([BLOCK_N], dtype=tl.float32)
-        amax_raw = tl.zeros([BLOCK_N], dtype=tl.float32)
-        for n0 in range(0, n, BLOCK_N):
-            offs = n0 + tl.arange(0, BLOCK_N)
-            mask = offs < n
-            x = tl.load(
-                x_ptr + row * stride_m + offs, mask=mask, other=0.0
-            ).to(tl.float32)
-            col_scale = tl.load(
-                col_scale_ptr + offs, mask=mask, other=0.0
-            ).to(tl.float32)
-            amax_raw = tl.maximum(amax_raw, tl.abs(x))
-            amax_scaled = tl.maximum(amax_scaled, tl.abs(x * col_scale))
-        amax = tl.max(amax_scaled, axis=0)
-        tl.store(inv_scale_ptr + row, tl.maximum(amax / 127.0, 1.0e-5 / 127.0))
-        tl.store(row_amax_ptr + row, tl.max(amax_raw, axis=0))
 
     @triton.jit
     def _dy_quant_dual_kernel(
@@ -1052,23 +996,19 @@ def _packed_linear(
 
 
 def _quantize_a8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """CUDA/Triton fused per-token A8 quantization.
+    """per-token A8 quantization (torch op 版)。
 
     戻り値は INT8 activation と dequantization scale (1/quant scale)。
+    torch op で書くのは、compile 時に inductor が producer (RMSNorm 等) と 1 kernel に
+    融合し、正規化済み bf16 を書いて読み直す pass を省くため (専用 Triton kernel より
+    fwd −13ms/update)。torch.round は round-half-to-even。
     """
-    if triton is None or not x.is_cuda:
-        raise RuntimeError("native INT8 BitLinear には CUDA + Triton が必要です")
+    if not x.is_cuda:
+        raise RuntimeError("native INT8 BitLinear には CUDA が必要です")
     x2 = x.contiguous()
-    m, k = x2.shape
-    q = torch.empty_like(x2, dtype=torch.int8)
-    inv_scale = torch.empty(m, device=x.device, dtype=torch.float32)
-    block_k = triton.next_power_of_2(k)
-    _a8_quantize_rows_kernel[(m,)](
-        x2, q, inv_scale,
-        m, k,
-        BLOCK_K=block_k,
-        num_warps=8 if block_k >= 2048 else 4,
-    )
+    x32 = x2.float()
+    inv_scale = (x32.abs().amax(dim=1) / 127.0).clamp_min(1.0e-5 / 127.0)
+    q = torch.round(x32 / inv_scale.unsqueeze(1)).clamp_(-128.0, 127.0).to(torch.int8)
     return q, inv_scale
 
 
@@ -1113,14 +1053,13 @@ def _quantize_dy_dual(
     m, n = x2.shape
     if scale.numel() != n:
         raise ValueError(f"col_scale must have N={n} values")
-    inv_scale = torch.empty(m, device=dy.device, dtype=torch.float32)
-    row_amax = torch.empty(m, device=dy.device, dtype=torch.float32)
-    _dy_row_amax_kernel[(m,)](
-        x2, scale, inv_scale, row_amax,
-        n, x2.stride(0),
-        BLOCK_N=min(triton.next_power_of_2(n), 4096),
-        num_warps=8 if n >= 2048 else 4,
-    )
+    # pass 1 (行 amax 2 種) は torch op で書く。compile 時は inductor が dY の
+    # producer (residual add / ReLU² backward などの pointwise) と 1 kernel に融合し、
+    # dY を読み直す pass が消える。max は結合順序に依らず、積 x*col_scale も同じ
+    # fp32 演算なので旧 Triton 版 (_dy_row_amax_kernel) と bit 一致する。
+    x32 = x2.float()
+    row_amax = x32.abs().amax(dim=1)
+    inv_scale = ((x32 * scale).abs().amax(dim=1) / 127.0).clamp_min(1.0e-5 / 127.0)
     # max は結合順序に依らないので、分離実装の t.abs().amax() と同じ値になる。
     fp8_scale = (row_amax.amax() / _FP8_MAX).clamp_min(1e-12)
     q = torch.empty_like(x2, dtype=torch.int8)
@@ -1606,15 +1545,13 @@ def _cast_a8_dequant_fp8_transposed(
     sx = inv_sx.contiguous()
     if sx.numel() != x2.size(0):
         raise ValueError(f"inv_sx must have M={x2.size(0)} values")
-    # Exact absmax of the reconstructed A8 tensor. A Python branch on
-    # sx.amax() would materialize a CUDA scalar and synchronize once per
-    # BitLinear dW call. Non-floor rows have qmax=127, so this is also
-    # equivalent to the former sx_max * 127 fast path.
-    row_qmax = torch.maximum(
-        x2.amax(dim=1).to(torch.int16),
-        -x2.amin(dim=1).to(torch.int16),
-    ).to(torch.float32)
-    scale = ((row_qmax * sx.float()).amax() / _FP8_MAX).clamp_min(1e-12)
+    # tensorwise FP8 scale = 再構築 A8 の absmax / 448。per-token absmax 量子化では
+    # 各行の最大要素が必ず ±127 に写るので、行 absmax = 127 * inv_sx が厳密に成り立ち、
+    # x_int8 を読み直す amax/amin reduction (2 pass) は要らない。例外は行 absmax が
+    # 1e-5 未満で inv_scale が下限 clamp される行 (qmax < 127) だが、その行が全体の
+    # 最大になるのは全行がほぼ 0 のときだけで、そのとき scale が僅かに大きく出ても
+    # ほぼ 0 の勾配が更に小さく丸まるだけ。
+    scale = (sx.float().amax() * 127.0 / _FP8_MAX).clamp_min(1e-12)
     if triton is None or not x2.is_cuda:
         x_q = x2.to(torch.float32) * sx.float().unsqueeze(1)
         return (
