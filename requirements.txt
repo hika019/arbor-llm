@@ -12,6 +12,7 @@ datasets==4.8.5       # HF streaming (state_dict resume には >=2.18 必須)
 # CUDA header (crt/, nv/target)。torch の CUDA major (cu13 なら 13.0.*) に合わせる。
 nvidia-cuda-nvcc==13.0.*
 nvidia-cuda-cccl==13.0.*
+ninja>=1.11          # torch.utils.cpp_extension.load の build に必須
 
 # ---- HF エクスポート / transformers からの推論 ----
 transformers>=4.45
