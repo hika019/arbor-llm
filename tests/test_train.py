@@ -497,8 +497,9 @@ def test_cudagraph_gradient_buffers_are_persistent_and_reused():
     )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
-    count, num_bytes = prepare_cudagraph_gradient_buffers(model, optimizer)
+    count, num_bytes, fused = prepare_cudagraph_gradient_buffers(model, optimizer)
     parameters = list(model.parameters())
+    assert fused == 0
     pointers = [parameter.grad.data_ptr() for parameter in parameters]
 
     assert count == len(parameters)
@@ -513,7 +514,7 @@ def test_cudagraph_gradient_buffers_are_persistent_and_reused():
 
     assert [parameter.grad.data_ptr() for parameter in parameters] == pointers
     assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in parameters)
-    assert prepare_cudagraph_gradient_buffers(model, optimizer) == (0, 0)
+    assert prepare_cudagraph_gradient_buffers(model, optimizer) == (0, 0, 0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

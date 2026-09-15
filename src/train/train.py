@@ -250,15 +250,59 @@ def _run_tuning_preflight_preserving_state(
 def prepare_cudagraph_gradient_buffers(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-) -> tuple[int, int]:
+    fused_grad_accum: bool = False,
+) -> tuple[int, int, int]:
     """Allocate persistent parameter.grad buffers outside graph-private memory.
 
     CUDA Graph Trees may reuse a first backward's private output storage on the
     next forward replay. Gradient accumulation must therefore target stable
     buffers whose addresses survive every micro-step and optimizer zeroing.
+
+    fused_grad_accum: BitLinear / BitLinearGroup の dW を cuBLASLt beta=1 で
+    param.grad へ直接足し込む (AccumulateGrad の bf16 add を省く)。group は
+    member 全員の grad を 1 本の連結 buffer にし、各 member.weight.grad をその
+    行 slice の view にする (GEMM 出力が連続領域である必要があるため)。
+    戻り値: (確保した grad tensor 数, bytes, fused 経路に載せた BitLinear/Group 数)。
     """
+    from src.model.bitlinear import BitLinear, BitLinearGroup
+
     allocated = 0
     allocated_bytes = 0
+    fused = 0
+    if fused_grad_accum:
+        from src.model.fp8_wgrad_lt import _load_extension
+
+        _load_extension()  # build 失敗はここで例外 (暗黙フォールバックしない)
+        groups = [m for m in model.modules() if isinstance(m, BitLinearGroup)]
+        grouped: set[int] = set()
+        for group in groups:
+            members = group.members()
+            first = members[0].weight
+            buffer = torch.zeros(
+                (group.out_features, group.in_features), dtype=first.dtype, device=first.device
+            )
+            offset = 0
+            for member in members:
+                rows = member.out_features
+                if member.weight.grad is not None:
+                    raise RuntimeError("fused grad accum: weight.grad は未設定であること")
+                member.weight.grad = buffer[offset:offset + rows]
+                grouped.add(id(member))
+                offset += rows
+            group.set_grad_accum_buffer(buffer)
+            allocated += len(members)
+            allocated_bytes += buffer.numel() * buffer.element_size()
+            fused += 1
+        for module in model.modules():
+            if isinstance(module, BitLinear) and id(module) not in grouped:
+                if module.weight.grad is None:
+                    module.weight.grad = torch.zeros_like(
+                        module.weight, memory_format=torch.preserve_format
+                    )
+                    allocated += 1
+                    allocated_bytes += module.weight.grad.numel() * module.weight.grad.element_size()
+                module.set_grad_accum_buffer(module.weight.grad)
+                fused += 1
     for parameter in model.parameters():
         if parameter.requires_grad and parameter.grad is None:
             parameter.grad = torch.zeros_like(
@@ -267,7 +311,29 @@ def prepare_cudagraph_gradient_buffers(
             allocated += 1
             allocated_bytes += parameter.grad.numel() * parameter.grad.element_size()
     optimizer.zero_grad(set_to_none=False)
-    return allocated, allocated_bytes
+    return allocated, allocated_bytes, fused
+
+
+def verify_fused_grad_accum_buffers(model: torch.nn.Module) -> None:
+    """param.grad が fused 累積 buffer から外れていない (set_to_none 等) ことを確認する."""
+    from src.model.bitlinear import BitLinear, BitLinearGroup
+
+    for module in model.modules():
+        if isinstance(module, BitLinearGroup) and module._grad_accum is not None:
+            offset = 0
+            for member, rows in zip(module.members(), module.out_splits):
+                grad = member.weight.grad
+                if grad is None or grad.data_ptr() != module._grad_accum[offset:offset + rows].data_ptr():
+                    raise RuntimeError(
+                        "fused grad accum: BitLinearGroup member の weight.grad が累積 buffer から外れました"
+                    )
+                offset += rows
+        elif isinstance(module, BitLinear) and module._grad_accum is not None:
+            grad = module.weight.grad
+            if grad is None or grad.data_ptr() != module._grad_accum.data_ptr():
+                raise RuntimeError(
+                    "fused grad accum: BitLinear の weight.grad が累積 buffer から外れました"
+                )
 
 
 # --------------------------------------------------------------- 引数 / 設定
@@ -1834,14 +1900,22 @@ def main() -> int:
         and uses_cudagraph_compile(cfg["speed"])
         and accum_schedule.max_accum > 1
     )
+    fused_grad_accum = False
     if preserve_grad_buffers:
-        grad_buffer_count, grad_buffer_bytes = prepare_cudagraph_gradient_buffers(
-            model, optimizer
+        # BitLinear の dW を cuBLASLt beta=1 で param.grad へ直接累積する (AccumulateGrad
+        # の bf16 add = param bytes×3×micro-step の DRAM 往復を省く)。ternary + FP8 dW
+        # 経路専用。既定 ON、speed.bitlinear_fused_grad_accum: false で従来経路。
+        fused_grad_accum = bool(cfg["speed"].get("bitlinear_fused_grad_accum", True)) and (
+            resolve_bitlinear_compute_mode(cfg["speed"]) == "ternary"
+        )
+        grad_buffer_count, grad_buffer_bytes, fused_count = prepare_cudagraph_gradient_buffers(
+            model, optimizer, fused_grad_accum=fused_grad_accum
         )
         print(
             "[train] cudagraph_grad_buffers="
             f"persistent tensors={grad_buffer_count} "
-            f"memory={grad_buffer_bytes / 2**30:.2f}GiB"
+            f"memory={grad_buffer_bytes / 2**30:.2f}GiB "
+            f"fused_grad_accum={'ON' if fused_grad_accum else 'OFF'} modules={fused_count}"
         )
     else:
         optimizer.zero_grad(set_to_none=True)
@@ -2159,6 +2233,8 @@ def main() -> int:
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg["optim"]["grad_clip"]
                 )
+            if fused_grad_accum:
+                verify_fused_grad_accum_buffers(base_model)
             opt_start = start_gpu_section("optimizer")
             with nsys_range("arbor.optimizer"):
                 optimizer.step()

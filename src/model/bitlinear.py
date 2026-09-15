@@ -361,31 +361,6 @@ if triton is not None:
         )
 
     @triton.jit
-    def _a8_quantize_rows_kernel(
-        x_ptr, q_ptr, inv_scale_ptr,
-        m: tl.constexpr, k: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        """1 program/row で absmax reduction と INT8 write をまとめる."""
-        row = tl.program_id(0)
-        offs = tl.arange(0, BLOCK_K)
-        mask = offs < k
-        x = tl.load(x_ptr + row * k + offs, mask=mask, other=0.0).to(tl.float32)
-        amax = tl.max(tl.abs(x), axis=0)
-        inv_scale = tl.maximum(amax / 127.0, 1.0e-5 / 127.0)
-        scaled = x / inv_scale
-        # torch.round と同じ round-half-to-even にする (既定 fake-quant path の
-        # (x*scale).round() と rounding 規則を一致させる)。外部 libdevice alias は
-        # torch.compile の Triton source 抽出で失われるため kernel 内演算だけで行う。
-        nearest = tl.floor(scaled + 0.5)
-        is_tie = (nearest - scaled) == 0.5
-        is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
-        q = tl.where(is_tie & is_odd, nearest - 1.0, nearest)
-        q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
-        tl.store(q_ptr + row * k + offs, q, mask=mask)
-        tl.store(inv_scale_ptr + row, inv_scale)
-
-    @triton.jit
     def _a8_quantize_rows_scaled_kernel(
         x_ptr, col_scale_ptr, q_ptr, inv_scale_ptr,
         m: tl.constexpr, k: tl.constexpr,
@@ -410,37 +385,6 @@ if triton is not None:
         q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
         tl.store(q_ptr + row * k + offs, q, mask=mask)
         tl.store(inv_scale_ptr + row, inv_scale)
-
-    @triton.jit
-    def _dy_row_amax_kernel(
-        x_ptr, col_scale_ptr, inv_scale_ptr, row_amax_ptr,
-        n: tl.constexpr, stride_m: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """dY 1行分の amax を 2 種類まとめて取る (fused dY plumbing の pass 1).
-
-        - inv_scale: (dY * col_scale) の per-row A8 dequant scale (dX 用 INT8)
-        - row_amax : |dY| の行 amax。全体 amax (dW 用 tensorwise FP8 scale) は
-          この M 要素の max で得るので、dY を 3 回目に読まずに済む。
-        行長 n は BLOCK_N 単位で loop するので巨大行でも register tile を作らない。
-        """
-        row = tl.program_id(0)
-        amax_scaled = tl.zeros([BLOCK_N], dtype=tl.float32)
-        amax_raw = tl.zeros([BLOCK_N], dtype=tl.float32)
-        for n0 in range(0, n, BLOCK_N):
-            offs = n0 + tl.arange(0, BLOCK_N)
-            mask = offs < n
-            x = tl.load(
-                x_ptr + row * stride_m + offs, mask=mask, other=0.0
-            ).to(tl.float32)
-            col_scale = tl.load(
-                col_scale_ptr + offs, mask=mask, other=0.0
-            ).to(tl.float32)
-            amax_raw = tl.maximum(amax_raw, tl.abs(x))
-            amax_scaled = tl.maximum(amax_scaled, tl.abs(x * col_scale))
-        amax = tl.max(amax_scaled, axis=0)
-        tl.store(inv_scale_ptr + row, tl.maximum(amax / 127.0, 1.0e-5 / 127.0))
-        tl.store(row_amax_ptr + row, tl.max(amax_raw, axis=0))
 
     @triton.jit
     def _dy_quant_dual_kernel(
@@ -1052,23 +996,19 @@ def _packed_linear(
 
 
 def _quantize_a8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """CUDA/Triton fused per-token A8 quantization.
+    """per-token A8 quantization (torch op 版)。
 
     戻り値は INT8 activation と dequantization scale (1/quant scale)。
+    torch op で書くのは、compile 時に inductor が producer (RMSNorm 等) と 1 kernel に
+    融合し、正規化済み bf16 を書いて読み直す pass を省くため (専用 Triton kernel より
+    fwd −13ms/update)。torch.round は round-half-to-even。
     """
-    if triton is None or not x.is_cuda:
-        raise RuntimeError("native INT8 BitLinear には CUDA + Triton が必要です")
+    if not x.is_cuda:
+        raise RuntimeError("native INT8 BitLinear には CUDA が必要です")
     x2 = x.contiguous()
-    m, k = x2.shape
-    q = torch.empty_like(x2, dtype=torch.int8)
-    inv_scale = torch.empty(m, device=x.device, dtype=torch.float32)
-    block_k = triton.next_power_of_2(k)
-    _a8_quantize_rows_kernel[(m,)](
-        x2, q, inv_scale,
-        m, k,
-        BLOCK_K=block_k,
-        num_warps=8 if block_k >= 2048 else 4,
-    )
+    x32 = x2.float()
+    inv_scale = (x32.abs().amax(dim=1) / 127.0).clamp_min(1.0e-5 / 127.0)
+    q = torch.round(x32 / inv_scale.unsqueeze(1)).clamp_(-128.0, 127.0).to(torch.int8)
     return q, inv_scale
 
 
@@ -1113,14 +1053,13 @@ def _quantize_dy_dual(
     m, n = x2.shape
     if scale.numel() != n:
         raise ValueError(f"col_scale must have N={n} values")
-    inv_scale = torch.empty(m, device=dy.device, dtype=torch.float32)
-    row_amax = torch.empty(m, device=dy.device, dtype=torch.float32)
-    _dy_row_amax_kernel[(m,)](
-        x2, scale, inv_scale, row_amax,
-        n, x2.stride(0),
-        BLOCK_N=min(triton.next_power_of_2(n), 4096),
-        num_warps=8 if n >= 2048 else 4,
-    )
+    # pass 1 (行 amax 2 種) は torch op で書く。compile 時は inductor が dY の
+    # producer (residual add / ReLU² backward などの pointwise) と 1 kernel に融合し、
+    # dY を読み直す pass が消える。max は結合順序に依らず、積 x*col_scale も同じ
+    # fp32 演算なので旧 Triton 版 (_dy_row_amax_kernel) と bit 一致する。
+    x32 = x2.float()
+    row_amax = x32.abs().amax(dim=1)
+    inv_scale = ((x32 * scale).abs().amax(dim=1) / 127.0).clamp_min(1.0e-5 / 127.0)
     # max は結合順序に依らないので、分離実装の t.abs().amax() と同じ値になる。
     fp8_scale = (row_amax.amax() / _FP8_MAX).clamp_min(1e-12)
     q = torch.empty_like(x2, dtype=torch.int8)
@@ -1606,15 +1545,13 @@ def _cast_a8_dequant_fp8_transposed(
     sx = inv_sx.contiguous()
     if sx.numel() != x2.size(0):
         raise ValueError(f"inv_sx must have M={x2.size(0)} values")
-    # Exact absmax of the reconstructed A8 tensor. A Python branch on
-    # sx.amax() would materialize a CUDA scalar and synchronize once per
-    # BitLinear dW call. Non-floor rows have qmax=127, so this is also
-    # equivalent to the former sx_max * 127 fast path.
-    row_qmax = torch.maximum(
-        x2.amax(dim=1).to(torch.int16),
-        -x2.amin(dim=1).to(torch.int16),
-    ).to(torch.float32)
-    scale = ((row_qmax * sx.float()).amax() / _FP8_MAX).clamp_min(1e-12)
+    # tensorwise FP8 scale = 再構築 A8 の absmax / 448。per-token absmax 量子化では
+    # 各行の最大要素が必ず ±127 に写るので、行 absmax = 127 * inv_sx が厳密に成り立ち、
+    # x_int8 を読み直す amax/amin reduction (2 pass) は要らない。例外は行 absmax が
+    # 1e-5 未満で inv_scale が下限 clamp される行 (qmax < 127) だが、その行が全体の
+    # 最大になるのは全行がほぼ 0 のときだけで、そのとき scale が僅かに大きく出ても
+    # ほぼ 0 の勾配が更に小さく丸まるだけ。
+    scale = (sx.float().amax() * 127.0 / _FP8_MAX).clamp_min(1e-12)
     if triton is None or not x2.is_cuda:
         x_q = x2.to(torch.float32) * sx.float().unsqueeze(1)
         return (
@@ -1710,6 +1647,26 @@ def _fp8_wgrad_from_a8_pretransposed(
         sx,
         out_dtype,
     )
+
+
+def _fp8_wgrad_accumulate_from_a8_pretransposed(
+    gt_f8: torch.Tensor,
+    sg: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    grad_accum: torch.Tensor,
+) -> None:
+    """FP8 dW を gradient accumulation buffer へ GEMM epilogue で直接足し込む.
+
+    `_fp8_wgrad_from_a8_pretransposed` + AccumulateGrad の bf16 add (param bytes
+    × 3 の DRAM 往復が micro-step ごとに走る) を cuBLASLt beta=1 の 1 GEMM に
+    置き換える。数値は「fp32 累積 + bf16 一回丸め」なので、従来の「GEMM 出力を
+    bf16 に丸めてから bf16 同士で加算」より丸めが 1 回少ない。
+    """
+    from src.model.fp8_wgrad_lt import fp8_wgrad_lt
+
+    x_km, sx = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+    fp8_wgrad_lt(x_km, sx, gt_f8, sg, grad_accum, True)
 
 
 def _ternary_wgrad_uses_fp8(m: int, k: int, n: int) -> bool:
@@ -1907,6 +1864,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         row_scale: torch.Tensor,
         backend: str,
         out_sizes: tuple[int, ...],
+        grad_accum: torch.Tensor | None,
         *shadow_weights: torch.Tensor,
     ) -> torch.Tensor:
         del shadow_weights
@@ -1919,7 +1877,14 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         ctx.decode_v2 = flags["decode_v2"]
         x2 = x.reshape(-1, ctx.input_shape[-1])
         x_int8, inv_sx = _quantize_a8_rows(x2)
-        ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale)
+        # grad_accum (= 各 member の param.grad を連結した persistent buffer) は
+        # backward で in-place 更新する。save_for_backward の version check は
+        # forward→backward 間の変更だけを見るので、micro-step 間の累積は通る。
+        ctx.has_grad_accum = grad_accum is not None
+        if grad_accum is not None:
+            ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale, grad_accum)
+        else:
+            ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale)
         y = _packed_linear(
             x_int8,
             inv_sx,
@@ -1937,10 +1902,14 @@ class TernaryBitLinearSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x_int8, inv_sx, w_packed_t, row_scale = ctx.saved_tensors
+        if ctx.has_grad_accum:
+            x_int8, inv_sx, w_packed_t, row_scale, grad_accum = ctx.saved_tensors
+        else:
+            x_int8, inv_sx, w_packed_t, row_scale = ctx.saved_tensors
+            grad_accum = None
         n = row_scale.numel()
         g2 = grad_output.reshape(-1, n)
-        needs_w = ctx.needs_input_grad[6:]
+        needs_w = ctx.needs_input_grad[7:]
         k = ctx.input_shape[-1]
         # dX 用 INT8 と dW 用 FP8 転置を dY の 2 pass で同時に作る。dW が FP8
         # backend でない場合は転置出力が要らないので分離実装のまま。
@@ -1972,7 +1941,14 @@ class TernaryBitLinearSTE(torch.autograd.Function):
                 backend=ctx.backend,
             ).reshape(ctx.input_shape)
 
-        if any(needs_w):
+        if any(needs_w) and grad_accum is not None and fuse_dy and all(needs_w):
+            # dW を param.grad (の連結 buffer) へ直接累積し、autograd には None を
+            # 返して AccumulateGrad の bf16 add を省く。
+            _fp8_wgrad_accumulate_from_a8_pretransposed(
+                gt_f8, sg, x_int8, inv_sx, grad_accum
+            )
+            grad_weights = tuple(None for _ in ctx.out_sizes)
+        elif any(needs_w):
             if fuse_dy:
                 grad_w = _fp8_wgrad_from_a8_pretransposed(
                     gt_f8, sg, x_int8, inv_sx, grad_output.dtype
@@ -1988,7 +1964,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
             grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
         else:
             grad_weights = tuple(None for _ in ctx.out_sizes)
-        return (grad_x, None, None, None, None, None, *grad_weights)
+        return (grad_x, None, None, None, None, None, None, *grad_weights)
 
 
 def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]:
@@ -2059,11 +2035,23 @@ class BitLinear(nn.Module):
         self.register_buffer("_train_w_packed_t", None, persistent=False)
         self._train_cache_enabled = False
         self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
+        # dW を直接累積する persistent buffer (= weight.grad と同一 storage)。
+        # 学習ループが set_grad_accum_buffer で設定する。ternary + FP8 dW 経路専用。
+        self.register_buffer("_grad_accum", None, persistent=False)
         # 推論凍結用 (freeze_for_inference 後のみ非 None)
         self._w_packed: torch.Tensor | None = None
         self._w_scale: torch.Tensor | None = None
         self._w_dq: torch.Tensor | None = None  # CPU/Triton 無し環境のフォールバック
         self.register_load_state_dict_post_hook(self._after_load_state_dict)
+
+    def set_grad_accum_buffer(self, buffer: torch.Tensor | None) -> None:
+        """dW 直接累積 buffer (= weight.grad そのもの) を設定する。None で解除."""
+        if buffer is not None:
+            if self.weight.grad is None or self.weight.grad.data_ptr() != buffer.data_ptr():
+                raise ValueError("grad accum buffer は weight.grad と同一 storage でなければならない")
+            if tuple(buffer.shape) != tuple(self.weight.shape) or not buffer.is_contiguous():
+                raise ValueError("grad accum buffer は weight と同形状の contiguous tensor")
+        self._grad_accum = buffer
 
     # --------------------------------------------------------- training cache
     def _after_load_state_dict(self, module: nn.Module, incompatible_keys: Any) -> None:
@@ -2357,6 +2345,7 @@ class BitLinear(nn.Module):
                 row_scale,
                 _ternary_backend,
                 (self.out_features,),
+                self._grad_accum,
                 self.weight,
             )
         if self.training and self._fp8_mode == "int8":
@@ -2416,9 +2405,31 @@ class BitLinearGroup(nn.Module):
         self.register_buffer("_train_w_packed_t", None, persistent=False)
         self._train_cache_enabled = False
         self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
+        # member 全員の weight.grad を out_splits 順に連結した persistent buffer
+        # (各 member.weight.grad はこの行 slice の view)。学習ループが設定する。
+        self.register_buffer("_grad_accum", None, persistent=False)
 
     def members(self) -> tuple[BitLinear, ...]:
         return self._members
+
+    def set_grad_accum_buffer(self, buffer: torch.Tensor | None) -> None:
+        """dW 直接累積 buffer を設定する。None で従来の AccumulateGrad 経路に戻る."""
+        if buffer is not None:
+            expected = (self.out_features, self.in_features)
+            if tuple(buffer.shape) != expected or not buffer.is_contiguous():
+                raise ValueError(
+                    f"grad accum buffer must be contiguous {expected}, got {tuple(buffer.shape)}"
+                )
+            offset = 0
+            for member, rows in zip(self.members(), self.out_splits):
+                view = buffer[offset:offset + rows]
+                if member.weight.grad is None or member.weight.grad.data_ptr() != view.data_ptr():
+                    raise ValueError(
+                        f"member {member.out_features}x{member.in_features} の weight.grad が "
+                        "buffer の対応 slice を指していません"
+                    )
+                offset += rows
+        self._grad_accum = buffer
 
     @property
     def matrix_count(self) -> int:
@@ -2606,6 +2617,7 @@ class BitLinearGroup(nn.Module):
                 row_scale,
                 _ternary_backend,
                 self.out_splits,
+                self._grad_accum,
                 *weights,
             )
         if self.training and self._fp8_mode == "int8":

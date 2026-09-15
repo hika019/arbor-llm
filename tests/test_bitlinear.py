@@ -366,31 +366,29 @@ def test_ternary_wgrad_auto_selects_backend_by_shape(monkeypatch):
 
 
 def test_a8_dequant_fp8_transposed_matches_materialized_xq_cpu():
-    cases = [
-        (
-            torch.tensor(
-                [
-                    [0, 0, 0, 0],
-                    [1, -2, 3, -4],
-                    [127, -126, 0, 64],
-                    [-128, 0, 5, -7],
-                ],
-                dtype=torch.int8,
-            ),
-            torch.tensor([1e-5 / 127.0, 1e-5 / 127.0, 0.25, 0.125]),
-        ),
-        (
-            torch.tensor([[0, 0, 0, 0], [1, -2, 0, 3]], dtype=torch.int8),
-            torch.full((2,), 1e-5 / 127.0),
-        ),
-    ]
-    for x_int8, inv_sx in cases:
-        x_q = x_int8.to(torch.float32) * inv_sx.unsqueeze(1)
-        actual, actual_scale = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
-        expected, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
+    """per-token absmax 量子化の出力 (各行の最大が ±127) では、x_int8 を読み直さずに
+    127 * max(inv_sx) で求める tensorwise scale が materialized x_q の absmax と一致する."""
+    torch.manual_seed(0)
+    x = torch.randn(8, 16) * torch.logspace(-3, 1, 8).unsqueeze(1)
+    x[2] *= 1e-9  # 一部の行は absmax < 1e-5 で inv_scale が下限 clamp される
+    amax = x.abs().amax(dim=1)
+    inv_sx = (amax / 127.0).clamp_min(1e-5 / 127.0)
+    x_int8 = torch.round(x / inv_sx.unsqueeze(1)).clamp(-128, 127).to(torch.int8)
+    x_q = x_int8.to(torch.float32) * inv_sx.unsqueeze(1)
+    actual, actual_scale = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+    expected, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
+    torch.testing.assert_close(actual_scale, expected_scale, atol=0, rtol=0)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
 
-        torch.testing.assert_close(actual_scale, expected_scale)
-        torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
+    # 全行が下限 clamp (ほぼ 0 の活性) のときだけ scale は上界 (>= 厳密値) になり、
+    # 値は overflow せずに小さく丸まる
+    x_int8 = torch.tensor([[0, 0, 0, 0], [1, -2, 0, 3]], dtype=torch.int8)
+    inv_sx = torch.full((2,), 1e-5 / 127.0)
+    x_q = x_int8.to(torch.float32) * inv_sx.unsqueeze(1)
+    actual, actual_scale = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+    _, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
+    assert actual_scale >= expected_scale
+    torch.testing.assert_close(actual.float() * actual_scale, x_q.t(), atol=0.0, rtol=0.0625)
 
 
 def test_lowbit_wgrad_tile_presets_cover_small_and_arbor_shapes():
@@ -847,3 +845,87 @@ def test_frozen_packed_inference_matches_reference_cuda(monkeypatch):
     assert torch.allclose(out, ref, atol=3e-2, rtol=1e-2), float(
         (out - ref).abs().max()
     )
+
+
+def _fused_grad_accum_available() -> bool:
+    if not fp8_gemm_supported():
+        return False
+    from src.model.fp8_wgrad_lt import fp8_wgrad_lt_available
+
+    return fp8_wgrad_lt_available()
+
+
+@pytest.mark.skipif(not _fused_grad_accum_available(), reason="sm89+ CUDA and cuBLASLt extension required")
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fused_grad_accumulation_matches_accumulate_grad(compiled, monkeypatch):
+    """cuBLASLt beta=1 の dW 直接累積が AccumulateGrad 経路と一致すること (Group + 単体)."""
+    torch.manual_seed(5)
+    set_bitlinear_ternary_backend("kmajor_single_dot")
+    set_bitlinear_ternary_wgrad_backend("fp8")
+    try:
+        def build():
+            q = BitLinear(64, 32).to(device="cuda", dtype=torch.bfloat16)
+            k = BitLinear(64, 16).to(device="cuda", dtype=torch.bfloat16)
+            o = BitLinear(48, 64).to(device="cuda", dtype=torch.bfloat16)
+            group = BitLinearGroup((q, k), kind="qkv")
+            for m in (q, k, o, group):
+                set_bitlinear_fp8_mode(m, "ternary")
+                m.enable_training_weight_cache(True)
+
+            class Net(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.q, self.k, self.o, self.group = q, k, o, group
+
+                def forward(self, x):
+                    return self.o(self.group(x))
+
+            return Net().cuda()
+
+        ref = build()
+        fused = build()
+        fused.load_state_dict(ref.state_dict())
+        for m in (fused.q, fused.k, fused.o, fused.group, ref.q, ref.k, ref.o, ref.group):
+            m.refresh_training_weight_cache()
+
+        # 参照: 通常の persistent grad buffer + AccumulateGrad
+        for p in ref.parameters():
+            p.grad = torch.zeros_like(p)
+        # fused: group は連結 buffer の slice、単体は grad そのもの
+        gbuf = torch.zeros((48, 64), device="cuda", dtype=torch.bfloat16)
+        fused.q.weight.grad = gbuf[:32]
+        fused.k.weight.grad = gbuf[32:]
+        fused.group.set_grad_accum_buffer(gbuf)
+        fused.o.weight.grad = torch.zeros_like(fused.o.weight)
+        fused.o.set_grad_accum_buffer(fused.o.weight.grad)
+
+        run_ref = torch.compile(ref) if compiled else ref
+        run_fused = torch.compile(fused) if compiled else fused
+        import src.model.bitlinear as bl
+
+        calls = []
+        orig = bl._fp8_wgrad_accumulate_from_a8_pretransposed
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(bl, "_fp8_wgrad_accumulate_from_a8_pretransposed", counted)
+        for _ in range(3):
+            x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+            run_ref(x).float().square().mean().backward()
+            run_fused(x).float().square().mean().backward()
+        # eager では micro-step ごとに group + 単体の 2 回。compile は trace 時のみ数えるので下限だけ見る
+        assert len(calls) >= (6 if not compiled else 2)
+        for name in ("q", "k", "o"):
+            g_ref = getattr(ref, name).weight.grad.float()
+            g_fused = getattr(fused, name).weight.grad.float()
+            assert torch.isfinite(g_fused).all()
+            # bf16 加算の丸め回数が違う (fused は fp32 累積 + 1 回丸め) ので厳密一致ではない
+            torch.testing.assert_close(g_fused, g_ref, atol=2e-2, rtol=2e-2)
+        # 単体 BitLinear の grad は buffer そのもの、group member は連結 buffer の view のまま
+        assert fused.o.weight.grad.data_ptr() == fused.o._grad_accum.data_ptr()
+        assert fused.q.weight.grad.data_ptr() == gbuf.data_ptr()
+    finally:
+        set_bitlinear_ternary_backend("dot")
+        set_bitlinear_ternary_wgrad_backend("auto")

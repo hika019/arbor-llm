@@ -204,6 +204,61 @@ dynamic=max に化ける二重挙動だったため、concat は static 専用�
 - entropy patching に戻す場合は mean/max しか使えない (patch 長可変)。concat 相当が欲しければ
   「max_patch_len へ右 pad して concat」を別途実装する (未実装)。
 
+## 9. GPU 側の無駄取り (B) — torch 2.14 の rms_norm 罠、dW 直接累積、量子化配管の融合 (2026-09-15)
+
+nsys (`scripts/profile_training_nsys.sh`、arbor.yaml、random_bytes、accum 8 フェーズ、2 update) で
+1 update の GPU 時間を kernel 名で分解し、「行列積以外」の帯域往復を減らした。
+4090 固有の tile チューニングは対象外 (packed GEMM / flex の kernel 効率は触っていない)。
+
+| 状態 | GPU ms/update | bytes/s (合成) | 主な変化 |
+|---|---:|---:|---|
+| torch 2.14 + 修正前 | ~750 (step_ms) | 172k | autocast 下の `F.rms_norm` が fp32 を返し全 BitLinear 入力が fp32 経路 |
+| RMSNorm 修正 (6765fac) | 550 | 233k | 2.11 と同じ bf16 経路に戻る |
+| (a) dW 直接累積 (26aee4e) | 486 | 254-262k | `CUDAFunctor_add` ×2080 (60ms) が消える |
+| (b) 量子化配管の融合 (653208a) | 447 | 276-292k | A8 量子化 / dY amax が producer に融合、x 側 amax 廃止 |
+
+実データ (HF streaming) でも同じ値 (269k、batch_ms 35-40ms は GPU と重畳)。loss は全段で 4 桁一致。
+
+### (a) 勾配累積を dW GEMM の epilogue に (−60ms)
+
+AccumulateGrad の bf16 add は param 950M × 2B × 3 (新 dW 読み・累積読み・書き) = 5.7GB/micro-step
+で帯域上限 (760GB/s) に張り付いていた。`torch._scaled_mm` は beta=0 固定なので cuBLASLt を
+直接呼ぶ C++ 拡張 (`src/model/csrc/fp8_wgrad_lt.cpp`、host API のみ、nvcc 不要、header/lib は
+pip の nvidia/cu13) を追加し、FP8 A/B + BF16 C/D + beta=1 で累積 buffer へ足し込む。
+BitLinearGroup は member の weight.grad を 1 本の連結 buffer の行 slice にする (GEMM 出力が
+連続領域である必要)。beta=1 の GEMM 時間は +1.3ms/update だけ。数値は fp32 累積 + bf16 1 回丸め
+(従来より丸めが 1 回少ない)。`speed.bitlinear_fused_grad_accum: false` で従来経路。
+
+### (b) 同じ activation を別 kernel で読み直す pass を消す (−39ms)
+
+- A8 量子化 (forward): 専用 Triton kernel → torch op。inductor が RMSNorm / ReLU² の kernel に
+  融合し、正規化済み bf16 の書き出し+読み直しが消える (fwd 113.6 → 99.6ms、kernel 単体 6.7ms より大)。
+- dY の行 amax (backward pass 1): Triton → torch reduction。dY の producer (residual add /
+  ReLU² backward) に融合。bit 一致 (max は順序非依存)。
+- x 側 FP8 tensorwise scale: x_int8 の amax/amin 2 pass → `127 * max(inv_sx)` (per-token absmax
+  量子化では各行の最大が必ず ±127 なので厳密に等しい。全行が |x|<1e-5 の下限 clamp のときだけ上界)。
+
+### (c) local 層の pointwise — (b) の融合で大半が吸収された
+
+(b) 前の local 層 pointwise 38ms (ReLU²+norm 8.2 / A8 3.9 / dY amax 8.4 / ReLU² bwd 9.5 / norm bwd 8.0)
+→ (b) 後 23ms (ReLU²+norm+A8 6.6 / ReLU² bwd+amax 9.3 / norm bwd 7.5)。残りは全て 650-870GB/s で
+帯域に張り付いており、減らすには tensor を跨ぐ融合 (SubLN backward + ReLU² backward を 1 kernel、
+d_h の往復 134MB ≈ 3.6ms) や local attention 専用 kernel (fmha fwd+bwd 11.8ms → ~6ms) の
+custom kernel が要る。各 1% 前後なので保留。
+
+試して効かなかったもの:
+- global attention を flex → cuDNN SDPA (密 doc マスク + native GQA): 単体では fwd+bwd 255 → 168µs/層
+  だが、in-model では flex backward が RMSNorm backward の template に融合されていて分離すると
+  fwd +6 / bwd +7ms の逆効果 (削除済み)。
+- flex の BLOCK_M/N kernel_options: 全組み合わせで差なし (latency bound は block 形状で解けない)。
+
+### 残りの内訳 (447ms/update、accum 8)
+
+packed ternary GEMM 33% / FP8 dW GEMM 15% / optimizer (AdamW+clip、update あたり固定) 8% /
+global flex bwd (norm bwd と融合) 7% / local 層 pointwise 5% / local attention 3% / その他 pointwise。
+optimizer は accum 32 で 2% に下がる。GEMM 側 (三値 ~190-250 TOPS、FP8 280 TFLOPS) は tile の話で
+4090 固有チューニングの領域。
+
 ## 見送り
 
 - **Multi-token prediction**: DeepSeek-V3 (arXiv 2412.19437) 採用。ただし "Pre-Training
