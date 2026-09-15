@@ -176,8 +176,13 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # F.rms_norm は内部 fp32 計算の fused カーネル (手書き 6 カーネル比 ~8 倍速)
-        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
+        # F.rms_norm は内部 fp32 計算の fused カーネル (手書き 6 カーネル比 ~8 倍速)。
+        # torch 2.14 から autocast 下の rms_norm は fp32 に昇格して fp32 を返す
+        # (2.11 までは bf16)。そのまま下流へ流すと A8 量子化・FP8 GEMM・pointwise が
+        # 全て fp32 経路になり学習が 25% 遅くなった (2026-09-15 実測 233k→173k bytes/s)。
+        # autocast を外し、入出力 dtype を x に固定する (内部計算は変わらず fp32)。
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return F.rms_norm(x, (x.size(-1),), self.weight.to(x.dtype), self.eps)
 
 
 class RotaryEmbedding(nn.Module):
