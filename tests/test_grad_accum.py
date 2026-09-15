@@ -55,7 +55,7 @@ def test_invalid_schedules_are_rejected(speed_cfg, message):
         GradAccumSchedule.from_speed_cfg(speed_cfg)
 
 
-@pytest.mark.parametrize("name", ["cosine_warmup", "two_stage"])
+@pytest.mark.parametrize("name", ["cosine_warmup", "wsd"])
 def test_build_scheduler_applies_lr_scale_to_every_scheduler(name):
     sched = GradAccumSchedule.from_speed_cfg({
         "grad_accum_steps": [[0, 1], [20, 4]],
@@ -67,10 +67,9 @@ def test_build_scheduler_applies_lr_scale_to_every_scheduler(name):
         "total_steps": 100,
         "min_lr_ratio": 0.1,
         "decay_end_ratio": 0.8,
-        "stage2_start_ratio": 0.5,
-        "stage2_peak_lr_ratio": 0.5,
+        "decay_start_ratio": 0.5,
         "weight_decay": 0.1,
-        "weight_decay_stage2": 0.0,
+        "weight_decay_decay_phase": 0.0,
     }
 
     def run(lr_scale):
@@ -129,15 +128,15 @@ def test_cumulative_accum_and_bytes_fraction():
     assert const(25) == pytest.approx(0.5)
 
 
-@pytest.mark.parametrize("name", ["cosine_warmup", "two_stage"])
+@pytest.mark.parametrize("name", ["cosine_warmup", "wsd"])
 def test_scheduler_progress_by_bytes_matches_constant_run_at_equal_bytes(name):
     """accum 1→4 の run は、同じ bytes を消費した時点で固定 accum 4 の run と同じ lr (補正前) になる。"""
     # warmup は step 単位なので、warmup 中に消費する bytes は両者で違う (cosine の起点が
     # bytes 上でわずかにずれる)。等価性を厳密に見るため warmup 0 で比べる。
     optim_cfg = {
         "scheduler": name, "lr": 1e-3, "warmup_steps": 0, "min_lr_ratio": 0.1,
-        "decay_end_ratio": 0.8, "stage2_start_ratio": 0.5, "stage2_peak_lr_ratio": 0.5,
-        "weight_decay": 0.1, "weight_decay_stage2": 0.0,
+        "decay_end_ratio": 0.8, "decay_start_ratio": 0.5,
+        "weight_decay": 0.1, "weight_decay_decay_phase": 0.0,
     }
     # 固定 accum 4 を 100 step = 400 micro-step。schedule 側は accum 1 を 100 step + accum 4 を 75 step = 400 micro-step。
     sched = GradAccumSchedule.from_speed_cfg({
@@ -160,5 +159,8 @@ def test_scheduler_progress_by_bytes_matches_constant_run_at_equal_bytes(name):
     # schedule run の step k>=100 は bytes = 100 + 4(k-100) micro-step、固定 run の step (25 + (k-100)) と同じ bytes
     for k in range(100, 175):
         assert warm[k] == pytest.approx(const[25 + (k - 100)], rel=1e-6), (k, name)
-    # 序盤 (accum 1) は bytes が少ないので lr の減衰が遅い
-    assert warm[50] > const[50]
+    # 序盤 (accum 1) は bytes が少ないので lr の減衰が遅い (wsd は stable 区間でどちらもピーク)
+    if name == "wsd":
+        assert warm[50] == pytest.approx(const[50]) == pytest.approx(1e-3)
+    else:
+        assert warm[50] > const[50]
