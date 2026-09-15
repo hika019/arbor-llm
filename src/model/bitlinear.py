@@ -1712,6 +1712,26 @@ def _fp8_wgrad_from_a8_pretransposed(
     )
 
 
+def _fp8_wgrad_accumulate_from_a8_pretransposed(
+    gt_f8: torch.Tensor,
+    sg: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    grad_accum: torch.Tensor,
+) -> None:
+    """FP8 dW を gradient accumulation buffer へ GEMM epilogue で直接足し込む.
+
+    `_fp8_wgrad_from_a8_pretransposed` + AccumulateGrad の bf16 add (param bytes
+    × 3 の DRAM 往復が micro-step ごとに走る) を cuBLASLt beta=1 の 1 GEMM に
+    置き換える。数値は「fp32 累積 + bf16 一回丸め」なので、従来の「GEMM 出力を
+    bf16 に丸めてから bf16 同士で加算」より丸めが 1 回少ない。
+    """
+    from src.model.fp8_wgrad_lt import fp8_wgrad_lt
+
+    x_km, sx = _cast_a8_dequant_fp8_transposed(x_int8, inv_sx)
+    fp8_wgrad_lt(x_km, sx, gt_f8, sg, grad_accum, True)
+
+
 def _ternary_wgrad_uses_fp8(m: int, k: int, n: int) -> bool:
     return _ternary_wgrad_backend == "fp8" or (
         _ternary_wgrad_backend == "auto"
@@ -1907,6 +1927,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         row_scale: torch.Tensor,
         backend: str,
         out_sizes: tuple[int, ...],
+        grad_accum: torch.Tensor | None,
         *shadow_weights: torch.Tensor,
     ) -> torch.Tensor:
         del shadow_weights
@@ -1919,7 +1940,14 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         ctx.decode_v2 = flags["decode_v2"]
         x2 = x.reshape(-1, ctx.input_shape[-1])
         x_int8, inv_sx = _quantize_a8_rows(x2)
-        ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale)
+        # grad_accum (= 各 member の param.grad を連結した persistent buffer) は
+        # backward で in-place 更新する。save_for_backward の version check は
+        # forward→backward 間の変更だけを見るので、micro-step 間の累積は通る。
+        ctx.has_grad_accum = grad_accum is not None
+        if grad_accum is not None:
+            ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale, grad_accum)
+        else:
+            ctx.save_for_backward(x_int8, inv_sx, w_packed_t, row_scale)
         y = _packed_linear(
             x_int8,
             inv_sx,
@@ -1937,10 +1965,14 @@ class TernaryBitLinearSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x_int8, inv_sx, w_packed_t, row_scale = ctx.saved_tensors
+        if ctx.has_grad_accum:
+            x_int8, inv_sx, w_packed_t, row_scale, grad_accum = ctx.saved_tensors
+        else:
+            x_int8, inv_sx, w_packed_t, row_scale = ctx.saved_tensors
+            grad_accum = None
         n = row_scale.numel()
         g2 = grad_output.reshape(-1, n)
-        needs_w = ctx.needs_input_grad[6:]
+        needs_w = ctx.needs_input_grad[7:]
         k = ctx.input_shape[-1]
         # dX 用 INT8 と dW 用 FP8 転置を dY の 2 pass で同時に作る。dW が FP8
         # backend でない場合は転置出力が要らないので分離実装のまま。
@@ -1972,7 +2004,14 @@ class TernaryBitLinearSTE(torch.autograd.Function):
                 backend=ctx.backend,
             ).reshape(ctx.input_shape)
 
-        if any(needs_w):
+        if any(needs_w) and grad_accum is not None and fuse_dy and all(needs_w):
+            # dW を param.grad (の連結 buffer) へ直接累積し、autograd には None を
+            # 返して AccumulateGrad の bf16 add を省く。
+            _fp8_wgrad_accumulate_from_a8_pretransposed(
+                gt_f8, sg, x_int8, inv_sx, grad_accum
+            )
+            grad_weights = tuple(None for _ in ctx.out_sizes)
+        elif any(needs_w):
             if fuse_dy:
                 grad_w = _fp8_wgrad_from_a8_pretransposed(
                     gt_f8, sg, x_int8, inv_sx, grad_output.dtype
@@ -1988,7 +2027,7 @@ class TernaryBitLinearSTE(torch.autograd.Function):
             grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
         else:
             grad_weights = tuple(None for _ in ctx.out_sizes)
-        return (grad_x, None, None, None, None, None, *grad_weights)
+        return (grad_x, None, None, None, None, None, None, *grad_weights)
 
 
 def set_bitlinear_fp8_mode(module: nn.Module, mode: str) -> dict[str, int | str]:
@@ -2059,11 +2098,23 @@ class BitLinear(nn.Module):
         self.register_buffer("_train_w_packed_t", None, persistent=False)
         self._train_cache_enabled = False
         self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
+        # dW を直接累積する persistent buffer (= weight.grad と同一 storage)。
+        # 学習ループが set_grad_accum_buffer で設定する。ternary + FP8 dW 経路専用。
+        self.register_buffer("_grad_accum", None, persistent=False)
         # 推論凍結用 (freeze_for_inference 後のみ非 None)
         self._w_packed: torch.Tensor | None = None
         self._w_scale: torch.Tensor | None = None
         self._w_dq: torch.Tensor | None = None  # CPU/Triton 無し環境のフォールバック
         self.register_load_state_dict_post_hook(self._after_load_state_dict)
+
+    def set_grad_accum_buffer(self, buffer: torch.Tensor | None) -> None:
+        """dW 直接累積 buffer (= weight.grad そのもの) を設定する。None で解除."""
+        if buffer is not None:
+            if self.weight.grad is None or self.weight.grad.data_ptr() != buffer.data_ptr():
+                raise ValueError("grad accum buffer は weight.grad と同一 storage でなければならない")
+            if tuple(buffer.shape) != tuple(self.weight.shape) or not buffer.is_contiguous():
+                raise ValueError("grad accum buffer は weight と同形状の contiguous tensor")
+        self._grad_accum = buffer
 
     # --------------------------------------------------------- training cache
     def _after_load_state_dict(self, module: nn.Module, incompatible_keys: Any) -> None:
@@ -2357,6 +2408,7 @@ class BitLinear(nn.Module):
                 row_scale,
                 _ternary_backend,
                 (self.out_features,),
+                self._grad_accum,
                 self.weight,
             )
         if self.training and self._fp8_mode == "int8":
@@ -2416,9 +2468,31 @@ class BitLinearGroup(nn.Module):
         self.register_buffer("_train_w_packed_t", None, persistent=False)
         self._train_cache_enabled = False
         self._fp8_mode = "off"  # set_bitlinear_fp8_mode で設定
+        # member 全員の weight.grad を out_splits 順に連結した persistent buffer
+        # (各 member.weight.grad はこの行 slice の view)。学習ループが設定する。
+        self.register_buffer("_grad_accum", None, persistent=False)
 
     def members(self) -> tuple[BitLinear, ...]:
         return self._members
+
+    def set_grad_accum_buffer(self, buffer: torch.Tensor | None) -> None:
+        """dW 直接累積 buffer を設定する。None で従来の AccumulateGrad 経路に戻る."""
+        if buffer is not None:
+            expected = (self.out_features, self.in_features)
+            if tuple(buffer.shape) != expected or not buffer.is_contiguous():
+                raise ValueError(
+                    f"grad accum buffer must be contiguous {expected}, got {tuple(buffer.shape)}"
+                )
+            offset = 0
+            for member, rows in zip(self.members(), self.out_splits):
+                view = buffer[offset:offset + rows]
+                if member.weight.grad is None or member.weight.grad.data_ptr() != view.data_ptr():
+                    raise ValueError(
+                        f"member {member.out_features}x{member.in_features} の weight.grad が "
+                        "buffer の対応 slice を指していません"
+                    )
+                offset += rows
+        self._grad_accum = buffer
 
     @property
     def matrix_count(self) -> int:
@@ -2606,6 +2680,7 @@ class BitLinearGroup(nn.Module):
                 row_scale,
                 _ternary_backend,
                 self.out_splits,
+                self._grad_accum,
                 *weights,
             )
         if self.training and self._fp8_mode == "int8":
