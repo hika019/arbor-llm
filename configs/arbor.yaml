@@ -158,18 +158,23 @@ optim:
   lr: 8.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  weight_decay: 0.1             # stage1 の weight decay (two_stage では stage2 で切替)
+  weight_decay: 0.1             # stable 区間の weight decay (decay 区間は weight_decay_decay_phase)
   grad_clip: 1.0
-  # BitNet 公式レシピ (2B4T) の 2 段構成: 前半 高LR+WD / 後半 低LR cooldown+WD=0。
-  #   A/B: 旧挙動へ戻すなら scheduler: cosine_warmup にする (下記 stage2_* は無視される)。
-  scheduler: two_stage          # choices: cosine_warmup | two_stage
-  stage2_start_ratio: 0.5       # two_stage: この比率で stage1->stage2 (cooldown) へ
-  stage2_peak_lr_ratio: 0.5     # two_stage: stage2 開始時の lr (ピーク比)。ここから min へ
-  weight_decay_stage2: 0.0      # two_stage: stage2 の weight decay (公式は 0)
+  # WSD (warmup → stable → decay)。stable 区間は lr が定数なので total_steps を後から
+  # 増やしても過去の lr 履歴と矛盾しない (延長可能)。stable 区間の checkpoint から短い
+  # decay を枝分かれさせて途中経過を評価することもできる (効率化メモ §3 anneal ×N)。
+  # decay 区間は BitNet 公式 2 段レシピの後半 (低 lr + WD 0) に相当。
+  # 旧 two_stage (前半 cosine 1.0→0.5、後半 cooldown) は延長不能なので廃止。2026-09-15 に
+  # step 2.6k で WSD へ切替 (その時点の two_stage の lr はピークの 0.9999 で履歴は事実上同一)。
+  scheduler: wsd                # choices: cosine_warmup | wsd
+  decay_start_ratio: 0.8        # wsd: 消費 bytes の 80% まで stable、そこから decay
+  decay_end_ratio: 1.0          # wsd: 100% で min_lr 到達
+  decay_shape: inv_sqrt         # wsd: choices: inv_sqrt (1-√, Hägele+ 2024) | linear | cosine
+  weight_decay_decay_phase: 0.0 # wsd: decay 区間の weight decay (BitNet 公式は 0)
   min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
-  decay_end_ratio: 0.8         # 総 step の 80% で下限到達、残りは下限で一定
   warmup_steps: 1000
-  total_steps: 230000           # grad_accum_steps の schedule 込みで 105GB (= 旧 200k step × 524k bytes)
+  total_steps: 230000           # grad_accum_steps の schedule 込みで 105GB (= 旧 200k step × 524k bytes)。
+                                # 延長するなら decay 開始 (step ~194k) より前に増やす
 
 # ---- スループット ----
 speed:

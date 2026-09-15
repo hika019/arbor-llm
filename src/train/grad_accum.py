@@ -90,7 +90,7 @@ class GradAccumSchedule:
         """step → 消費 bytes の割合 [0, 1] を返す関数。
 
         accum が変わる run では step 割合と bytes 割合がずれる (序盤ほど bytes/step が
-        小さい)。lr の cosine / decay_end / stage2 の進行を bytes 割合で測ることで、
+        小さい)。lr の cosine / decay_start / decay_end の進行を bytes 割合で測ることで、
         固定 accum の run と「同じ bytes で同じ lr」になる (batch size warmup の
         A/B が lr schedule の違いに汚染されないため)。
         """

@@ -576,7 +576,7 @@ class Muon(torch.optim.Optimizer):
 
     param_groups は 2 つ: group[0] が Muon (`use_muon=True`)、group[1] が AdamW。
     LambdaLR は各 group の initial_lr に同じ倍率を掛けるので、scheduler /
-    rebase_scheduler_lr / TwoStageCooldownLR の weight decay 切替はそのまま効く。
+    rebase_scheduler_lr / WeightDecaySwitchLR の weight decay 切替はそのまま効く。
     Muon の momentum は fp32 (AdamW の半分の state)。AdamW 側は fp32 state の eager 経路
     (対象が embedding / head / norm 程度で小さいため融合は不要)。
     parameter への書き戻しは両 group とも `_apply_update` (param_rounding 対応)。
@@ -796,18 +796,13 @@ def build_optimizer(
     )
 
 
-class TwoStageCooldownLR(torch.optim.lr_scheduler.LambdaLR):
-    """LR を cosine 2 段に、weight decay を 2 段に切り替える scheduler.
+class WeightDecaySwitchLR(torch.optim.lr_scheduler.LambdaLR):
+    """LambdaLR + 指定 step 以降で weight decay を切り替える scheduler.
 
-    BitNet b1.58 公式レシピ (2B4T) の 2 段構成に寄せたもの:
-      - Stage 1 [warmup, stage2_start]: cosine で 1.0 -> stage2_peak_lr_ratio。
-        前半は比較的高い LR を保つ (WD は stage1 値)。
-      - Stage 2 [stage2_start, decay_end]: cosine で stage2_peak_lr_ratio ->
-        min_lr_ratio まで cooldown。WD は stage2 値 (公式は 0)。
-      - [decay_end, total]: min_lr_ratio で一定。
-    LambdaLR を継承するので base_lrs / lr_lambdas / state_dict / get_last_lr /
-    rebase_scheduler_lr との互換をそのまま保つ。WD は last_epoch (= step) から
-    毎 step 再計算して optimizer.param_groups へ書き戻す (state を増やさない)。
+    WSD の decay 区間で WD を 0 にする (BitNet b1.58 公式レシピの後半 WD=0 に対応) ために
+    使う。LambdaLR を継承するので base_lrs / lr_lambdas / state_dict / get_last_lr /
+    rebase_scheduler_lr との互換をそのまま保つ。WD は last_epoch (= step) から毎 step
+    再計算して optimizer.param_groups へ書き戻す (state を増やさない)。
     """
 
     def __init__(
@@ -815,22 +810,18 @@ class TwoStageCooldownLR(torch.optim.lr_scheduler.LambdaLR):
         optimizer: torch.optim.Optimizer,
         lr_lambda,
         *,
-        wd_stage1: float,
-        wd_stage2: float,
-        stage2_start_step: int,
+        wd_before: float,
+        wd_after: float,
+        switch_step: int,
     ) -> None:
-        self._wd_stage1 = float(wd_stage1)
-        self._wd_stage2 = float(wd_stage2)
-        self._stage2_start_step = int(stage2_start_step)
+        self._wd_before = float(wd_before)
+        self._wd_after = float(wd_after)
+        self._switch_step = int(switch_step)
         super().__init__(optimizer, lr_lambda)
         self._apply_weight_decay()
 
     def _current_weight_decay(self) -> float:
-        return (
-            self._wd_stage2
-            if self.last_epoch >= self._stage2_start_step
-            else self._wd_stage1
-        )
+        return self._wd_after if self.last_epoch >= self._switch_step else self._wd_before
 
     def _apply_weight_decay(self) -> None:
         wd = self._current_weight_decay()
@@ -840,6 +831,9 @@ class TwoStageCooldownLR(torch.optim.lr_scheduler.LambdaLR):
     def step(self, epoch=None):  # type: ignore[override]
         super().step(epoch)
         self._apply_weight_decay()
+
+
+_WSD_DECAY_SHAPES = ("inv_sqrt", "linear", "cosine")
 
 
 def _scheduler_common(cfg: dict) -> tuple[int, int, float, float]:
@@ -867,7 +861,7 @@ def build_scheduler(
 ):
     """lr_scale(step) は lr_lambda に乗算する係数 (batch size warmup の √(accum/final))。
     progress(step) は学習の進行 [0,1] (消費 bytes 割合。省略時は step/total)。cosine /
-    decay_end_ratio / stage2_start_ratio はこの進行で測るので、accum が変わる run でも
+    decay_start_ratio / decay_end_ratio はこの進行で測るので、accum が変わる run でも
     固定 accum と「同じ bytes で同じ lr」になる。warmup は step。LambdaLR の base_lrs /
     state_dict / rebase_scheduler_lr との互換はそのまま。"""
     name = cfg.get("scheduler", "cosine_warmup")
@@ -897,40 +891,53 @@ def build_scheduler(
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_lambda(step) * lr_scale(step))
 
-    if name == "two_stage":
-        # BitNet 公式 2 段レシピ。stage2_start_ratio で stage を切り替え、stage1 は
-        # cosine で stage2_peak_lr_ratio まで、stage2 はそこから min_lr_ratio まで
-        # cooldown する。weight decay も stage1/stage2 で切り替える (公式は stage2=0)。
-        stage2_start_ratio = float(cfg.get("stage2_start_ratio", 0.5))
-        if not 0.0 < stage2_start_ratio < 1.0:
-            raise ValueError(f"stage2_start_ratio は (0, 1) で指定: {stage2_start_ratio}")
-        if decay_end_ratio <= stage2_start_ratio:
+    if name == "wsd":
+        # Warmup-Stable-Decay (MiniCPM / Hägele+ 2024 "Scaling Laws and Compute-Optimal
+        # Training Beyond Fixed Training Durations")。warmup 後は decay_start_ratio まで
+        # ピーク lr で一定 (stable)、そこから decay_end_ratio まで min_lr_ratio へ decay、
+        # 以後は下限で一定。stable 区間は lr が定数なので total_steps を増やしても過去の
+        # lr 履歴と矛盾せず、run を後から延長できる (cosine では不可)。
+        # stable 区間の任意 checkpoint から短い decay を枝分かれさせて「今止めたらどれ
+        # くらいか」を測ることもできる (効率化メモ §3 の anneal ×N)。
+        # weight decay は stable 区間 weight_decay、decay 区間 weight_decay_decay_phase
+        # (BitNet 公式の後半 WD=0 に対応)。
+        decay_start_ratio = float(cfg.get("decay_start_ratio", 0.8))
+        if not 0.0 < decay_start_ratio < decay_end_ratio:
             raise ValueError(
-                "decay_end_ratio は stage2_start_ratio より大きくすること "
-                f"(decay_end_ratio={decay_end_ratio}, stage2_start_ratio={stage2_start_ratio})"
+                "decay_start_ratio は (0, decay_end_ratio) で指定: "
+                f"decay_start_ratio={decay_start_ratio}, decay_end_ratio={decay_end_ratio}"
             )
-        stage2_peak = float(cfg.get("stage2_peak_lr_ratio", 0.5))
-        if not min_ratio < stage2_peak <= 1.0:
+        decay_shape = str(cfg.get("decay_shape", "inv_sqrt")).lower()
+        if decay_shape not in _WSD_DECAY_SHAPES:
             raise ValueError(
-                f"stage2_peak_lr_ratio は (min_lr_ratio, 1] で指定: {stage2_peak}"
+                f"decay_shape は {' | '.join(_WSD_DECAY_SHAPES)} から選ぶ: {decay_shape!r}"
             )
-        wd_stage1 = float(cfg.get("weight_decay", 0.0))
-        wd_stage2 = float(cfg.get("weight_decay_stage2", 0.0))
-        if wd_stage2 < 0:
-            raise ValueError(f"weight_decay_stage2 は非負で指定: {wd_stage2}")
-        s2 = step_at(stage2_start_ratio, warmup)
-        decay_end = step_at(decay_end_ratio, s2)
+        wd_stable = float(cfg.get("weight_decay", 0.0))
+        wd_decay = float(cfg.get("weight_decay_decay_phase", 0.0))
+        if wd_decay < 0:
+            raise ValueError(f"weight_decay_decay_phase は非負で指定: {wd_decay}")
+        ds = step_at(decay_start_ratio, warmup)
+        decay_end = step_at(decay_end_ratio, ds)
+
+        def decay(p: float) -> float:
+            if decay_shape == "inv_sqrt":
+                # 1-sqrt: 序盤に速く落として終盤を長く低 lr で回す。Hägele+ 2024 が
+                # cosine / linear より僅かに良いと報告した形。
+                return min_ratio + (1.0 - min_ratio) * (1.0 - math.sqrt(p))
+            if decay_shape == "linear":
+                return min_ratio + (1.0 - min_ratio) * (1.0 - p)
+            return cosine(p, 1.0, min_ratio)
 
         def lr_lambda(step: int) -> float:
             if step < warmup:
                 return step / max(1, warmup)
-            if step < s2:
-                return cosine(segment(step, warmup, s2), 1.0, stage2_peak)
-            return cosine(segment(step, s2, decay_end), stage2_peak, min_ratio)
+            if step < ds:
+                return 1.0
+            return decay(segment(step, ds, decay_end))
 
-        return TwoStageCooldownLR(
+        return WeightDecaySwitchLR(
             optimizer, lambda step: lr_lambda(step) * lr_scale(step),
-            wd_stage1=wd_stage1, wd_stage2=wd_stage2, stage2_start_step=s2,
+            wd_before=wd_stable, wd_after=wd_decay, switch_step=ds,
         )
 
     raise ValueError(f"unknown scheduler: {name}")

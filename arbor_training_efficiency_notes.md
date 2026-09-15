@@ -14,7 +14,7 @@ nanoGPT スピードランから、arbor (4090 ×1、1B BitNet b1.58、byte 直�
 ## 1. batch size warmup (A) — 実装済み、ByteLM A/B で効きを確認し本走に採用 (2026-09-14)
 
 `speed.grad_accum_steps` に [[step, accum], ...] (`src/train/grad_accum.py`)。詳細は configs/arbor.yaml のコメント参照。
-lr schedule (cosine / decay_end / stage2) の進行は消費 bytes 割合で測る (accum が変わっても
+lr schedule (cosine / decay_start / decay_end) の進行は消費 bytes 割合で測る (accum が変わっても
 固定 accum と同じ bytes で同じ lr。最初の A/B はこれが step 割合だったため無効になった)。
 
 - **A/B 結果** (BitNet ByteLM 19M、本走 mix、8k、lr 8e-4、同 983M bytes):
