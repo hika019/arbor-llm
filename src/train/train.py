@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -2668,4 +2669,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        rc = main()
+    except BaseException:  # noqa: BLE001 - 終了コードを揃えて os._exit へ
+        traceback.print_exc()
+        rc = 1
+    # 通常の interpreter 終了を使わない。HF streaming (datasets + pyarrow) の途中放棄した
+    # stream を終了時に破棄すると、pyarrow の I/O スレッドが読みかけの parquet range を
+    # fd 閉鎖後に読んで EBADF → datasets の read_with_retries (20 回 × (5s + HF backoff
+    # 23s)) を使い切るまで pyarrow の thread pool 破棄が戻らず、プロセスが ~13 分終了しない
+    # (2026-09-16、patch8 A/B で再現。checkpoint/metrics は全て同期書き込み済みなので
+    # 即時終了して問題ない)。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
