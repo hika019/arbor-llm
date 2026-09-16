@@ -255,7 +255,7 @@ validation:
 
 checkpoint:
   dir: ./checkpoints/arbor2_1b_8k_lowbit
-  save_every_steps: 1000
+  save_every_steps: 3000
   keep_last_k: 3
   keep_every_n_steps: 10000
   async_save: true              # 書き込みをbackground threadへ (中断/final時は同期)
