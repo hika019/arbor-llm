@@ -16,7 +16,8 @@ __pycache__/
 .ruff_cache/
 
 # checkpoints / data (src/data/ は除外しない: パターンを /data/ に限定)
-/checkpoints/
+/checkpoints
+/checkpoints_drvfs_bak/
 /export/
 /wandb/
 /data/
