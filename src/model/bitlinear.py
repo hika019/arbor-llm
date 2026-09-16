@@ -376,7 +376,10 @@ if triton is not None:
         ).to(tl.float32)
         x = x * col_scale
         amax = tl.max(tl.abs(x), axis=0)
-        inv_scale = tl.maximum(amax / 127.0, 1.0e-5 / 127.0)
+        # 勾配は絶対値が小さい (mean 損失 / accum で 1e-8 以下も普通) ので、活性用の
+        # 絶対下限 1e-5 を使うと行ごと 0 に量子化されて dX が消える。0 割り回避の
+        # 極小値だけ入れる (_DY_SCALE_FLOOR と同値。Triton は module global を参照できないので直書き)。
+        inv_scale = tl.maximum(amax / 127.0, 1.0e-30)  # = _DY_SCALE_FLOOR
         scaled = x / inv_scale
         nearest = tl.floor(scaled + 0.5)
         is_tie = (nearest - scaled) == 0.5
@@ -1059,7 +1062,10 @@ def _quantize_dy_dual(
     # fp32 演算なので旧 Triton 版 (_dy_row_amax_kernel) と bit 一致する。
     x32 = x2.float()
     row_amax = x32.abs().amax(dim=1)
-    inv_scale = ((x32 * scale).abs().amax(dim=1) / 127.0).clamp_min(1.0e-5 / 127.0)
+    # 下限は 0 割り回避のみ。活性用の 1e-5 を使うと小さい勾配 (mean 損失 / grad_accum で
+    # |dY·col_scale| < 1e-5 の行) が丸ごと 0 になり dX が消える (2026-09-16 に本走が
+    # decoder 層へ勾配を流せず bpb 3.7 で停滞した原因)。
+    inv_scale = ((x32 * scale).abs().amax(dim=1) / 127.0).clamp_min(_DY_SCALE_FLOOR)
     # max は結合順序に依らないので、分離実装の t.abs().amax() と同じ値になる。
     fp8_scale = (row_amax.amax() / _FP8_MAX).clamp_min(1e-12)
     q = torch.empty_like(x2, dtype=torch.int8)
@@ -1221,6 +1227,9 @@ class _CachedBitLinearGroupSTE(torch.autograd.Function):
 # ---------------------------------------------------------------- FP8 GEMM
 _FP8_E4M3 = torch.float8_e4m3fn
 _FP8_MAX = 448.0  # e4m3fn の最大有限値
+# dY の per-token INT8 量子化 scale の下限 (0 割り回避のみ、勾配の絶対スケールに依存しない)
+_DY_SCALE_FLOOR = 1.0e-30
+
 _FP8_MODES = ("off", "bwd", "full", "int8", "ternary")
 _INT8_BACKENDS = ("auto", "int_mm", "triton")
 _TERNARY_BACKENDS = ("dot", "dot_current", "kmajor_current", "kmajor_single_dot")

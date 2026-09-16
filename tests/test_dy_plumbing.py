@@ -101,3 +101,27 @@ def test_ste_backward_is_bitwise_identical_with_fused_dy_plumbing():
         set_bitlinear_ternary_backend("dot_current")
         set_bitlinear_ternary_wgrad_backend("int8")
     assert bitlinear._fused_dy_plumbing is True
+
+
+@pytest.mark.parametrize("magnitude", [1e-6, 1e-8, 1e-10])
+def test_small_gradients_are_not_quantized_to_zero(magnitude):
+    """dY の per-token INT8 scale に活性用の絶対下限 (1e-5) を使うと、mean 損失 / grad_accum で
+    小さくなった勾配が行ごと 0 に潰れ dX が消える (2026-09-16 の本走停滞の原因)。
+    下限は 0 割り回避の極小値だけにし、勾配の絶対スケールに依存しないこと。"""
+    torch.manual_seed(0)
+    dy = (torch.randn(64, 256, device="cuda") * magnitude).to(torch.bfloat16)
+    col_scale = torch.full((256,), 0.02, device="cuda")  # 三値重みの absmean scale 程度
+    for q, inv in (_quantize_a8_rows_scaled(dy, col_scale), _quantize_dy_dual(dy, col_scale)[:2]):
+        assert int((q != 0).sum()) > q.numel() // 2, "小さい勾配が 0 に量子化された"
+        # 行の最大要素は ±127 に写る (scale が下限に張り付いていない)
+        assert int(q.abs().amax(dim=1).min()) == 127
+        # dequantize の誤差は量子化 1 段 (inv) の半分以内
+        err = (q.float() * inv.unsqueeze(1) - dy.float() * col_scale).abs()
+        assert bool((err <= 0.5 * inv.unsqueeze(1) * 1.001).all())
+
+
+def test_all_zero_dy_row_is_finite():
+    dy = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
+    col_scale = torch.ones(64, device="cuda")
+    q, inv, t, sg = _quantize_dy_dual(dy, col_scale)
+    assert torch.isfinite(inv).all() and int(q.abs().sum()) == 0
