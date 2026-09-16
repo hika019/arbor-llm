@@ -29,42 +29,44 @@ model:
 
 # 本走 (arbor.yaml) の混合の上位集合: ByteLM はトークナイザ相当で
 # 本体学習開始後は差し替え不可なので、文体カバレッジは広めに取る。
-# 日本語は最低 60% を維持し、その中に日本語チャット/崩れ文も入れる。
+# 日本語は最低 55% を維持し、その中に日本語チャット/崩れ文も入れる。
 # 残りで英語・多言語 UTF-8・会話/typo/絵文字・
-# code/markdown/math を混ぜる。HF の text 列に残っている改行・タブ・空白・
-# 絵文字・顔文字は UTF-8 bytes としてそのまま学習され、row 末尾にも LF を足す。
+# code/markdown/math/TeX/mermaid を混ぜる。HF の text 列に残っている改行・タブ・空白・
+# 絵文字・顔文字は UTF-8 bytes としてそのまま学習される。
+# packing は本走と同じ document (doc EOS doc EOS ...)。concat だと EOS を一度も
+# 見ないまま本体の document packed 入力に使われ、EOS 直後の entropy が未学習になる。
 # 混合を変えたら resume せず新規学習すること (dataloader 状態が合わなくなる)。
 data:
   sources:
-    # ---- 日本語 0.60 ----
+    # ---- 日本語 0.55 ----
     - path: "HuggingFaceFW/fineweb-2"   # 現代 web
       name: "jpn_Jpan"
-      weight: 0.31
+      weight: 0.28
     - path: "range3/cc100-ja"           # web 口語 (ブログ調)
-      weight: 0.06
+      weight: 0.055
     - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
-      weight: 0.06
+      weight: 0.055
     - path: "wikimedia/wikipedia"       # 百科事典文体
       name: "20231101.ja"
       weight: 0.04
-    - path: "y2lan/japan-law"           # 法令 (条文体。8.75k 件と小さいが all_exhausted で循環)
+    - path: "y2lan/japan-law"           # 法令 (条文体。8.75k 件と小さいが循環)
       text_column: "body"
-      weight: 0.04
+      weight: 0.035
     - path: "shidowake/chatbot-arena-ja_dedup_subset-5k"  # 日本語チャット/崩れた入力
-      weight: 0.05
+      weight: 0.045
     - path: "sirgecko/dataset_japanesechatbot2"  # 日本語チャット文
-      weight: 0.04
+      weight: 0.02
     - path: "sirgecko/dataset_japanesechatbot_sentence"  # 日本語短文チャット
-      weight: 0.03
-    # ---- 英語 0.12 ----
+      weight: 0.02
+    # ---- 英語 0.10 ----
     - path: "HuggingFaceFW/fineweb-edu" # edu (高品質土台)
-      weight: 0.07
+      weight: 0.06
     - path: "manu/project_gutenberg"    # 古典書籍
       split: "en"
-      weight: 0.03
+      weight: 0.025
     - path: "vblagoje/cc_news"          # news
-      weight: 0.02
-    # ---- 多言語 UTF-8 web 0.12 ----
+      weight: 0.015
+    # ---- 多言語 UTF-8 web 0.10 ----
     - path: "HuggingFaceFW/fineweb-2"   # 韓国語
       name: "kor_Hang"
       weight: 0.015
@@ -73,31 +75,59 @@ data:
       weight: 0.015
     - path: "HuggingFaceFW/fineweb-2"   # フランス語
       name: "fra_Latn"
-      weight: 0.012
+      weight: 0.014
     - path: "HuggingFaceFW/fineweb-2"   # スペイン語
       name: "spa_Latn"
-      weight: 0.012
+      weight: 0.014
     - path: "HuggingFaceFW/fineweb-2"   # 中国語
       name: "cmn_Hani"
-      weight: 0.012
+      weight: 0.014
     - path: "HuggingFaceFW/fineweb-2"   # ロシア語
       name: "rus_Cyrl"
-      weight: 0.012
+      weight: 0.014
     - path: "HuggingFaceFW/fineweb-2"   # アラビア語
       name: "arb_Arab"
-      weight: 0.012
+      weight: 0.014
 
-    # ---- 会話 / typo / 絵文字 0.06 ----
+    # ---- 会話 / typo / 絵文字 / markdown 応答 0.06 ----
     - path: "OpenAssistant/oasst1"      # 多言語チャット。崩れた文・顔文字・絵文字も含む
-      weight: 0.06
-    # ---- code / markdown / math 0.10 ----
-    # 旧 loubnabnl/github-code-more-filtering は datasets 4.x 非対応 (スクリプト型) のため統合。
+      weight: 0.05
+    - path: "nvidia/HelpSteer2"         # 英語 LLM 応答 (見出し・箇条書き・コードフェンス等の markdown)
+      text_column: "response"
+      weight: 0.01
+    # ---- code / markdown / math / TeX / mermaid 0.19 ----
+    # 本走 (arbor.yaml) には生ソースコード・.tex 文書・mermaid が無いが、ByteLM は
+    # 境界判定器 = トークナイザ相当なので本走に入れない記法も一通り見せておく
+    # (2026-09-16 追加。全て HF API で gated=False を確認済み)。
     - path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書
-      weight: 0.07
-    - path: "HuggingFaceTB/finemath"    # 数学
-      name: "finemath-4plus"
+      weight: 0.04
+    - path: "OpenCoder-LLM/opc-annealing-corpus"     # 多言語コード + ```lang フェンス付き解説
+      name: "algorithmic_corpus"
       weight: 0.03
+    - path: "OpenCoder-LLM/opc-annealing-corpus"     # 生ソースコード断片 (合成、多言語)
+      name: "synthetic_code_snippet"
+      weight: 0.02
+    - path: "codeparrot/codeparrot-clean"            # GitHub Python 生ファイル (json.gz)
+      text_column: "content"
+      weight: 0.03
+    - path: "HuggingFaceTB/finemath"    # 数学 web (inline LaTeX)
+      name: "finemath-4plus"
+      weight: 0.02
+    - path: "open-web-math/open-web-math"            # 数学 web (inline LaTeX、$...$ 多め)
+      weight: 0.02
+    - path: "json"                                   # arXiv LaTeX 本文 (\section, \begin{figure} ...)
+      # EleutherAI/proof-pile-2 は script 型で datasets 4.x が直接読めないため生ファイル指定。
+      # .jsonl.zst の展開に zstandard が必要 (requirements.txt)。
+      data_files: "hf://datasets/EleutherAI/proof-pile-2/arxiv/train/*.jsonl.zst"
+      weight: 0.02
+    - path: "injaeryou/mermaid_samples_13k"          # ```mermaid フェンス付き図 (2.6MB と小さいので上限付き)
+      split: "wrapped"
+      weight: 0.01
+      max_epochs: 3
   streaming: true
+  packing: document
+  eos_token_id: 2
+  pad_token_id: 3
   shuffle_buffer: 2000
   context_length: 8192      # 本走の context に合わせる (max_bytes は buffer 上限)
   num_workers: 0

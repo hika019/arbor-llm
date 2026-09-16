@@ -30,6 +30,45 @@ class _ResumeState:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+
+# pyarrow の parquet デコードスレッド数。datasets streaming は 1 プロセス内で全 source を
+# 同時に開くので、既定 (CPU 数 = 20) だと source ごとにスレッド分の作業バッファが居座る。
+# 2 で 5000 rows/5s 出るので学習 (数十 rows/s) には十分。
+_ARROW_THREADS = 2
+
+
+def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dict):
+    """HF dataset を streaming で開く (load_dataset(streaming=True) 相当 + 省メモリ設定).
+
+    `data_files` を指定すると path は "json" / "parquet" 等の builder 名として扱い、
+    Hub 上の生ファイルを直接 stream する (例: script 型で datasets 4.x が読めない
+    repo の `hf://datasets/<repo>/<dir>/*.jsonl.zst`)。.zst は zstandard が必要。
+
+    parquet source は pyarrow の pre_buffer (row group 先読み cache、解放されず
+    source あたり +400MB 居座る) を切る: 1 source +415MB → +136MB (fineweb-2 実測)。
+    28 source 混合の entropy_lm で dataloader だけで host RAM 19GB を食い、本走と
+    同居して WSL ごと OOM した (2026-09-16)。
+    """
+    import pyarrow as pa
+    from datasets import load_dataset_builder
+    from datasets.packaged_modules.parquet.parquet import ParquetConfig
+
+    if pa.cpu_count() > _ARROW_THREADS:
+        pa.set_cpu_count(_ARROW_THREADS)
+        pa.set_io_thread_count(_ARROW_THREADS)
+    kwargs: dict = {}
+    if spec.get("revision"):
+        kwargs["revision"] = spec["revision"]
+    if spec.get("data_files"):
+        kwargs["data_files"] = spec["data_files"]
+    builder = load_dataset_builder(path, name=name, **kwargs)
+    if isinstance(builder.config, ParquetConfig):
+        import pyarrow.dataset as pds
+
+        builder.config.fragment_scan_options = pds.ParquetFragmentScanOptions(pre_buffer=False)
+    return builder.as_streaming_dataset(split=split)
+
+
 class ByteStreamDataset(IterableDataset):
     """バイト列を context_length に区切って (input_ids, labels) を yield する.
 
@@ -61,7 +100,7 @@ class ByteStreamDataset(IterableDataset):
         ソース指定は 2 通り:
         - `source`: 単一データセット (str). `file:` prefix でローカル mmap.
         - `sources`: 複数データセットを重み付き混合 (list[dict]). 各要素は
-          `{path, name?, weight?, text_column?, split?}`. weight は確率に正規化し
+          `{path, name?, weight?, text_column?, split?, data_files?}`. weight は確率に正規化し
           datasets.interleave_datasets で行レベルに混ぜる (例: 日本語 60% + 英語 40%).
           ローカル file: は混合対象外 (HF streaming のみ).
         """
@@ -203,7 +242,7 @@ class ByteStreamDataset(IterableDataset):
         }
 
     def _iter_hf_sft(self) -> Iterator[dict[str, torch.Tensor]]:
-        from datasets import load_dataset
+        import datasets  # noqa: F401 - 未インストール検出 (ImportError) 用
 
         specs = self.sources or [{
             "path": self.source, "name": self.name, "revision": self.revision,
@@ -212,10 +251,7 @@ class ByteStreamDataset(IterableDataset):
         }]
         streams = []
         for s in specs:
-            kwargs = {"split": s.get("split", self.split), "streaming": True}
-            if s.get("revision"):
-                kwargs["revision"] = s["revision"]
-            ds = load_dataset(s["path"], name=s.get("name"), **kwargs)
+            ds = _load_hf_streaming(s["path"], s.get("name"), s.get("split", self.split), s)
             if self.shuffle_buffer > 0:
                 ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
             streams.append(ds)
@@ -254,13 +290,11 @@ class ByteStreamDataset(IterableDataset):
         正規化し interleave_datasets で混ぜる. seed 固定なので skip ベースの
         resume でも同じ順序を再現できる.
         """
-        from datasets import load_dataset
+        import datasets  # noqa: F401 - 未インストール検出 (ImportError) 用
 
-        def _one(path, name, col, split, revision=None, skip_samples=0):
-            kwargs = {"split": split, "streaming": True}
-            if revision:
-                kwargs["revision"] = revision
-            ds = load_dataset(path, name=name, **kwargs)
+        def _one(path, name, col, split, revision=None, skip_samples=0, data_files=None):
+            spec = {"revision": revision, "data_files": data_files}
+            ds = _load_hf_streaming(path, name, split, spec)
             if col != "text":
                 ds = ds.rename_column(col, "text")
             ds = ds.select_columns(["text"])  # スキーマ衝突回避 (混合時)
@@ -287,6 +321,7 @@ class ByteStreamDataset(IterableDataset):
                 s.get("split", self.split),
                 s.get("revision"),
                 s.get("skip_samples", self.skip_samples),
+                s.get("data_files"),
             ))
             weights.append(float(s.get("weight_bytes", s.get("weight", 1.0))))
         total = sum(weights) or 1.0
@@ -304,7 +339,7 @@ class ByteStreamDataset(IterableDataset):
 
     def _build_hf_source_streams(self):
         """Return per-source HF streams normalized to a ``text`` column."""
-        from datasets import load_dataset
+        import datasets  # noqa: F401 - 未インストール検出 (ImportError) 用
 
         specs = self.sources or [{
             "path": self.source,
@@ -316,13 +351,7 @@ class ByteStreamDataset(IterableDataset):
         }]
         streams = []
         for idx, s in enumerate(specs):
-            kwargs = {
-                "split": s.get("split", self.split),
-                "streaming": True,
-            }
-            if s.get("revision"):
-                kwargs["revision"] = s["revision"]
-            ds = load_dataset(s["path"], name=s.get("name"), **kwargs)
+            ds = _load_hf_streaming(s["path"], s.get("name"), s.get("split", self.split), s)
             col = s.get("text_column", self.text_column)
             if col != "text":
                 ds = ds.rename_column(col, "text")
