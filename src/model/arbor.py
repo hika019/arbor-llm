@@ -141,6 +141,12 @@ class ArborConfig:
     num_kv_heads: int = 4
     intermediate_size: int = 4608
     num_hidden_layers: int = 16
+    # ---- global 層の mixer (docs/global_seq_recurrent_experiment.md) ----
+    # 層ごとに attention (A) か 系列方向の線形再帰 SSD (S) かを文字列パターンで指定し、層数分
+    # 巡回する。None (既定) は全層 attention で従来と同一。例: "S" 全層再帰、"AS" 交互 (Jamba 型)。
+    global_layer_pattern: str | None = None
+    ssd_conv_width: int = 4          # SSD 入力側の patch 方向 depthwise 因果 conv 幅
+    ssd_chunk: int = 64              # SSD 並列 scan の chunk 長
     # ---- 共通 ----
     rope_theta: float = 500000.0
     # RoPE theta を階層別に上書きする (None なら rope_theta を使う)。
@@ -357,18 +363,142 @@ class FeedForward(nn.Module):
         return self.down(self.ffn_sub_norm(a * a * up))
 
 
+class SSDMixer(nn.Module):
+    """系列方向の線形再帰 (Mamba-2 SSD / GLA と同型)。global 層で attention の代わりに使う.
+
+    head ごとに dh×dh の状態 S を持ち、patch が 1 つ来るごとに
+        S_t = a_t · S_{t-1} + k_tᵀ v_t,   out_t = q_t · S_t
+    で更新する (a_t ∈ (0,1) は入力依存の忘却ゲート、head ごとのスカラー)。文書境界 (seg が変わる位置)
+    で a_t = 0 にして状態をリセットする。学習時は chunk 単位の並列 scan (行列積だけ) で計算し、
+    state の受け渡しだけ chunk 数 (512/64 = 8) の逐次ループ。
+    入力側に patch 方向の depthwise 因果 conv (幅 conv_width、文書境界マスク) と SiLU、
+    出力側に sub-norm と出力ゲートを付ける (線形 RNN の定番構成)。
+    q/k/v/gate/out 射影は BitLinear (k, v は n_kv_heads で共有 = GQA と同じ節約)。
+    """
+
+    def __init__(
+        self, dim: int, n_heads: int, n_kv_heads: int, bitnet: bool, norm_eps: float,
+        activation_precision: str = "int8", conv_width: int = 4, chunk: int = 64,
+    ):
+        super().__init__()
+        if dim % n_heads != 0 or n_heads % n_kv_heads != 0:
+            raise ValueError(f"invalid head config: {dim=} {n_heads=} {n_kv_heads=}")
+        self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
+        self.head_dim = dim // n_heads
+        self.conv_width, self.chunk = conv_width, chunk
+        kv_width = n_kv_heads * self.head_dim
+        self.wq = _make_linear(dim, dim, bitnet, activation_precision)
+        self.wk = _make_linear(dim, kv_width, bitnet, activation_precision)
+        self.wv = _make_linear(dim, kv_width, bitnet, activation_precision)
+        self.wg = _make_linear(dim, dim, bitnet, activation_precision)   # 出力ゲート
+        self.wo = _make_linear(dim, dim, bitnet, activation_precision)
+        # 忘却ゲート logit (FP)。bias を head ごとに 1..5 に散らし、記憶長 ~4..150 patch で初期化
+        self.wa = nn.Linear(dim, n_heads, bias=True)
+        nn.init.trunc_normal_(self.wa.weight, std=0.02, a=-0.06, b=0.06)
+        with torch.no_grad():
+            self.wa.bias.copy_(torch.linspace(1.0, 5.0, n_heads))
+        # depthwise 因果 conv: tap 0 (現在) を 1、過去 tap を小さく初期化
+        self.conv_weight = nn.Parameter(torch.empty(conv_width, dim))
+        nn.init.trunc_normal_(self.conv_weight, std=0.02, a=-0.06, b=0.06)
+        with torch.no_grad():
+            self.conv_weight[0].fill_(1.0)
+        self.sub_norm = RMSNorm(dim, norm_eps)
+
+    def _causal_conv(self, x: torch.Tensor, seg: torch.Tensor | None) -> torch.Tensor:
+        # x (B,K,d)。過去 tap j は seg[t-j] == seg[t] のときだけ使う (文書を跨がない)
+        y = x * self.conv_weight[0].to(x.dtype)
+        for j in range(1, self.conv_width):
+            xs = F.pad(x[:, :-j], (0, 0, j, 0))
+            if seg is not None:
+                same = F.pad(seg[:, :-j] == seg[:, j:], (j, 0), value=False)
+                xs = xs * same.unsqueeze(-1).to(x.dtype)
+            y = y + xs * self.conv_weight[j].to(x.dtype)
+        return y
+
+    def forward(self, x: torch.Tensor, seg: torch.Tensor | None = None) -> torch.Tensor:
+        b, k, d = x.shape
+        h, hkv, dh, c = self.n_heads, self.n_kv_heads, self.head_dim, self.chunk
+        xc = F.silu(self._causal_conv(x, seg))
+        q = self.wq(xc).view(b, k, h, dh)
+        kk = self.wk(xc).view(b, k, hkv, dh)
+        v = self.wv(xc).view(b, k, hkv, dh)
+        if hkv != h:
+            kk = kk.repeat_interleave(h // hkv, dim=2)
+            v = v.repeat_interleave(h // hkv, dim=2)
+        # 忘却ゲートの logit は計算 dtype で、scan 自体は fp32 (減衰の累積積は精度に敏感)
+        gate_logit = F.linear(x, self.wa.weight.to(x.dtype), self.wa.bias.to(x.dtype))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            q = q.float() * dh ** -0.5
+            kk, v = kk.float(), v.float()
+            log_a = F.logsigmoid(gate_logit.float())                       # (B,K,H) ≤ 0
+            if seg is not None:
+                reset = F.pad(seg[:, 1:] != seg[:, :-1], (1, 0), value=True)  # 文書先頭で状態を切る
+                log_a = torch.where(reset.unsqueeze(-1), torch.full_like(log_a, -1e4), log_a)
+            y = self._chunked_scan(q, kk, v, log_a)                           # (B,K,H,dh)
+        y = y.to(x.dtype).reshape(b, k, d)
+        return self.wo(self.sub_norm(y) * F.silu(self.wg(x)))
+
+    def _chunked_scan(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor,
+    ) -> torch.Tensor:
+        b, kk, h, dh = q.shape
+        c = self.chunk
+        pad = (c - kk % c) % c
+        if pad:
+            q, k, v = (F.pad(t, (0, 0, 0, 0, 0, pad)) for t in (q, k, v))
+            log_a = F.pad(log_a, (0, 0, 0, pad))
+        n = q.size(1) // c
+        q, k, v = (t.view(b, n, c, h, dh) for t in (q, k, v))
+        cum = log_a.view(b, n, c, h).cumsum(dim=2)                             # chunk 内累積
+        # chunk 内: L[j,i] = exp(cum[j] - cum[i]) (i ≤ j)、Y = (Q Kᵀ ⊙ L) V
+        diff = cum.unsqueeze(3) - cum.unsqueeze(2)                              # (B,N,Cj,Ci,H)
+        causal = torch.ones(c, c, dtype=torch.bool, device=q.device).tril().view(1, 1, c, c, 1)
+        L = torch.where(causal, diff, torch.full_like(diff, -1e4)).exp()
+        scores = torch.einsum("bnjhd,bnihd->bnjih", q, k) * L
+        y = torch.einsum("bnjih,bnihd->bnjhd", scores, v)
+        # chunk 末尾の状態: S_n(local) = Σ_i exp(cum[C-1] - cum[i]) k_iᵀ v_i
+        decay_to_end = (cum[:, :, -1:, :] - cum).exp()                         # (B,N,C,H)
+        s_local = torch.einsum("bnchd,bnche,bnch->bnhde", k, v, decay_to_end)   # (B,N,H,dh,dh)
+        chunk_decay = cum[:, :, -1, :].exp()                                    # (B,N,H)
+        # chunk 間: S_n = decay_n · S_{n-1} + S_n(local)、前 chunk 状態からの寄与 y += exp(cum) q S_{n-1}
+        state = torch.zeros(b, h, dh, dh, dtype=q.dtype, device=q.device)
+        in_decay = cum.exp()                                                    # (B,N,C,H)
+        outs = []
+        for i in range(n):
+            outs.append(torch.einsum("bchd,bhde,bch->bche", q[:, i], state, in_decay[:, i]))
+            state = chunk_decay[:, i].view(b, h, 1, 1) * state + s_local[:, i]
+        y = y + torch.stack(outs, dim=1)
+        y = y.reshape(b, n * c, h, dh)
+        return y[:, :kk] if pad else y
+
+
 class Block(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, ffn_hidden: int,
         rope: RotaryEmbedding, bitnet: bool, norm_eps: float, causal: bool,
-        activation_precision: str = "int8",
+        activation_precision: str = "int8", mixer: str = "attention",
+        ssd_conv_width: int = 4, ssd_chunk: int = 64,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(dim, norm_eps)
-        self.attn = Attention(dim, n_heads, n_kv_heads, rope, bitnet, norm_eps, causal,
-                              activation_precision)
+        if mixer == "attention":
+            self.attn = Attention(dim, n_heads, n_kv_heads, rope, bitnet, norm_eps, causal,
+                                  activation_precision)
+            self.mixer = None
+        elif mixer == "ssd":
+            if not causal:
+                raise ValueError("SSDMixer は causal 専用")
+            self.attn = None
+            self.mixer = SSDMixer(dim, n_heads, n_kv_heads, bitnet, norm_eps, activation_precision,
+                                  conv_width=ssd_conv_width, chunk=ssd_chunk)
+        else:
+            raise ValueError(f"unknown mixer: {mixer!r} (choices: attention | ssd)")
         self.ffn_norm = RMSNorm(dim, norm_eps)
         self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps, activation_precision)
+
+    @property
+    def out_proj_owner(self) -> nn.Module:
+        return self.attn if self.attn is not None else self.mixer
 
     def forward(
         self,
@@ -376,8 +506,14 @@ class Block(nn.Module):
         attn_mask: "torch.Tensor | WindowMask | None" = None,
         kv_cache: "_LayerKVCache | None" = None,
         pos_offset: int = 0,
+        seg: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), attn_mask, kv_cache, pos_offset)
+        if self.attn is not None:
+            x = x + self.attn(self.attn_norm(x), attn_mask, kv_cache, pos_offset)
+        else:
+            if kv_cache is not None:
+                raise NotImplementedError("SSDMixer は KV cache (逐次生成) 未対応")
+            x = x + self.mixer(self.attn_norm(x), seg)
         return x + self.ffn(self.ffn_norm(x))
 
 
@@ -388,7 +524,7 @@ def _scale_residual_projections(layer_lists: list[nn.ModuleList]) -> None:
     with torch.no_grad():
         for layers in layer_lists:
             for block in layers:
-                block.attn.wo.weight.mul_(scale)
+                block.out_proj_owner.wo.weight.mul_(scale)
                 block.ffn.down.weight.mul_(scale)
 
 
@@ -650,12 +786,18 @@ class ArborModel(nn.Module):
         self.global_bos = nn.Parameter(torch.empty(dg))
         nn.init.trunc_normal_(self.global_bos, std=0.02, a=-0.06, b=0.06)
 
+        pattern = (cfg.global_layer_pattern or "A").upper()
+        if any(ch not in "AS" for ch in pattern):
+            raise ValueError(f"global_layer_pattern は A/S の文字列 (got {cfg.global_layer_pattern!r})")
         self.global_layers = nn.ModuleList(
             Block(dg, cfg.num_heads, cfg.num_kv_heads, cfg.intermediate_size,
                   global_rope, cfg.bitnet, cfg.norm_eps, causal=True,
-                  activation_precision=cfg.activation_precision)
-            for _ in range(cfg.num_hidden_layers)
+                  activation_precision=cfg.activation_precision,
+                  mixer="ssd" if pattern[i % len(pattern)] == "S" else "attention",
+                  ssd_conv_width=cfg.ssd_conv_width, ssd_chunk=cfg.ssd_chunk)
+            for i in range(cfg.num_hidden_layers)
         )
+        self.has_ssd = any(block.mixer is not None for block in self.global_layers)
         self.global_norm = RMSNorm(dg, cfg.norm_eps)
         self.global_to_local = nn.Linear(dg, dl, bias=False)  # FP
         nn.init.trunc_normal_(self.global_to_local.weight, std=0.02, a=-0.06, b=0.06)
@@ -1027,18 +1169,19 @@ class ArborModel(nn.Module):
             new_doc = F.pad(patch_doc[:, 1:] != patch_doc[:, :-1], (1, 0), value=True)
             g = torch.where(new_doc.unsqueeze(-1), bos, g)
         for layer in self.global_layers:
-            g = self._maybe_ckpt(layer, g, attn_mask)
+            g = self._maybe_ckpt(layer, g, attn_mask, seg=patch_doc)
         return self.global_to_local(self.global_norm(g))
 
     def _maybe_ckpt(
         self, layer: nn.Module, x: torch.Tensor,
         attn_mask: "torch.Tensor | WindowMask | None" = None,
+        seg: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.cfg.gradient_checkpointing and self.training and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint
 
-            return checkpoint(layer, x, attn_mask, use_reentrant=False)
-        return layer(x, attn_mask)
+            return checkpoint(layer, x, attn_mask, None, 0, seg, use_reentrant=False)
+        return layer(x, attn_mask, seg=seg)
 
     # ------------------------------------------------------------ utility
     def num_parameters(self) -> dict[str, int]:
@@ -1077,6 +1220,10 @@ class ArborByteGenerator:
     def __init__(self, model: ArborModel):
         if not isinstance(model, ArborModel):
             raise TypeError("ArborByteGenerator は ArborModel 専用")
+        if getattr(model, "has_ssd", False):
+            raise NotImplementedError(
+                "ArborByteGenerator は global_layer_pattern の SSD 層 (逐次 state 生成) 未対応 (実験用 A/B のみ)"
+            )
         self.m = model.eval()
         self.cfg = model.cfg
         p = next(model.parameters())
@@ -1241,6 +1388,8 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
         f"entropy_lm={counts['entropy_model'] / 1e6:.1f}M) "
         f"patching={cfg.patching_mode} bitnet={'ON' if cfg.bitnet else 'OFF'} "
         f"bitlinear_layers={n_bit} "
+        + (f"global_pattern={cfg.global_layer_pattern} " if cfg.global_layer_pattern else "")
+        + 
         "weights=W1.58(absmean ternary) "
         f"activations={_activation_desc(cfg.activation_precision)} "
         "subln=ON backward=STE(detach)"
