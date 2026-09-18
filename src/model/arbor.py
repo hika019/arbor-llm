@@ -148,6 +148,9 @@ class ArborConfig:
     ssd_conv_width: int = 4          # SSD 入力側の patch 方向 depthwise 因果 conv 幅
     ssd_chunk: int = 64              # SSD 並列 scan の chunk 長
     ssd_output_gate: bool = True     # SSD 出力ゲート (+1·d² / 層)。False で attention 層とパラメータ同等
+    # scan の実装。fla = flash-linear-attention の Triton kernel (chunk_simple_gla、CUDA 専用、
+    # torch 実装の ~11 倍速)。torch = 純 PyTorch の chunk scan (fp32、参照実装)。auto = CUDA なら fla。
+    ssd_backend: str = "auto"        # choices: auto | fla | torch
     # ---- 共通 ----
     rope_theta: float = 500000.0
     # RoPE theta を階層別に上書きする (None なら rope_theta を使う)。
@@ -364,6 +367,73 @@ class FeedForward(nn.Module):
         return self.down(self.ffn_sub_norm(a * a * up))
 
 
+# flash-linear-attention の chunk_simple_gla (head ごとスカラー減衰の chunk scan、Triton) を
+# torch.library.custom_op で包む。fla の autograd.Function をそのまま呼ぶと dynamo が層ごとに graph
+# break して周囲の融合が壊れ、torch 実装より遅くなる (実測 69 vs 58 ms)。custom_op なら不透明な
+# 1 op として compile に乗る。
+_FLA_SCAN_OP_READY = False
+
+
+def _ensure_fla_scan_op() -> None:
+    global _FLA_SCAN_OP_READY
+    if _FLA_SCAN_OP_READY:
+        return
+    try:
+        from fla.ops.simple_gla.chunk import (
+            RCP_LN2, chunk_local_cumsum, chunk_simple_gla_bwd, chunk_simple_gla_fwd,
+        )
+    except ImportError as exc:  # 暗黙フォールバックはしない (速度が桁で違うので黙って落ちると困る)
+        raise RuntimeError(
+            "ssd_backend=fla/auto(CUDA) には flash-linear-attention が必要: "
+            "pip install flash-linear-attention (無ければ ssd_backend: torch を明示)"
+        ) from exc
+
+    @torch.library.custom_op("arbor::ssd_scan", mutates_args=())
+    def ssd_scan(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor) -> torch.Tensor:
+        g = chunk_local_cumsum(log_a, chunk_size=64, scale=RCP_LN2)
+        o, _ = chunk_simple_gla_fwd(q=q, k=k, v=v, g=g, scale=1.0, chunk_size=64)
+        return o.to(q.dtype)
+
+    @ssd_scan.register_fake
+    def _(q, k, v, log_a):
+        return torch.empty_like(q)
+
+    # backward も不透明な custom_op にする (register_autograd の関数は AOTAutograd にトレースされ、
+    # Triton kernel の中に入って FakeTensor エラーになる)
+    @torch.library.custom_op("arbor::ssd_scan_bwd", mutates_args=())
+    def ssd_scan_bwd(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor, do: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        g = chunk_local_cumsum(log_a, chunk_size=64, scale=RCP_LN2)
+        dq, dk, dv, dg, _ = chunk_simple_gla_bwd(
+            q=q, k=k, v=v, g=g, g_gamma=None, initial_state=None, do=do.contiguous(), dht=None,
+            scale=1.0, chunk_size=64,
+        )
+        dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True).to(log_a.dtype)
+        return [dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dg]
+
+    @ssd_scan_bwd.register_fake
+    def _(q, k, v, log_a, do):
+        return [torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), torch.empty_like(log_a)]
+
+    def _backward(ctx, do):
+        q, k, v, log_a = ctx.saved_tensors
+        dq, dk, dv, dg = torch.ops.arbor.ssd_scan_bwd(q, k, v, log_a, do)
+        return dq, dk, dv, dg
+
+    def _setup(ctx, inputs, output):
+        q, k, v, log_a = inputs
+        ctx.save_for_backward(q, k, v, log_a)
+
+    ssd_scan.register_autograd(_backward, setup_context=_setup)
+    _FLA_SCAN_OP_READY = True
+
+
+def _fla_chunk_simple_gla(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor) -> torch.Tensor:
+    _ensure_fla_scan_op()
+    return torch.ops.arbor.ssd_scan(q.contiguous(), k.contiguous(), v.contiguous(), log_a.contiguous())
+
+
 class SSDMixer(nn.Module):
     """系列方向の線形再帰 (Mamba-2 SSD / GLA と同型)。global 層で attention の代わりに使う.
 
@@ -380,9 +450,12 @@ class SSDMixer(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, bitnet: bool, norm_eps: float,
         activation_precision: str = "int8", conv_width: int = 4, chunk: int = 64,
-        output_gate: bool = True,
+        output_gate: bool = True, backend: str = "auto",
     ):
         super().__init__()
+        if backend not in ("auto", "fla", "torch"):
+            raise ValueError(f"unknown ssd_backend: {backend!r} (choices: auto | fla | torch)")
+        self.backend = backend
         if dim % n_heads != 0 or n_heads % n_kv_heads != 0:
             raise ValueError(f"invalid head config: {dim=} {n_heads=} {n_kv_heads=}")
         self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
@@ -421,22 +494,30 @@ class SSDMixer(nn.Module):
         b, k, d = x.shape
         h, hkv, dh, c = self.n_heads, self.n_kv_heads, self.head_dim, self.chunk
         xc = F.silu(self._causal_conv(x, seg))
-        q = self.wq(xc).view(b, k, h, dh)
-        kk = self.wk(xc).view(b, k, hkv, dh)
-        v = self.wv(xc).view(b, k, hkv, dh)
+        qkv_group = getattr(self, "_fast_qkv_group", None)   # Attention と同じ融合 QKV 経路 (低ビット学習)
+        if self.training and qkv_group is not None and qkv_group.training_weight_cache_enabled:
+            kv_width = hkv * dh
+            q, kk, v = qkv_group(xc).split((h * dh, kv_width, kv_width), dim=-1)
+            q, kk, v = q.view(b, k, h, dh), kk.view(b, k, hkv, dh), v.view(b, k, hkv, dh)
+        else:
+            q = self.wq(xc).view(b, k, h, dh)
+            kk = self.wk(xc).view(b, k, hkv, dh)
+            v = self.wv(xc).view(b, k, hkv, dh)
         if hkv != h:
             kk = kk.repeat_interleave(h // hkv, dim=2)
             v = v.repeat_interleave(h // hkv, dim=2)
-        # 忘却ゲートの logit は計算 dtype で、scan 自体は fp32 (減衰の累積積は精度に敏感)
+        # 忘却ゲートの logit は計算 dtype で、減衰の累積 (log_a) は fp32 (累積積は精度に敏感)
         gate_logit = F.linear(x, self.wa.weight.to(x.dtype), self.wa.bias.to(x.dtype))
         with torch.autocast(device_type=x.device.type, enabled=False):
-            q = q.float() * dh ** -0.5
-            kk, v = kk.float(), v.float()
             log_a = F.logsigmoid(gate_logit.float())                       # (B,K,H) ≤ 0
             if seg is not None:
                 reset = F.pad(seg[:, 1:] != seg[:, :-1], (1, 0), value=True)  # 文書先頭で状態を切る
                 log_a = torch.where(reset.unsqueeze(-1), torch.full_like(log_a, -1e4), log_a)
-            y = self._chunked_scan(q, kk, v, log_a)                           # (B,K,H,dh)
+            use_fla = self.backend == "fla" or (self.backend == "auto" and x.is_cuda)
+            if use_fla:
+                y = _fla_chunk_simple_gla(q * dh ** -0.5, kk, v, log_a)         # bf16 入出力、内部 fp32 累積
+            else:
+                y = self._chunked_scan(q.float() * dh ** -0.5, kk.float(), v.float(), log_a)
         y = self.sub_norm(y.to(x.dtype).reshape(b, k, d))
         if self.wg is not None:
             y = y * F.silu(self.wg(x))
@@ -482,6 +563,7 @@ class Block(nn.Module):
         rope: RotaryEmbedding, bitnet: bool, norm_eps: float, causal: bool,
         activation_precision: str = "int8", mixer: str = "attention",
         ssd_conv_width: int = 4, ssd_chunk: int = 64, ssd_output_gate: bool = True,
+        ssd_backend: str = "auto",
     ):
         super().__init__()
         self.attn_norm = RMSNorm(dim, norm_eps)
@@ -494,7 +576,8 @@ class Block(nn.Module):
                 raise ValueError("SSDMixer は causal 専用")
             self.attn = None
             self.mixer = SSDMixer(dim, n_heads, n_kv_heads, bitnet, norm_eps, activation_precision,
-                                  conv_width=ssd_conv_width, chunk=ssd_chunk, output_gate=ssd_output_gate)
+                                  conv_width=ssd_conv_width, chunk=ssd_chunk, output_gate=ssd_output_gate,
+                                  backend=ssd_backend)
         else:
             raise ValueError(f"unknown mixer: {mixer!r} (choices: attention | ssd)")
         self.ffn_norm = RMSNorm(dim, norm_eps)
@@ -799,7 +882,7 @@ class ArborModel(nn.Module):
                   activation_precision=cfg.activation_precision,
                   mixer="ssd" if pattern[i % len(pattern)] == "S" else "attention",
                   ssd_conv_width=cfg.ssd_conv_width, ssd_chunk=cfg.ssd_chunk,
-                  ssd_output_gate=cfg.ssd_output_gate)
+                  ssd_output_gate=cfg.ssd_output_gate, ssd_backend=cfg.ssd_backend)
             for i in range(cfg.num_hidden_layers)
         )
         self.has_ssd = any(block.mixer is not None for block in self.global_layers)
