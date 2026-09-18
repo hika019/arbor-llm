@@ -147,6 +147,7 @@ class ArborConfig:
     global_layer_pattern: str | None = None
     ssd_conv_width: int = 4          # SSD 入力側の patch 方向 depthwise 因果 conv 幅
     ssd_chunk: int = 64              # SSD 並列 scan の chunk 長
+    ssd_output_gate: bool = True     # SSD 出力ゲート (+1·d² / 層)。False で attention 層とパラメータ同等
     # ---- 共通 ----
     rope_theta: float = 500000.0
     # RoPE theta を階層別に上書きする (None なら rope_theta を使う)。
@@ -379,6 +380,7 @@ class SSDMixer(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, bitnet: bool, norm_eps: float,
         activation_precision: str = "int8", conv_width: int = 4, chunk: int = 64,
+        output_gate: bool = True,
     ):
         super().__init__()
         if dim % n_heads != 0 or n_heads % n_kv_heads != 0:
@@ -390,7 +392,7 @@ class SSDMixer(nn.Module):
         self.wq = _make_linear(dim, dim, bitnet, activation_precision)
         self.wk = _make_linear(dim, kv_width, bitnet, activation_precision)
         self.wv = _make_linear(dim, kv_width, bitnet, activation_precision)
-        self.wg = _make_linear(dim, dim, bitnet, activation_precision)   # 出力ゲート
+        self.wg = _make_linear(dim, dim, bitnet, activation_precision) if output_gate else None  # 出力ゲート
         self.wo = _make_linear(dim, dim, bitnet, activation_precision)
         # 忘却ゲート logit (FP)。bias を head ごとに 1..5 に散らし、記憶長 ~4..150 patch で初期化
         self.wa = nn.Linear(dim, n_heads, bias=True)
@@ -435,8 +437,10 @@ class SSDMixer(nn.Module):
                 reset = F.pad(seg[:, 1:] != seg[:, :-1], (1, 0), value=True)  # 文書先頭で状態を切る
                 log_a = torch.where(reset.unsqueeze(-1), torch.full_like(log_a, -1e4), log_a)
             y = self._chunked_scan(q, kk, v, log_a)                           # (B,K,H,dh)
-        y = y.to(x.dtype).reshape(b, k, d)
-        return self.wo(self.sub_norm(y) * F.silu(self.wg(x)))
+        y = self.sub_norm(y.to(x.dtype).reshape(b, k, d))
+        if self.wg is not None:
+            y = y * F.silu(self.wg(x))
+        return self.wo(y)
 
     def _chunked_scan(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor,
@@ -477,7 +481,7 @@ class Block(nn.Module):
         self, dim: int, n_heads: int, n_kv_heads: int, ffn_hidden: int,
         rope: RotaryEmbedding, bitnet: bool, norm_eps: float, causal: bool,
         activation_precision: str = "int8", mixer: str = "attention",
-        ssd_conv_width: int = 4, ssd_chunk: int = 64,
+        ssd_conv_width: int = 4, ssd_chunk: int = 64, ssd_output_gate: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(dim, norm_eps)
@@ -490,7 +494,7 @@ class Block(nn.Module):
                 raise ValueError("SSDMixer は causal 専用")
             self.attn = None
             self.mixer = SSDMixer(dim, n_heads, n_kv_heads, bitnet, norm_eps, activation_precision,
-                                  conv_width=ssd_conv_width, chunk=ssd_chunk)
+                                  conv_width=ssd_conv_width, chunk=ssd_chunk, output_gate=ssd_output_gate)
         else:
             raise ValueError(f"unknown mixer: {mixer!r} (choices: attention | ssd)")
         self.ffn_norm = RMSNorm(dim, norm_eps)
@@ -794,7 +798,8 @@ class ArborModel(nn.Module):
                   global_rope, cfg.bitnet, cfg.norm_eps, causal=True,
                   activation_precision=cfg.activation_precision,
                   mixer="ssd" if pattern[i % len(pattern)] == "S" else "attention",
-                  ssd_conv_width=cfg.ssd_conv_width, ssd_chunk=cfg.ssd_chunk)
+                  ssd_conv_width=cfg.ssd_conv_width, ssd_chunk=cfg.ssd_chunk,
+                  ssd_output_gate=cfg.ssd_output_gate)
             for i in range(cfg.num_hidden_layers)
         )
         self.has_ssd = any(block.mixer is not None for block in self.global_layers)
