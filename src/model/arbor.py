@@ -370,23 +370,16 @@ class FeedForward(nn.Module):
 # flash-linear-attention の chunk_simple_gla (head ごとスカラー減衰の chunk scan、Triton) を
 # torch.library.custom_op で包む。fla の autograd.Function をそのまま呼ぶと dynamo が層ごとに graph
 # break して周囲の融合が壊れ、torch 実装より遅くなる (実測 69 vs 58 ms)。custom_op なら不透明な
-# 1 op として compile に乗る。
-_FLA_SCAN_OP_READY = False
-
-
-def _ensure_fla_scan_op() -> None:
-    global _FLA_SCAN_OP_READY
-    if _FLA_SCAN_OP_READY:
-        return
+# 1 op として compile に乗る。登録は import 時に済ませる: forward 内で遅延登録すると custom_op の
+# infer_schema が dynamo の skip 対象で graph break し、1B では CUDA graph が 1,600 個/step に割れて
+# forward が 2 倍遅くなった (2026-09-19 プロファイル)。
+def _register_fla_scan_op() -> bool:
     try:
         from fla.ops.simple_gla.chunk import (
             RCP_LN2, chunk_local_cumsum, chunk_simple_gla_bwd, chunk_simple_gla_fwd,
         )
-    except ImportError as exc:  # 暗黙フォールバックはしない (速度が桁で違うので黙って落ちると困る)
-        raise RuntimeError(
-            "ssd_backend=fla/auto(CUDA) には flash-linear-attention が必要: "
-            "pip install flash-linear-attention (無ければ ssd_backend: torch を明示)"
-        ) from exc
+    except ImportError:
+        return False
 
     @torch.library.custom_op("arbor::ssd_scan", mutates_args=())
     def ssd_scan(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor) -> torch.Tensor:
@@ -426,11 +419,18 @@ def _ensure_fla_scan_op() -> None:
         ctx.save_for_backward(q, k, v, log_a)
 
     ssd_scan.register_autograd(_backward, setup_context=_setup)
-    _FLA_SCAN_OP_READY = True
+    return True
+
+
+_FLA_SCAN_OP_AVAILABLE = _register_fla_scan_op()
 
 
 def _fla_chunk_simple_gla(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor) -> torch.Tensor:
-    _ensure_fla_scan_op()
+    if not _FLA_SCAN_OP_AVAILABLE:  # 暗黙フォールバックはしない (速度が桁で違うので黙って落ちると困る)
+        raise RuntimeError(
+            "ssd_backend=fla/auto(CUDA) には flash-linear-attention が必要: "
+            "pip install flash-linear-attention (無ければ ssd_backend: torch を明示)"
+        )
     return torch.ops.arbor.ssd_scan(q.contiguous(), k.contiguous(), v.contiguous(), log_a.contiguous())
 
 
