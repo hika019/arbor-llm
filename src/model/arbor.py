@@ -482,7 +482,7 @@ class SSDMixer(nn.Module):
     def _causal_conv(self, x: torch.Tensor, seg: torch.Tensor | None) -> torch.Tensor:
         # x (B,K,d)。過去 tap j は seg[t-j] == seg[t] のときだけ使う (文書を跨がない)
         y = x * self.conv_weight[0].to(x.dtype)
-        for j in range(1, self.conv_width):
+        for j in range(1, min(self.conv_width, x.size(1))):   # 系列が tap 数より短い (生成の序盤) なら無い tap は飛ばす
             xs = F.pad(x[:, :-j], (0, 0, j, 0))
             if seg is not None:
                 same = F.pad(seg[:, :-j] == seg[:, j:], (j, 0), value=False)
