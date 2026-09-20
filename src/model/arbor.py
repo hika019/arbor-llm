@@ -145,6 +145,9 @@ class ArborConfig:
     # 層ごとに attention (A) か 系列方向の線形再帰 SSD (S) かを文字列パターンで指定し、層数分
     # 巡回する。None (既定) は全層 attention で従来と同一。例: "S" 全層再帰、"AS" 交互 (Jamba 型)。
     global_layer_pattern: str | None = None
+    # 数値で書く版: N 層に 1 回 attention、残りは SSD (= "S"*(N-1) + "A" のパターン)。
+    # 例: 4 → SSSA (attention 1/4)、8 → SSSSSSSA (1/8)。global_layer_pattern と同時指定は不可。
+    global_attention_every: int | None = None
     ssd_conv_width: int = 4          # SSD 入力側の patch 方向 depthwise 因果 conv 幅
     ssd_chunk: int = 64              # SSD 並列 scan の chunk 長
     ssd_output_gate: bool = True     # SSD 出力ゲート (+1·d² / 層)。False で attention 層とパラメータ同等
@@ -873,7 +876,14 @@ class ArborModel(nn.Module):
         self.global_bos = nn.Parameter(torch.empty(dg))
         nn.init.trunc_normal_(self.global_bos, std=0.02, a=-0.06, b=0.06)
 
-        pattern = (cfg.global_layer_pattern or "A").upper()
+        if cfg.global_attention_every is not None:
+            if cfg.global_layer_pattern is not None:
+                raise ValueError("global_attention_every と global_layer_pattern は同時に指定できない")
+            if cfg.global_attention_every < 1:
+                raise ValueError(f"global_attention_every must be >= 1, got {cfg.global_attention_every}")
+            pattern = "S" * (cfg.global_attention_every - 1) + "A"
+        else:
+            pattern = (cfg.global_layer_pattern or "A").upper()
         if any(ch not in "AS" for ch in pattern):
             raise ValueError(f"global_layer_pattern は A/S の文字列 (got {cfg.global_layer_pattern!r})")
         self.global_layers = nn.ModuleList(
@@ -1476,7 +1486,10 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
         f"entropy_lm={counts['entropy_model'] / 1e6:.1f}M) "
         f"patching={cfg.patching_mode} bitnet={'ON' if cfg.bitnet else 'OFF'} "
         f"bitlinear_layers={n_bit} "
-        + (f"global_pattern={cfg.global_layer_pattern} " if cfg.global_layer_pattern else "")
+        + (
+            f"global_layers={''.join('S' if b.mixer is not None else 'A' for b in model.global_layers)} "
+            if getattr(model, "has_ssd", False) else ""
+        )
         + 
         "weights=W1.58(absmean ternary) "
         f"activations={_activation_desc(cfg.activation_precision)} "
