@@ -2068,6 +2068,8 @@ def main() -> int:
     if sync_each_step:
         print("[train] sync_each_step=ON")
 
+    first_step_in_process = True
+    first_step_t0 = time.perf_counter()
     data_iter = make_data_iter()
     while global_step < total_steps:
         try:
@@ -2113,9 +2115,15 @@ def main() -> int:
             for micro in range(grad_accum):
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_next_batch", device)
+                if first_step_in_process and micro == 0:
+                    print("[train] 最初の batch 待ち (データ準備)...", flush=True)
                 t0 = time.perf_counter()
                 batch = next(data_iter)
                 interval_cpu_ms["batch_wait"] += (time.perf_counter() - t0) * 1000.0
+                if first_step_in_process and micro == 0:
+                    print(f"[train] 最初の batch ready ({time.perf_counter() - t0:.1f}s)。"
+                          "初回 step 実行中 (torch.compile / CUDA graph 捕獲)...", flush=True)
+                    first_step_t0 = time.perf_counter()
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_batch_ready", device)
                 t0 = time.perf_counter()
@@ -2268,6 +2276,11 @@ def main() -> int:
 
             global_step += 1
             interval_steps += 1
+            if first_step_in_process:
+                first_step_in_process = False
+                print(f"[train] 初回 step 完了 ({time.perf_counter() - first_step_t0:.1f}s)。"
+                      f"次のログは step={min((global_step // log_every + 1) * log_every, total_steps)}",
+                      flush=True)
             if device.type == "cuda" and sync_each_step:
                 torch.cuda.synchronize()
             meter.step(bytes_this_step)
