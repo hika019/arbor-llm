@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import mmap
+import itertools
 import random
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -134,6 +136,10 @@ class ByteStreamDataset(IterableDataset):
         if int(patch_align) < 1:
             raise ValueError(f"patch_align must be >= 1, got {patch_align}")
         self.patch_align = int(patch_align)
+        # True なら各 source の準備 (shard 取得 + shuffle buffer 充填) の開始/完了を print
+        self.verbose = False
+        # 複数 source の open と初回充填 (shuffle buffer) を並列化する
+        self.parallel_source_init = True
         self._state = _ResumeState()
 
     # --- state_dict: 学習ループから保存/復元される -----------------------
@@ -349,9 +355,12 @@ class ByteStreamDataset(IterableDataset):
             "split": self.split,
             "weight_bytes": 1.0,
         }]
-        streams = []
-        for idx, s in enumerate(specs):
+        def build_one(idx: int, s: dict[str, Any]):
+            t0 = time.perf_counter()
             ds = _load_hf_streaming(s["path"], s.get("name"), s.get("split", self.split), s)
+            if self.verbose:
+                print(f"[data] source {s.get('id') or s.get('path')}: opened ({time.perf_counter() - t0:.1f}s)",
+                      flush=True)
             col = s.get("text_column", self.text_column)
             if col != "text":
                 ds = ds.rename_column(col, "text")
@@ -371,7 +380,21 @@ class ByteStreamDataset(IterableDataset):
                 # Divide the configured buffer across sources to avoid multiplying memory use.
                 per_source_buffer = max(1, self.shuffle_buffer // max(len(specs), 1))
                 ds = ds.shuffle(buffer_size=per_source_buffer, seed=self.seed + idx)
-            streams.append(ds)
+            return ds
+
+        # source を開く処理 (Hub のファイル一覧解決。大きい repo は 30s 超) は
+        # source ごとに独立なので並列に行う。
+        t_all = time.perf_counter()
+        if self.verbose:
+            print(f"[data] {len(specs)} source を開いています (Hub のファイル一覧解決、並列)...", flush=True)
+        if self.parallel_source_init and len(specs) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(specs), thread_name_prefix="source-open") as ex:
+                streams = list(ex.map(build_one, range(len(specs)), specs))
+        else:
+            streams = [build_one(idx, s) for idx, s in enumerate(specs)]
+        if self.verbose:
+            print(f"[data] 全 source open 完了 ({time.perf_counter() - t_all:.1f}s)", flush=True)
         return streams, [dict(s) for s in specs]
 
     def _iter_hf_stream(self) -> Iterator[dict[str, torch.Tensor]]:
@@ -482,6 +505,9 @@ class ByteStreamDataset(IterableDataset):
                 return rng.choices(live, weights=[probs[i] for i in live], k=1)[0]
             return min(live, key=lambda i: emitted_source_bytes[i] / max(probs[i], 1e-12))
 
+        if self.parallel_source_init and source_count > 1:
+            self._prefill_sources(source_iters, source_names)
+
         while True:
             idx = choose_source()
             if idx is None:
@@ -508,6 +534,41 @@ class ByteStreamDataset(IterableDataset):
             self._state.extra["document_stream_states"] = document_stream_states
             self._state.extra["document_pack_states"] = document_pack_states
             yield sample
+
+    def _prefill_sources(self, source_iters: list[Iterator], source_names: list[str]) -> None:
+        """全 source の初回 next() (shard 取得 + shuffle buffer 充填) を並列に走らせる.
+
+        source は初めて選ばれた時に充填が走るため、逐次だと source 数ぶんの待ちが
+        直列に積み上がる。先頭 1 行を先取りして iterator の前に戻すだけなので、
+        消費順も stream.state_dict() の位置 (先取り行を消費した後にしか保存されない)
+        も逐次時と変わらない。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        n = len(source_iters)
+        t_all = time.perf_counter()
+        if self.verbose:
+            print(f"[data] {n} source の準備開始 (shard 取得 + shuffle buffer 充填、並列)...", flush=True)
+
+        def first_row(i: int):
+            t0 = time.perf_counter()
+            try:
+                row = next(source_iters[i])
+            except StopIteration:
+                row = None
+            if self.verbose:
+                print(f"[data] source {source_names[i]}: ready ({time.perf_counter() - t0:.1f}s)", flush=True)
+            return row
+
+        with ThreadPoolExecutor(max_workers=n, thread_name_prefix="source-prefill") as ex:
+            rows = list(ex.map(first_row, range(n)))
+        for i, row in enumerate(rows):
+            if row is None:
+                source_iters[i] = iter(())  # 空 source は next_doc_bytes の epoch 処理に任せる
+            else:
+                source_iters[i] = itertools.chain([row], source_iters[i])
+        if self.verbose:
+            print(f"[data] 全 source 準備完了 ({time.perf_counter() - t_all:.1f}s)", flush=True)
 
     def _source_document_samples(
         self,
@@ -730,6 +791,7 @@ def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
         sft_add_eos=cfg.get("sft_add_eos", True),
         patch_align=cfg.get("patch_align", 1),
     )
+    ds.verbose = split == "train"
     num_workers = cfg.get("num_workers", 4)
     if num_workers > 1 and not cfg.get("allow_multi_worker_iterable", False):
         raise ValueError(
