@@ -8,6 +8,9 @@ WAIT_STEPS=25
 ACTIVE_STEPS=2
 GRAPH_TRACE="node"
 CONFIG="configs/arbor.yaml"
+# 本走は Python 3.13 / torch 2.14 (scripts/env313.sh)。venv 側 (torch 2.11) で
+# 測ると inductor の融合結果が変わり本走と比較できないので、既定を py313 にする。
+ARBOR_ENV="${ARBOR_ENV:-py313}"
 OUTPUT="/tmp/arbor-nsys-$(date +%Y%m%d-%H%M%S)"
 NSYS_BIN="${NSYS_BIN:-}"
 TRAIN_ARGS=()
@@ -23,9 +26,11 @@ Options:
   --output PATH    Report path without .nsys-rep
   --nsys PATH      Nsight Systems CLI (also accepted via NSYS_BIN)
   --graph-trace M  CUDA graph granularity: node (default) or graph
+  --env NAME       Python environment: py313 (default, torch 2.14 = 本走) or venv (torch 2.11)
+                   Also settable via ARBOR_ENV.
   -h, --help       Show this help
 
-The script sources scripts/env.sh and profiles only the requested steady-state
+The script sources the selected environment (--env) and profiles only the steady-state
 optimizer steps. On WSL it works around CUPTI timestamp conversion issues and,
 when necessary, uses the newest Windows Nsight target-linux-x64 installation.
 EOF
@@ -55,6 +60,10 @@ while (($#)); do
             ;;
         --graph-trace)
             GRAPH_TRACE="$2"
+            shift 2
+            ;;
+        --env)
+            ARBOR_ENV="$2"
             shift 2
             ;;
         -h|--help)
@@ -87,8 +96,22 @@ if [[ "$GRAPH_TRACE" != "node" && "$GRAPH_TRACE" != "graph" ]]; then
     exit 2
 fi
 
-# shellcheck source=scripts/env.sh
-source "$ROOT_DIR/scripts/env.sh"
+case "$ARBOR_ENV" in
+    py313)
+        # shellcheck source=scripts/env313.sh
+        source "$ROOT_DIR/scripts/env313.sh"
+        ;;
+    venv)
+        # shellcheck source=scripts/env.sh
+        source "$ROOT_DIR/scripts/env.sh"
+        ;;
+    *)
+        echo "--env must be py313 or venv: $ARBOR_ENV" >&2
+        exit 2
+        ;;
+esac
+# 環境取り違えは計測結果を静かに無効にするので、必ず実物を表示する。
+echo "Profiling env=$ARBOR_ENV python=$(python -c 'import sys;print(sys.version.split()[0])') torch=$(python -c 'import torch;print(torch.__version__)')"
 
 is_wsl=false
 if [[ -r /proc/sys/kernel/osrelease ]] && grep -qi microsoft /proc/sys/kernel/osrelease; then
