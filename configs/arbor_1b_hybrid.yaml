@@ -1,0 +1,306 @@
+# Arbor v2 hybrid (SSD 系列再帰 3 : attention 1) 1B 設定: arbor2_1b_8k_hybrid
+# 元は configs/arbor.yaml (lowbit 本走)。global 層の mixer だけ差し替え。docs/global_seq_recurrent_experiment.md
+#
+# 新規:   python -m src.train.train --config configs/arbor_1b_hybrid.yaml
+# 再開:   python -m src.train.train --config configs/arbor_1b_hybrid.yaml --resume latest
+#
+# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching
+# (16 bytes/patch) なので global は512 patches。実効バッチは64 seq=524k bytes/update。
+#
+# このbranchの既定値はCUDA sm89+専用。非対応deviceへは暗黙フォールバックしない。
+# MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_compute_mode: off を明示する。
+
+run_name: arbor2_1b_8k_hybrid
+seed: 42
+
+# model.patching_mode を entropy に変えた時だけ参照する。ByteLM の model 定義を
+# Arbor 側へ複製せず、このファイルから自動読込する。
+entropy_lm_config: entropy_lm.yaml
+
+model:
+  vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
+  # patching_mode: 一定 byte で区切る (entropy 不使用) なら static のまま。
+  #   static  … patch_size byte 固定で区切る (これが「一定 byte 区切り」)
+  #   utf8    … UTF-8 文字境界で区切る (min/max_patch_len 有効)
+  #   space   … 空白/改行直後で区切る (min/max_patch_len 有効)
+  #   entropy … ByteLM の予測エントロピー閾値で区切る (entropy_lm_config 必須)
+  patching_mode: static         # choices: static | utf8 | space | entropy
+  patch_size: 16                # static 専用: 1 patch = N byte。8192/16=512 global patches
+  # patch 表現の pooling。
+  #   concat … patch 内 byte を連結して p*dl→dg 射影 (static 専用。動的モードはエラー)
+  #   mean/max … patch_size 非依存の固定 local_hidden dim projection
+  # 小型 Arbor A/B (2026-09-14, 効率化メモ §8): concat が mean に mean_bpb −0.031 (全ドメイン)。
+  # 1B では +25M FP params / +1.2% step 時間 / +0.2 GiB。
+  patch_pooling: concat         # choices: concat | mean | max
+  min_patch_len: 3              # utf8/space/entropy 専用。range: 1..max_patch_len
+  max_patch_len: 16             # utf8/space/entropy 専用。range: >=min_patch_len
+  entropy_threshold: 2.0        # entropy 専用: 次 byte H (nats)。range: >0 (小さいほど細切れ)
+  max_bytes: 8192               # 学習 context (bytes)。static では patch_size の倍数
+  # ---- global (patch 階層, BitLinear) ----
+  hidden_size: 2048
+  num_heads: 16
+  num_kv_heads: 4               # GQA
+  intermediate_size: 5632       # ReLU² gated FFN
+  num_hidden_layers: 20
+  # ---- global 層を SSD (系列再帰) と attention の hybrid に (feat/global-seq-recurrent) ----
+  # 4 層に 1 回 attention (4, 8, 12, 16, 20 層目)、残り 15 層は SSD。SSSA×5。
+  # SSD 単体は 1B 20k で attention に −0.014 bpb だが 4k byte 超の逐語コピーが消えるため、
+  # attention 層で想起を担わせる。比率 1/4 は Jamba (1/8) より濃いめ (小型で 1/2 は負け)。
+  global_attention_every: 4
+  ssd_conv_width: 4
+  ssd_chunk: 64
+  ssd_output_gate: true         # +1·d² / 層 (SSD 層のみ)。false で attention 層と同パラメータ
+  ssd_backend: auto             # CUDA では flash-linear-attention の kernel (要 pip install flash-linear-attention)
+  # ---- local (byte 階層, BitLinear) ----
+  local_hidden_size: 768
+  local_num_heads: 12
+  local_num_kv_heads: 12
+  local_intermediate_size: 2048
+  num_local_encoder_layers: 1   # local は全 byte 位置で計算するため層を薄くして budget を global へ
+  num_local_decoder_layers: 2
+  # ---- 共通 ----
+  # RoPE。global は max_patches (static 8k/patch16 = 512) 位置しか見ないため、
+  # 128k 長文脈向けの theta=500000 は大半の次元の波長が文脈長を桁で超え、位置
+  # 分解能を潰す (#1: 長距離一貫性が育たない疑い)。系列長相応の値へ下げる。
+  #   A/B: 旧挙動へ戻すなら rope_theta_global を 500000.0 にする。
+  # local は patch 内 (static) / flat バイト列 (dynamic) を見るので従来値を維持。
+  rope_theta: 500000.0          # 個別未指定の層のfallback (= local に適用)
+  rope_theta_global: 10000.0    # #1: 512 patch 位置に見合う theta
+  rope_theta_local: 500000.0    # local は従来どおり
+  norm_eps: 1.0e-5
+  bitnet: true                  # choices: true (W1.58/A8 BitNet) | false (FP debug)
+  # BitLinear の活性量子化 (重みは常に W1.58 ternary)。
+  #   int8 … BitNet 公式 A8 (per-token absmax int8)
+  #   bf8  … 8bit float (float8_e5m2) fake-quant
+  #   bf16 … 量子化しない (活性は計算 dtype のまま)
+  activation_precision: int8    # choices: int8 | bf8 | bf16
+                                # int8=BitNet公式A8。bf8(float8_e5m2)は仮数2bitで
+                                # 実データ学習が発散したため非推奨。
+  gradient_checkpointing: false # OOM 時のみ true
+  # global(patch階層) attention 実装。文書 packing のマスクを SDPA 密マスクで課すと
+  # flash 経路を外れて遅い。CUDA では flex にすると BlockMask で fuse + native GQA。
+  #   sdpa … 全 device 対応。 flex … CUDA + torch.compile 必須。
+  # 非対応環境での暗黙フォールバックは禁止。必要なら明示的にsdpaへ変更する。
+  global_attn_impl: flex        # RTX 4090実測: sdpa比 +3.7% (FP8 bwd併用、8k context)
+
+# ---- データ (streaming 前提; 一括ロードは禁止) ----
+# weight_bytes は行選択確率ではなく、document packing 後の実測 byte 比率に近づくよう
+# ByteStreamDataset 側で byte-aware に混合する。
+data:
+  sources:
+    - id: fineweb2_ja
+      path: "HuggingFaceFW/fineweb-2"   # 日本語 web
+      name: "jpn_Jpan"
+      revision: main
+      weight_bytes: 0.465
+      text_filter:
+        preset: ja_web_v1
+    - id: wikipedia_ja
+      path: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      revision: main
+      weight_bytes: 0.19
+    - id: aozora_modern
+      path: "globis-university/aozorabunko-clean"
+      revision: main
+      weight_bytes: 0.02
+      max_epochs: 3
+    - id: japan_law
+      path: "y2lan/japan-law"           # 法令 (条文体。小規模)
+      text_column: "body"
+      revision: main
+      weight_bytes: 0.005
+      max_epochs: 5
+    - id: fineweb_edu_en
+      path: "HuggingFaceFW/fineweb-edu" # 英語 edu (高品質土台)
+      revision: main
+      weight_bytes: 0.12
+    - id: fineweb_en
+      path: "HuggingFaceFW/fineweb"
+      revision: main
+      weight_bytes: 0.05
+    - id: finemath_4plus
+      path: "HuggingFaceTB/finemath"    # 数学 (web 由来, 高品質フィルタ)
+      name: "finemath-4plus"
+      revision: main
+      weight_bytes: 0.06
+      text_filter:
+        preset: en_web_quality_v1
+    - id: opc_code_web
+      path: "OpenCoder-LLM/opc-fineweb-code-corpus"  # コード解説系 web 文書 (parquet, 非 gated)
+      revision: main
+      # 旧 github_code_filtered (loubnabnl/github-code-more-filtering) は datasets 4.x が
+      # 廃止したスクリプト型データセットで読めない (現在は 401) ため、その比率をここへ統合。
+      # 2026-08-28 に「非公開化」として一度外したが、2026-09-13 に HF API で
+      # gated/private/disabled いずれも False・parquet 512 本を確認したので復帰。
+      weight_bytes: 0.09
+      text_filter:
+        preset: en_web_quality_v1
+  streaming: true
+  packing: document
+  eos_token_id: 2
+  pad_token_id: 3
+  shuffle_buffer: 2000
+  context_length: 8192          # bytes。patch_size の倍数にする
+  num_workers: 0                # 正確 resume は単一プロセス前提
+  pin_memory: true
+
+# ---- 最適化 (BitNet training tips: 高めの LR が安定して効く) ----
+optim:
+  optimizer: adamw              # choices: adamw | lion
+  state_precision: fp32         # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
+                                # fp32=2 moment合計8B/parameter(既定・最も安定),
+                                # int8/bf8=合計2B/parameter(+block scale)。
+                                # 実データ1000-step A/B: fp32はloss 5.7->1.89で安定。
+                                # 旧int8(線形blockwise)/bf8はstep300-500で発散したため、
+                                # int8はdynamic codebook量子化へ改良済み(下記)。VRAMを
+                                # 節約したい時のみint8を選ぶ(fp32比で二次モーメントの
+                                # underflowを防ぐ非線形符号帳を使用)。
+  fp32_backend: auto           # auto: 対応する連続CUDA tensorでAdamW演算を融合。eagerで従来版、tritonで明示必須。
+  # parameter (bf16, fp32 master 無し) への書き戻し丸め。
+  #   nearest    … 最近接丸め。更新が半 ulp (相対 ~0.2%) 未満だと消える。lr*wd ~1e-5 の
+  #                weight decay は一度も効かず、lr が下がる後半は更新の大半が消える (実測)。
+  #   stochastic … 端数に比例した確率で切り上げる不偏丸め (torchao bf16_stochastic_round
+  #                / Ozkara+ 2025 と同方式)。追加メモリ無し、AdamW kernel 内で完結。
+  param_rounding: stochastic    # choices: nearest | stochastic
+  # BitNet b1.58 公式再現設定 (Training Tips, 1.3B): 1.2e-3 -> 8e-4、LLaMA FP 1.3B は 2e-4。
+  # 2e-4 は FP 側の値だった。8e-4 は旧 filter run (bnb 8bit) で実績あり。
+  lr: 8.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1             # stable 区間の weight decay (decay 区間は weight_decay_decay_phase)
+  grad_clip: 1.0
+  # WSD (warmup → stable → decay)。stable 区間は lr が定数なので total_steps を後から
+  # 増やしても過去の lr 履歴と矛盾しない (延長可能)。stable 区間の checkpoint から短い
+  # decay を枝分かれさせて途中経過を評価することもできる (効率化メモ §3 anneal ×N)。
+  # decay 区間は BitNet 公式 2 段レシピの後半 (低 lr + WD 0) に相当。
+  # 旧 two_stage (前半 cosine 1.0→0.5、後半 cooldown) は延長不能なので廃止。2026-09-15 に
+  # step 2.6k で WSD へ切替 (その時点の two_stage の lr はピークの 0.9999 で履歴は事実上同一)。
+  scheduler: wsd                # choices: cosine_warmup | wsd
+  decay_start_ratio: 0.8        # wsd: 消費 bytes の 80% まで stable、そこから decay
+  decay_end_ratio: 1.0          # wsd: 100% で min_lr 到達
+  decay_shape: inv_sqrt         # wsd: choices: inv_sqrt (1-√, Hägele+ 2024) | linear | cosine
+  weight_decay_decay_phase: 0.0 # wsd: decay 区間の weight decay (BitNet 公式は 0)
+  min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
+  warmup_steps: 1000
+  total_steps: 230000           # grad_accum_steps の schedule 込みで 105GB (= 旧 200k step × 524k bytes)。
+                                # 延長するなら decay 開始 (step ~194k) より前に増やす
+
+# ---- スループット ----
+speed:
+  device: auto                  # choices: auto | cuda | mps | cpu
+  precision: bf16               # 計算dtype。choices: bf16 | fp16 | fp32
+                                # (bf8 は forward の float8 カーネルが無く非対応)
+  tf32_matmul: true
+  cudnn_benchmark: true
+  torch_compile: true           # 静的形状なので常時 ON (初回コンパイルに数分)
+  compile_mode: reduce-overhead # packed kernelのlaunch gapをCUDA Graphsで削減。grad bufferを固定確保する。
+  cuda_prefetch: true           # 次 batch の H2D 転送を別 CUDA stream で先行
+  cpu_prefetch_depth: 3         # batch組み立て(document packing)をthread先読み。0で無効
+  bitlinear_compute_mode: ternary  # choices: off | bwd | full | int8 | ternary。ternaryは実験的packed W1.58 training。
+                                # int8=A8 INT8×ternary INT8 forward + cached FP8 backward (本命)。
+                                # ternary=packed 2bit forward/dX + 下記backendのdW。
+                                # bwd=forward BF16 維持で backward のみ FP8。fullは追加丸めが乗る。
+                                # 旧表記 speed.bitlinear_fp8 は互換のため引き続き受理する。
+  bitlinear_int8_backend: auto  # choices: auto | int_mm | triton。5090では両者をA/Bする。
+  bitlinear_ternary_backend: kmajor_single_dot # choices: dot_current | kmajor_current | kmajor_single_dot | dot。backendは固定しtileだけ実測選択。
+  bitlinear_ternary_execution: custom_op # choices: legacy_raw | legacy_custom_op | custom_op | raw | raw_plan。Graph capture後はresolverをreplayしない。
+  bitlinear_ternary_tuning: auto       # choices: auto | fixed | off。実行GPU上でtileを測りfingerprint付きcacheへ保存。
+  bitlinear_ternary_tuning_cache: true
+  bitlinear_ternary_tuning_cache_path: auto # XDG_CACHE_HOME/arbor。checkpointとは分離。
+  bitlinear_ternary_fixed_tile: null   # fixed時のみ BM,BN,BK,WARPS,STAGES
+  bitlinear_ternary_tuning_warmup: 10
+  bitlinear_ternary_tuning_iters: 30
+  bitlinear_ternary_tuning_verbose: false
+  bitlinear_ternary_wgrad_backend: fp8 # choices: int8 | fp8 | auto。autoはN>=KでFP8、それ以外はINT8。
+  bitnet_weight_cache: full     # int8/ternary は全 BitLinear の low-bit cache が必須
+  bitnet_weight_cache_gib: 3.25 # INT8 ternary + FP8(N×K/K×N)両layout用
+  bitnet_weight_cache_min_numel: 0
+  sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
+  micro_batch_size: 2           # patch16 + local 1/2層で余裕があれば 4 も A/B 候補
+  # 固定値 (例: 32) か [[step, accum], ...] の step 関数 (batch size warmup, Ai2 "Critical Batch Size
+  # Revisited": 序盤は臨界 batch が小さいので小さく始める)。VRAM には影響しない (micro_batch_size が決める)。
+  # lr schedule の進行は消費 bytes 割合で測る。ByteLM A/B (2026-09-14): 1→2→4 warmup は固定より bpb -0.043。
+  # accum 8 (131k B/update) で 2.6GB、16 で 7.9GB、以後 32 (524k)。総量 105GB を保つため total_steps 230k。
+  grad_accum_steps: [[0, 8], [20000, 16], [50000, 32]]
+  grad_accum_lr_scaling: sqrt   # choices: sqrt | none。区間中の lr を √(accum/final) 倍
+
+validation:
+  enabled: true
+  # training用compiled wrapperとは分離。安定性優先のeagerが既定。
+  # CUDA上で独立compileする場合だけtrueにし、compile_modeを個別指定する。
+  torch_compile: false
+  compile_mode: default
+  max_batches: 64
+  micro_batch_size: 2
+  domains:
+    ja_web:
+      source: "HuggingFaceFW/fineweb-2"
+      name: "jpn_Jpan"
+      revision: main
+      split: train
+      skip_samples: 200000
+    wikipedia_ja:
+      source: "wikimedia/wikipedia"
+      name: "20231101.ja"
+      revision: main
+      split: train
+      skip_samples: 20000
+    english:
+      source: "HuggingFaceFW/fineweb-edu"
+      revision: main
+      split: train
+      skip_samples: 200000
+    math:
+      source: "HuggingFaceTB/finemath"
+      name: "finemath-4plus"
+      revision: main
+      split: train
+      skip_samples: 20000
+    code:
+      source: "OpenCoder-LLM/opc-fineweb-code-corpus"
+      revision: main
+      split: train
+      skip_samples: 20000
+
+checkpoint:
+  dir: ./checkpoints/arbor2_1b_8k_hybrid
+  save_every_steps: 3000
+  keep_last_k: 3
+  keep_every_n_steps: 10000
+  async_save: true              # 書き込みをbackground threadへ (中断/final時は同期)
+
+# ---- checkpoint 時のサンプル生成 (checkpoint dir に samples.txt を保存) ----
+sampling:
+  enabled: true
+  prompts:
+    - "日本の四季は"
+    - "The most important thing in life is"
+    - "def fibonacci(n):"
+  max_new_bytes: 100
+  temperature: 0.8
+  top_p: 0.95
+  seed: 42
+  use_cache: true               # cache有効で checkpoint 時サンプル生成を高速化 (出力分岐は fbc42f5 で修正・検証済み)
+
+probes:
+  enabled: true
+  items:
+    - name: ja_seasons
+      prompt: "日本には春、夏、秋、冬という四つの季節があり、"
+      target: "それぞれに異なる気候と風景を楽しむことができる。"
+      bad_targets:
+        - "あっという間においしくなった。"
+        - "天然記念物になるという。"
+    - name: ja_buttons
+      prompt: "この装置には赤、青、緑、黄色という四つのボタンがあり、"
+      target: "それぞれに異なる機能が割り当てられている。"
+      bad_targets:
+        - "あっという間においしくなった。"
+        - "天然記念物になるという。"
+
+logging:
+  log_every_steps: 20
+  throughput_window: 50
+  byte_kind_metrics: true
+  best_ema_decay: 0.98

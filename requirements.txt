@@ -25,3 +25,4 @@ hf-xet==1.5.0
 # ---- dev ----
 pytest>=8.2
 ruff>=0.6
+flash-linear-attention>=0.5.2  # SSDMixer (global_layer_pattern S) の chunk scan kernel
