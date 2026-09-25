@@ -38,7 +38,9 @@ def _load_model(ckpt_dir: Path, device: torch.device, dtype: torch.dtype):
     cfg = yaml.safe_load((ckpt_dir / "config.yaml").read_text())
     meta = json.loads((ckpt_dir / "meta.json").read_text())
 
-    model = build_arbor(cfg["model"]).to(device=device, dtype=dtype)
+    with torch.device(device):  # 初期値は checkpoint で上書きするので device 上で直接作る
+        model = build_arbor(cfg["model"])
+    model = model.to(dtype=dtype)
     weights = load_file(str(ckpt_dir / "model.safetensors"), device=str(device))
     if any(k.startswith("_orig_mod.") for k in weights):
         weights = {k.removeprefix("_orig_mod."): v for k, v in weights.items()}

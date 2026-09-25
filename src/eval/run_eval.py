@@ -34,7 +34,9 @@ def main() -> int:
     apply_speed_settings(cfg.get("speed", {}))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_arbor(cfg["model"]).to(device=device, dtype=torch.bfloat16)
+    with torch.device(device):  # 初期値は checkpoint で上書きするので device 上で直接作る
+        model = build_arbor(cfg["model"])
+    model = model.to(dtype=torch.bfloat16)
 
     ckpt = CheckpointManager(cfg["checkpoint"]["dir"], async_save=False)
     meta, _ = ckpt.load(args.ckpt, model, map_location=device)

@@ -376,8 +376,40 @@ class FeedForward(nn.Module):
 # 1 op として compile に乗る。登録は import 時に済ませる: forward 内で遅延登録すると custom_op の
 # infer_schema が dynamo の skip 対象で graph break し、1B では CUDA graph が 1,600 個/step に割れて
 # forward が 2 倍遅くなった (2026-09-19 プロファイル)。
+def _import_fla_without_package_init() -> None:
+    """fla の親パッケージ __init__ を実行せずに fla.ops.simple_gla.chunk を読めるようにする.
+
+    ``fla/__init__.py`` と ``fla/ops/__init__.py`` は全 layer / model / 全 op と
+    transformers まで import し、環境が /mnt/d (9p) 上だと stat 待ちで ~88s かかる
+    (実際に使うのは chunk_simple_gla だけ)。空の package module を先に登録して
+    サブモジュールだけを読む: 88s → 12s (2026-09-25 実測)。fla が既に import 済みなら何もしない。
+    """
+    import importlib.util
+    import re
+    import sys
+    import types
+    from pathlib import Path
+
+    if "fla" in sys.modules:
+        return
+    spec = importlib.util.find_spec("fla")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    base = Path(list(spec.submodule_search_locations)[0])
+    for name, sub in (("fla", base), ("fla.ops", base / "ops"),
+                      ("fla.ops.simple_gla", base / "ops" / "simple_gla")):
+        mod = types.ModuleType(name)
+        mod.__path__ = [str(sub)]
+        mod.__package__ = name
+        sys.modules[name] = mod
+    # fla.utils が `from .. import __version__` するので本物の値を入れておく
+    m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)", (base / "__init__.py").read_text())
+    sys.modules["fla"].__version__ = m.group(1) if m else "0"
+
+
 def _register_fla_scan_op() -> bool:
     try:
+        _import_fla_without_package_init()
         from fla.ops.simple_gla.chunk import (
             RCP_LN2, chunk_local_cumsum, chunk_simple_gla_bwd, chunk_simple_gla_fwd,
         )
