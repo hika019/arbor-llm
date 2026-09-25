@@ -89,7 +89,9 @@ def load_checkpoint(
     )
     dtype = resolve_dtype(precision_name)
 
-    model = build_arbor(model_cfg).to(device=device, dtype=dtype)
+    with torch.device(device):  # 初期値は checkpoint で上書きするので device 上で直接作る
+        model = build_arbor(model_cfg)
+    model = model.to(dtype=dtype)
     weights = safe_load(
         str(checkpoint / "model.safetensors"),
         device=str(device),

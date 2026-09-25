@@ -143,7 +143,11 @@ def load_inference_model(
         from src.model.arbor import build_byte_lm as build_model
     else:
         from src.model.arbor import build_arbor as build_model
-    model = build_model(model_cfg).to(device=device, dtype=dtype)
+    # 初期値は直後に checkpoint で上書きするので、CPU で乱数初期化せず device 上で直接作る
+    # (1B を CPU で初期化すると ~100s、GPU 上なら ~1s)。
+    with torch.device(device):
+        model = build_model(model_cfg)
+    model = model.to(dtype=dtype)
 
     state = _strip_compile_prefix(safe_load(str(ckpt_dir / "model.safetensors"), device="cpu"))
     model.load_state_dict(state, strict=True)
