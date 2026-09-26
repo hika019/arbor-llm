@@ -157,7 +157,8 @@ optim:
   lr: 4.0e-4                # BLT の entropy model 設定と同じ
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  weight_decay: 0.0
+  weight_decay: 0.1
+  weight_decay_decay_phase: 0.1   # FP モデルなので decay 区間も同じ (0 は BitNet 公式の値)
   grad_clip: 1.0
   # WSD: stable 区間は lr 一定なので、検証 bpb が頭打ちになった時点で打ち切って
   # decay だけ回す / total_steps を延ばす、のどちらもできる (本走と同じ運用)。
