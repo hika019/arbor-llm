@@ -29,6 +29,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # 潤沢な RAM の環境では source 前に上書きしてよい。
 export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-6}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
+export ARBOR_ARROW_THREADS="${ARBOR_ARROW_THREADS:-8}"
 export PYTHONPATH="${_ENVC_PROJECT_DIR}:${PYTHONPATH:-}"
 # stdout をファイルにリダイレクトする本番 run 向け: block buffering だと print が
 # 溜まるまでログに出ず監視しづらいので常に unbuffered にする。

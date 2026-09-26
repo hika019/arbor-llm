@@ -36,42 +36,10 @@ class _ResumeState:
 
 # pyarrow の parquet デコードスレッド数。datasets streaming は 1 プロセス内で全 source を
 # 同時に開くので、既定 (CPU 数 = 20) だと source ごとにスレッド分の作業バッファが居座る。
-# 2 で 5000 rows/5s 出るので学習 (数十 rows/s) には十分。
-_ARROW_THREADS = 2
+# 2 で 5000 rows/5s 出るので学習 (数十 rows/s) には十分。環境変数 ARBOR_ARROW_THREADS で上書き。
+_ARROW_THREADS = int(os.environ.get("ARBOR_ARROW_THREADS", "2"))
 # parquet source の読み出し単位 (行)。row group 丸ごと読みを避けて host RAM を抑える
 _PARQUET_BATCH_ROWS = 256
-
-
-def _parquet_tables_without_readahead(self, files, row_groups_list):
-    """datasets の Parquet._generate_tables の置き換え。ParquetFile.iter_batches で読んだ分だけ持つ.
-
-    元実装の fragment.to_batches (pyarrow dataset scanner) は batch_readahead=0 でも裏で
-    ファイルを先読みし、stream ごとに ~260MB を抱え続ける (29 source で ~4.4GB)。
-    datasets==4.8.5 の内部 (_generate_tables の引数・Key・_cast_table・streaming 時の open 差し替え) に依存。
-    """
-    import builtins
-    import sys
-
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    from datasets.builder import Key
-
-    if self.config.filters is not None:
-        raise NotImplementedError("parquet source の filters は未対応")
-    # streaming では datasets が builder のモジュールの open を認証付き xopen に差し替えている
-    opener = getattr(sys.modules[type(self).__module__], "open", builtins.open)
-    for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
-        with opener(file, "rb") as f:
-            pf = pq.ParquetFile(f, pre_buffer=False)
-            if pf.metadata.num_row_groups == 0:
-                continue
-            batches = pf.iter_batches(
-                batch_size=self.config.batch_size or pf.metadata.row_group(0).num_rows,
-                row_groups=None if row_groups is None else list(row_groups),
-                columns=self.config.columns,
-            )
-            for batch_idx, record_batch in enumerate(batches):
-                yield Key(file_idx, batch_idx), self._cast_table(pa.Table.from_batches([record_batch]))
 
 
 def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dict):
@@ -80,9 +48,12 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
     `data_files` を指定すると path は "json" / "parquet" 等の builder 名として扱い、
     Hub 上の生ファイルを直接 stream する (例: script 型で datasets 4.x が読めない
     repo の `hf://datasets/<repo>/<dir>/*.jsonl.zst`)。.zst は zstandard が必要。
-    """
-    import functools
 
+    parquet source は pyarrow の pre_buffer (row group 先読み cache、解放されず
+    source あたり +400MB 居座る) を切る: 1 source +415MB → +136MB (fineweb-2 実測)。
+    28 source 混合の entropy_lm で dataloader だけで host RAM 19GB を食い、本走と
+    同居して WSL ごと OOM した (2026-09-16)。
+    """
     import pyarrow as pa
     from datasets import load_dataset_builder
     from datasets.packaged_modules.parquet.parquet import ParquetConfig
@@ -108,7 +79,9 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
         kwargs["data_files"] = data_files
     builder = load_dataset_builder(path, name=name, **kwargs)
     if isinstance(builder.config, ParquetConfig):
-        builder._generate_tables = functools.partial(_parquet_tables_without_readahead, builder)
+        import pyarrow.dataset as pds
+
+        builder.config.fragment_scan_options = pds.ParquetFragmentScanOptions(pre_buffer=False)
         # 既定の batch は row group 丸ごと (fineweb 系で数万行) かつ全列を展開するため、
         # 大きい web source 1 つで ~1GB が常駐し、28 source 混合の ByteLM 学習で host RSS が
         # 21GB に達して止めた (2026-09-26)。使う列だけを小さい batch で読む。
