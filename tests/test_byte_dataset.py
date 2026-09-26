@@ -402,3 +402,64 @@ def test_document_packing_carries_over_instead_of_padding_when_more_docs_exist(m
     assert second["input_ids"].tolist() == [ord("g"), ord("h"), 2, ord("i"), ord("j"), 2]
     assert second["labels"].tolist() == [ord("h"), 2, -100, ord("j"), 2, -100]
     assert second["fill_ratio"].item() == 1.0
+
+
+class _HFLikeEpochStream:
+    """HF IterableDataset の epoch 付き状態復元を模す.
+
+    load_state_dict の状態は「epoch が保存時と同じ間は iter() のたびに再適用」される。
+    """
+
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
+        self.epoch = 0
+        self.idx = 0
+        self._starting = None
+        self.state_applied = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        self.idx = 0
+        if self._starting is not None and self.epoch == self._starting["epoch"]:
+            self.idx = self._starting["idx"]
+            self.state_applied += 1
+        order = self.rows if self.epoch % 2 == 0 else self.rows[::-1]  # epoch で shuffle が変わる
+        while self.idx < len(order):
+            row = order[self.idx]
+            self.idx += 1
+            yield row
+
+    def state_dict(self):
+        return {"epoch": self.epoch, "idx": self.idx}
+
+    def load_state_dict(self, state):
+        self._starting = dict(state)
+
+
+def test_exhausted_source_restarts_next_epoch_from_beginning_after_resume(monkeypatch):
+    """resume 後に小さい source を読み切ったら、次の周は頭から (状態を再適用しない)."""
+    specs = [{"path": "small", "weight_bytes": 1.0}]
+    rows = [{"text": t} for t in ("aaa", "bbb", "ccc", "ddd")]
+
+    def make(ds):
+        stream = _HFLikeEpochStream(rows)
+        monkeypatch.setattr(ds, "_build_hf_source_streams", lambda: ([stream], specs))
+        return stream
+
+    ds = ByteStreamDataset(sources=specs, context_length=3, byte_offset=0, packing="document", seed=0)
+    make(ds)
+    it = ds._iter_hf_document_packed()
+    next(it)
+    next(it)  # "aaa", "bbb" まで消費
+    state = ds.state_dict()
+
+    restored = ByteStreamDataset(sources=specs, context_length=3, byte_offset=0, packing="document", seed=0)
+    stream = make(restored)
+    restored.load_state_dict(state)
+    it2 = restored._iter_hf_document_packed()
+    got = [bytes(next(it2)["input_ids"].tolist()).decode() for _ in range(6)]
+    # 残り (ccc, ddd) の後、次の周は epoch 1 (逆順) を頭から 4 件すべて読む
+    assert got == ["ccc", "ddd", "ddd", "ccc", "bbb", "aaa"]
+    assert stream.state_applied == 1  # 復元は resume 時の 1 回だけ

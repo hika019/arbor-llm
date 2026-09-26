@@ -81,6 +81,21 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
     return builder.as_streaming_dataset(split=split)
 
 
+def _restart_stream_next_epoch(stream):
+    """読み切った source を次の epoch として頭から読み直す.
+
+    HF IterableDataset は load_state_dict で受け取った状態を覚えていて、epoch が保存時と同じ間は
+    iter() のたびに再適用する。epoch を進めずに iter() し直すと、resume 後は毎周「checkpoint 時点の
+    位置」から再開して前半を二度と読まず、そのたびに shuffle buffer も充填し直していた
+    (ByteLM 学習で 50 step ごとに 3〜4 回 "Loading a state dict of a shuffle buffer" が出て
+    17 万 → 13.5 万 bytes/s、2026-09-26)。set_epoch で epoch を進めれば状態は適用されず、
+    shuffle 順も周ごとに変わる (HF は seed + epoch で shuffle する)。
+    """
+    if hasattr(stream, "set_epoch"):
+        stream.set_epoch(int(getattr(stream, "epoch", 0)) + 1)
+    return iter(stream)
+
+
 class ByteStreamDataset(IterableDataset):
     """バイト列を context_length に区切って (input_ids, labels) を yield する.
 
@@ -471,6 +486,10 @@ class ByteStreamDataset(IterableDataset):
             document_stream_states = [None for _ in range(source_count)]
         for stream, stream_state in zip(streams, document_stream_states):
             if stream_state is not None and hasattr(stream, "load_state_dict"):
+                # HF IterableDataset は保存時の epoch と一致するときだけ状態を適用する。
+                # 読み切った source は set_epoch で epoch を進めて読み直すので、保存時の epoch に揃える
+                if hasattr(stream, "set_epoch") and isinstance(stream_state, dict) and "epoch" in stream_state:
+                    stream.set_epoch(int(stream_state["epoch"]))
                 stream.load_state_dict(stream_state)
 
         document_pack_states = list(
@@ -622,7 +641,7 @@ class ByteStreamDataset(IterableDataset):
                     max_epochs = specs[source_idx].get("max_epochs")
                     if max_epochs is not None and source_epochs[source_idx] >= int(max_epochs):
                         return None
-                    source_iters[source_idx] = iter(streams[source_idx])
+                    source_iters[source_idx] = _restart_stream_next_epoch(streams[source_idx])
                     continue
                 min_score = specs[source_idx].get("min_score")
                 if min_score is not None:
