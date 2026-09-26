@@ -700,11 +700,23 @@ class ByteLM(nn.Module):
                 x = layer(x, attn_mask)
         return ArborOutput(logits=self.head(self.norm(x)))
 
-    def _attention_mask(self, input_ids: torch.Tensor) -> "torch.Tensor | WindowMask | None":
+    def _attention_mask(self, input_ids: torch.Tensor) -> "torch.Tensor | WindowMask | object | None":
         if self.attention_window is None:
             return None
         b, t = input_ids.shape
         w = min(int(self.attention_window), t)
+        if input_ids.is_cuda and torch.compiler.is_compiling():
+            # compile 下では sliding window を flex_attention の BlockMask で表す。窓外の
+            # block を丸ごと飛ばす fused kernel になり、計算は ~T·w (WindowMask の masked
+            # SDPA は chunk + 2w 幅を全部計算する)。eager の flex は T×T を実体化するので
+            # compile 時だけ使い、eager / CPU は下の WindowMask 経路で同じマスクを課す。
+            from torch.nn.attention.flex_attention import create_block_mask
+
+            def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+                return (kv_idx <= q_idx) & (q_idx - kv_idx < w)
+
+            return create_block_mask(mask_mod, B=None, H=None, Q_LEN=t, KV_LEN=t,
+                                     device=input_ids.device)
         c = _WINDOW_CHUNK
         if t % c == 0 and t >= c:
             ar_q = torch.arange(c, device=input_ids.device).view(1, 1, c, 1)
@@ -745,7 +757,64 @@ def _is_utf8_char_start_byte(byte: int) -> bool:
     return byte < 0x80 or 0xC2 <= byte <= 0xF4
 
 
-@torch.compiler.disable
+def _patch_starts_reference(
+    raw: torch.Tensor, force: torch.Tensor, min_len: int, max_len: int, budget: int, horizon: int,
+) -> torch.Tensor:
+    """境界 walk の CPU 参照実装。CUDA kernel (csrc/patch_starts.cu) と生成器
+    (ArborByteGenerator._starts_new_patch) はこれと同じ規則で実装する.
+
+    - patch は最長 max_len (到達したら強制的に区切る)
+    - force[p] (文書先頭) は min_len に関係なく区切り候補
+    - raw[p] は現 patch が min_len 以上のときだけ候補
+    - budget > 0 なら、位置 p で新 patch を開けるのは
+      ``count + ceil(max(horizon - p, 0) / max_len) <= budget`` のときだけ
+      (count = それまでに開いた patch 数)。残りを max_len ずつ区切っても上限に収まる
+      ことを常に保つので patch 数は budget を超えない。判定は位置と過去の境界だけで
+      決まる (因果的)。horizon は系列長ではなく固定値 (max_bytes) を使うこと。
+    """
+    b, t = raw.shape
+    starts = torch.zeros(b, t, dtype=torch.bool)
+    raw_l, force_l = raw.cpu().tolist(), force.cpu().tolist()
+    for r in range(b):
+        i = 0
+        count = 0
+        while i < t:
+            starts[r, i] = True
+            count += 1
+            hi = min(i + max_len, t)
+            lo = i + min_len
+            nxt = hi
+            for p in range(i + 1, hi):
+                if not (force_l[r][p] or (p >= lo and raw_l[r][p])):
+                    continue
+                if budget > 0 and count + -(-max(horizon - p, 0) // max_len) > budget:
+                    continue
+                nxt = p
+                break
+            i = nxt
+    return starts.to(raw.device)
+
+
+# 境界 walk は逐次処理だが出力形状は入力と同じ (B, T) bool なので、custom_op + fake 実装に
+# しておけば torch.compile は不透明な 1 op として扱い、graph break も CUDA graph の分断も
+# 起きない (旧実装は @torch.compiler.disable で graph が割れ、step あたり ~37ms の CPU
+# 待ちが出ていた: 2026-09-26 プロファイル)。
+@torch.library.custom_op("arbor::patch_starts", mutates_args=())
+def _patch_starts_op(
+    raw: torch.Tensor, force: torch.Tensor, min_len: int, max_len: int, budget: int, horizon: int,
+) -> torch.Tensor:
+    if raw.is_cuda:
+        from src.model.patch_starts_cuda import patch_starts_cuda
+
+        return patch_starts_cuda(raw, force, min_len, max_len, budget, horizon)
+    return _patch_starts_reference(raw, force, min_len, max_len, budget, horizon)
+
+
+@_patch_starts_op.register_fake
+def _(raw, force, min_len, max_len, budget, horizon):
+    return torch.empty_like(raw)
+
+
 def compute_patch_starts(
     input_ids: torch.Tensor,
     mode: str,
@@ -754,22 +823,25 @@ def compute_patch_starts(
     entropy_model: ByteLM | None = None,
     threshold: float = 1.5,
     entropy_values: torch.Tensor | None = None,
+    *,
+    eos_token_id: int | None = None,
+    budget: int = 0,
+    horizon: int = 0,
 ) -> torch.Tensor:
     """patch 開始位置の bool tensor (B, T) を返す。判定は過去バイトのみに依存 (causal).
 
     - utf8:    現在バイトが UTF-8 文字先頭なら新 patch を開始
     - space:   直前バイトが空白系なら新 patch を開始
     - entropy: 直前位置での次バイト予測エントロピーが threshold 超なら開始
-    その後 min_len (それ未満では区切らない) / max_len (達したら強制区切り) を適用。
-
-    min/max 制約は「境界 s の次の境界 = min(s+min_len 以降で最初の候補, s+max_len)」
-    というジャンプ過程なので、CUDA では raw -> starts の境界 walk を extension
-    に渡して GPU 上で完結させる。CPU ではテスト用の torch 実装を使う。
+    その後 min_len / max_len / 文書先頭 (eos_token_id の直後、min_len 無視) /
+    予算ガード (budget, horizon) を適用する。規則の詳細は _patch_starts_reference。
     """
     if min_len <= 0:
         raise ValueError("min_patch_len must be positive")
     if max_len < min_len:
         raise ValueError("max_patch_len must be >= min_patch_len")
+    if budget > 0 and budget < -(-horizon // max_len):
+        raise ValueError(f"budget={budget} は ceil(horizon/max_len)={-(-horizon // max_len)} 以上が必要")
 
     b, t = input_ids.shape
     if mode == "utf8":
@@ -781,8 +853,7 @@ def compute_patch_starts(
         is_space = torch.zeros_like(prev, dtype=torch.bool)
         for sb in _SPACE_BYTES:
             is_space |= prev == sb
-        raw = torch.zeros(b, t, dtype=torch.bool, device=input_ids.device)
-        raw[:, 1:] = is_space
+        raw = F.pad(is_space, (1, 0), value=False)
     elif mode == "entropy":
         if entropy_values is None:
             if entropy_model is None:
@@ -790,28 +861,17 @@ def compute_patch_starts(
             ent = entropy_model.next_byte_entropy(input_ids)  # (B, T), no_grad in ByteLM
         else:
             ent = entropy_values
-        raw = torch.zeros(b, t, dtype=torch.bool, device=input_ids.device)
-        raw[:, 1:] = ent[:, :-1] > threshold
+        raw = F.pad(ent[:, :-1] > threshold, (1, 0), value=False)
     else:
         raise ValueError(f"unknown dynamic patching mode: {mode}")
 
-    if raw.is_cuda:
-        from src.model.patch_starts_cuda import patch_starts_cuda
-
-        return patch_starts_cuda(raw, min_len, max_len)
-
-    starts = torch.zeros_like(raw)
-    for r in range(b):
-        i = 0
-        while i < t:
-            starts[r, i] = True
-            lo = i + min_len
-            if lo >= t:
-                break
-            hi = min(i + max_len, t)
-            candidates = raw[r, lo:hi].nonzero(as_tuple=False)
-            i = lo + int(candidates[0, 0]) if candidates.numel() else hi
-    return starts
+    if eos_token_id is None:
+        force = torch.zeros_like(raw)
+    else:
+        force = F.pad(input_ids[:, :-1] == eos_token_id, (1, 0), value=False)
+    return torch.ops.arbor.patch_starts(
+        raw.contiguous(), force.contiguous(), int(min_len), int(max_len), int(budget), int(horizon)
+    )
 
 
 # ------------------------------------------------------------------ KV cache
@@ -872,9 +932,13 @@ class ArborModel(nn.Module):
         if self.dynamic:
             worst_case_patches = math.ceil(cfg.max_bytes / cfg.min_patch_len)
             self.max_patches = cfg.max_patches or worst_case_patches
-            if self.max_patches <= 0 or self.max_patches > worst_case_patches:
+            # 予算ガードが成立する下限: 残り全部を max_patch_len で区切った patch 数
+            min_budget = math.ceil(cfg.max_bytes / cfg.max_patch_len)
+            if self.max_patches < min_budget or self.max_patches > worst_case_patches:
                 raise ValueError(
-                    f"max_patches must be in [1, {worst_case_patches}], got {self.max_patches}"
+                    f"max_patches must be in [{min_budget}, {worst_case_patches}] "
+                    f"(= [ceil(max_bytes/max_patch_len), ceil(max_bytes/min_patch_len)]), "
+                    f"got {self.max_patches}"
                 )
         else:
             self.max_patches = (cfg.max_bytes + p - 1) // p
@@ -1102,9 +1166,23 @@ class ArborModel(nn.Module):
         max_patch_count = torch.full((), k, dtype=torch.float32, device=logits.device)
         return ArborOutput(logits=logits, patch_count=patch_count, max_patch_count=max_patch_count)
 
+    def _patch_starts(
+        self, input_ids: torch.Tensor, entropy_values: torch.Tensor | None
+    ) -> torch.Tensor:
+        """動的モードの境界。文書先頭で必ず区切り、patch 数は予算ガードで max_patches 以下."""
+        cfg = self.cfg
+        return compute_patch_starts(
+            input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
+            self.entropy_model, cfg.entropy_threshold, entropy_values,
+            eos_token_id=cfg.eos_token_id, budget=self.max_patches, horizon=cfg.max_bytes,
+        )
+
     def _forward_dynamic(self, input_ids: torch.Tensor) -> ArborOutput:
         cfg = self.cfg
         b, t = input_ids.shape
+        if t > cfg.max_bytes:
+            # 予算ガードは horizon=max_bytes 前提 (これを超えると patch 数の上限保証が崩れる)
+            raise ValueError(f"動的モードの入力長 {t} が max_bytes={cfg.max_bytes} を超えている")
         profile_sections = bool(getattr(self, "profile_sections", False))
         section_ms: dict[str, float] = {}
 
@@ -1129,29 +1207,22 @@ class ArborModel(nn.Module):
         if cfg.patching_mode == "entropy":
             if self.entropy_model is None:
                 raise ValueError("patching_mode=entropy には entropy_model が必要")
-            # Keep only the data-dependent boundary walk out of torch.compile.
-            # The frozen ByteLM itself is dense tensor work and benefits from compile.
+            # 凍結 ByteLM も境界 walk (custom_op arbor::patch_starts) も compile の 1 graph に乗る
             entropy_values = timed_section(
                 "bytelm_ms",
                 lambda: self.entropy_model.next_byte_entropy(input_ids),
             )
 
         def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
-            starts_local = compute_patch_starts(
-                input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
-                self.entropy_model, cfg.entropy_threshold, entropy_values,
-            )
+            starts_local = self._patch_starts(input_ids, entropy_values)
             # (B, T) 各バイトの patch 番号
             return starts_local.long().cumsum(1) - 1, starts_local.sum(1).to(torch.float32)
 
         patch_id, patch_counts = timed_section("patching_ms", build_patch_ids)
         patch_count = patch_counts.sum()
         max_patch_count = patch_counts.max()
+        # 予算ガード (_patch_starts_reference) により patch 数は max_patches を超えない
         k = self.max_patches
-        torch._assert(
-            (patch_id < k).all(),
-            f"dynamic patch count exceeded max_patches={k}; increase model.max_patches",
-        )
 
         def run_arbor_body() -> torch.Tensor:
             x = self.byte_emb(input_ids)                   # (B, T, dl)
@@ -1264,10 +1335,7 @@ class ArborModel(nn.Module):
             )
 
         def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
-            starts_local = compute_patch_starts(
-                input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
-                self.entropy_model, cfg.entropy_threshold, entropy_values,
-            )
+            starts_local = self._patch_starts(input_ids, entropy_values)
             return starts_local.long().cumsum(1) - 1, starts_local.sum(1).to(torch.float32)
 
         patch_id, patch_counts = timed_section("patching_ms", build_patch_ids)
@@ -1397,7 +1465,7 @@ class ArborByteGenerator:
 
     # ----------------------------------------------------------- internal
     def _starts_new_patch(self, next_byte_id: int | None = None) -> bool:
-        """次に push されるバイトが新しい patch を始めるか (compute_patch_starts と同条件)."""
+        """次に push されるバイトが新しい patch を始めるか (_patch_starts_reference と同じ規則)."""
         run = len(self.cur_patch)
         if run == 0:
             return False
@@ -1405,16 +1473,23 @@ class ArborByteGenerator:
         if cfg.patching_mode == "static":
             return run >= cfg.patch_size
         if run >= cfg.max_patch_len:
-            return True
-        if run < cfg.min_patch_len:
+            return True  # 予算ガードの不変条件により常に許される
+        if self.byte_ids[-1] == cfg.eos_token_id:
+            candidate = True  # 文書先頭は min_len に関係なく区切る
+        elif run < cfg.min_patch_len:
             return False
-        if cfg.patching_mode == "utf8":
-            if next_byte_id is None:
-                return False
-            return _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
-        if cfg.patching_mode == "space":
-            return (self.byte_ids[-1] - BYTE_OFFSET) in _SPACE_BYTES
-        return self.prev_entropy > cfg.entropy_threshold
+        elif cfg.patching_mode == "utf8":
+            candidate = next_byte_id is not None and _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
+        elif cfg.patching_mode == "space":
+            candidate = (self.byte_ids[-1] - BYTE_OFFSET) in _SPACE_BYTES
+        else:
+            candidate = self.prev_entropy > cfg.entropy_threshold
+        if not candidate:
+            return False
+        # 予算ガード: これまでに開いた patch 数 (= n_global、BOS 分を除き現 patch を含む) と
+        # 次バイトの位置 len(byte_ids) だけで決まる
+        remaining = max(cfg.max_bytes - len(self.byte_ids), 0)
+        return self.n_global + -(-remaining // cfg.max_patch_len) <= self.m.max_patches
 
     def _push_global(self, g_in: torch.Tensor) -> None:
         g = g_in.to(self.dtype)

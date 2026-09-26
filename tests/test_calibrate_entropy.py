@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import numpy as np
+import torch
+
+from src.model.arbor import compute_patch_starts
 
 
 def _module():
@@ -15,20 +17,19 @@ def _module():
     return module
 
 
-def test_patch_count_respects_min_and_max():
+def test_search_threshold_hits_target_fill_within_budget():
     module = _module()
-    entropy = np.full(32, 10.0, dtype=np.float32)
-    assert module.patch_count(entropy, 0.0, min_len=4, max_len=16) == 8
-    entropy.fill(0.0)
-    assert module.patch_count(entropy, 10.0, min_len=4, max_len=8) == 4
+    g = torch.Generator().manual_seed(0)
+    ent = torch.rand(8, 256, generator=g) * 5.0
+    ids = torch.randint(4, 260, (8, 256), generator=g)
+    budget, max_len = 64, 16
 
+    def counts_at(threshold):
+        starts = compute_patch_starts(ids, "entropy", 1, max_len, entropy_values=ent,
+                                      threshold=threshold, budget=budget, horizon=256)
+        return starts.sum(1).float()
 
-def test_threshold_monotonically_increases_bytes_per_patch():
-    module = _module()
-    rng = np.random.default_rng(0)
-    samples = [rng.uniform(0.0, 5.0, 128).astype(np.float32) for _ in range(8)]
-    low, _ = module.evaluate(samples, 0.5, min_len=3, max_len=16)
-    high, counts = module.evaluate(samples, 4.5, min_len=3, max_len=16)
-    assert low <= high
-    capacity = module.recommend_capacity(counts, context=128, min_len=3)
-    assert int(counts.max()) <= capacity <= 43
+    thr = module.search_threshold(counts_at, 0.9 * budget, -1.0, 6.0, 24)
+    counts = counts_at(thr)
+    assert abs(float(counts.mean()) - 0.9 * budget) <= 2.0
+    assert int(counts.max()) <= budget

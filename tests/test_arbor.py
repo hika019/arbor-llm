@@ -363,7 +363,9 @@ def test_patch_starts_cuda_matches_cpu_reference():
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
     torch.manual_seed(3)
-    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
+    # bitnet=False: BitNet の per-token int8 活性量子化は 1e-7 の数値差でも丸め境界を跨ぐと
+    # 出力が ~1e-3 跳ねるため、境界・KV cache のロジック一致の検証には使えない
+    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg(mode), bitnet=False))).eval()
     ids = torch.randint(4, 260, (26,))
     ids[::5] = 0x20 + 4  # 空白を混ぜて動的境界を発生させる
     gen = ArborByteGenerator(m)
@@ -541,3 +543,116 @@ def test_short_seq_attention_uses_efficient_sdpa(monkeypatch, compiled):
         ref.float().sum().backward()
     assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(grad_eff.float(), x.grad.float(), atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------- 境界: 文書先頭の強制区切り + 予算ガード
+def _check_patch_rules(starts, raw, force, min_len, max_len, budget, horizon):
+    """_patch_starts_reference の出力が規則を満たすこと (独立な検査)."""
+    for r in range(starts.size(0)):
+        pos = starts[r].nonzero().flatten().tolist()
+        assert pos[0] == 0
+        lens = [b - a for a, b in zip(pos, pos[1:] + [starts.size(1)])]
+        assert max(lens) <= max_len
+        if budget:
+            assert len(pos) <= budget
+        for c, p in enumerate(pos[1:], start=1):  # c = p より前に開いていた patch 数
+            if lens[c - 1] == max_len:
+                continue  # max_len 到達の強制境界
+            assert force[r, p] or (raw[r, p] and lens[c - 1] >= min_len)
+            if budget:
+                assert c + -(-max(horizon - p, 0) // max_len) <= budget
+
+
+@pytest.mark.parametrize("budget", [0, 9, 12, 20])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_patch_starts_force_and_budget_rules(budget, seed):
+    from src.model.arbor import _patch_starts_reference
+
+    g = torch.Generator().manual_seed(seed)
+    raw = torch.rand(3, 64, generator=g) < 0.5
+    force = torch.rand(3, 64, generator=g) < 0.05
+    starts = _patch_starts_reference(raw, force, 2, 8, budget, 64)
+    _check_patch_rules(starts, raw, force, 2, 8, budget, 64)
+    if budget == 0:
+        assert all(starts[force].tolist())  # 予算無しなら文書先頭は必ず境界
+
+
+def test_patch_budget_binds_and_never_overflows():
+    """全位置が候補でも patch 数は budget ちょうどに収まる (上限超えのエラーが起きない)."""
+    from src.model.arbor import _patch_starts_reference
+
+    raw = torch.ones(2, 64, dtype=torch.bool)
+    force = torch.zeros_like(raw)
+    starts = _patch_starts_reference(raw, force, 1, 16, 10, 64)
+    assert starts.sum(1).tolist() == [10, 10]
+    free = _patch_starts_reference(raw, force, 1, 16, 0, 64)
+    assert free.sum(1).tolist() == [64, 64]
+
+
+def test_budget_rejects_infeasible_max_patches():
+    with pytest.raises(ValueError, match="max_patches"):
+        ArborModel(ArborConfig.from_dict(dict(tiny_cfg("space"), max_patches=2, max_patch_len=16)))
+
+
+def test_document_start_forces_patch_boundary():
+    eos = 2
+    ids = torch.full((1, 20), ord("a") + 4)
+    ids[0, 6] = eos
+    starts = compute_patch_starts(ids, "space", min_len=4, max_len=16, eos_token_id=eos)
+    assert starts[0].nonzero().flatten().tolist() == [0, 7]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("budget", [0, 16, 30])
+def test_patch_starts_cuda_matches_reference_with_force_and_budget(budget):
+    from src.model.arbor import _patch_starts_reference
+    from src.model.patch_starts_cuda import patch_starts_cuda
+
+    g = torch.Generator().manual_seed(7)
+    raw = torch.rand(4, 173, generator=g) < 0.4
+    force = torch.rand(4, 173, generator=g) < 0.03
+    want = _patch_starts_reference(raw, force, 3, 12, budget, 180)
+    got = patch_starts_cuda(raw.cuda(), force.cuda(), 3, 12, budget, 180).cpu()
+    assert torch.equal(got, want)
+
+
+def _tight_dynamic_cfg(mode):
+    # max_bytes=64, max_patch_len=8 → 予算の下限 8。max_patches=10 で候補の大半を予算で削らせる
+    return dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=8, max_patches=10,
+                entropy_threshold=0.0)
+
+
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
+@pytest.mark.parametrize("pos", [5, 20, 40])
+def test_causality_with_budget_and_documents(mode, pos):
+    """予算ガードが効き、文書境界がある状態でも未来のバイトが過去の logits に漏れない."""
+    torch.manual_seed(11)
+    m = ArborModel(ArborConfig.from_dict(_tight_dynamic_cfg(mode))).eval()
+    a = torch.randint(4, 260, (1, 60))
+    a[0, ::3] = 0x20 + 4
+    a[0, 30] = 2  # EOS: 位置 31 から次の文書
+    b = a.clone()
+    b[0, pos] = (a[0, pos] - 4 + 1) % 256 + 4
+    with torch.inference_mode():
+        la, lb = m(a).logits, m(b).logits
+    assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
+def test_generator_matches_full_forward_with_budget(mode):
+    """逐次生成器の境界判定 (予算ガードが効く状態) がフルフォワードと一致すること.
+
+    EOS は入れない: 生成器は global の文書分離 (新文書は BOS しか見ない) を実装しておらず
+    (static も同じ既存の制約)、プロンプト中の EOS ではフルフォワードと一致しない。
+    """
+    torch.manual_seed(12)
+    m = ArborModel(ArborConfig.from_dict(dict(_tight_dynamic_cfg(mode), bitnet=False))).eval()
+    ids = torch.randint(4, 260, (50,))
+    ids[ids == 2] = 5
+    ids[::3] = 0x20 + 4
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i in range(len(ids)):
+            inc = gen.push(int(ids[i]))
+            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
+            assert torch.allclose(inc, full, atol=2e-4), f"mode={mode} pos={i}"

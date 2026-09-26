@@ -18,11 +18,16 @@ model:
   arch: byte_lm             # 小型 causal バイト LM (Arbor 本体ではない)
   vocab_size: 260
   max_bytes: 32768          # 本体 (8k 本走 / 32k 拡張) の max_bytes 以上にする
-  hidden_size: 512
-  num_heads: 8
+  # ~83M (BLT 本家は 100M / 14 層 / 512 次元 / 窓 512。論文の ablation では 50M 超で頭打ち)。
+  # 本体 1B の学習では毎 micro-step 全バイトに forward するので、コストは約 2×83M FLOP/byte。
+  hidden_size: 768
+  num_heads: 12
   num_kv_heads: 4
-  intermediate_size: 1536
-  num_hidden_layers: 6
+  intermediate_size: 2304
+  num_hidden_layers: 12
+  # 次バイト予測の不確かさは局所文脈でほぼ決まるので直近 512 byte だけを見る (BLT と同じ)。
+  # 全文脈 causal より attention が ~1/8 (8k 系列) になり、学習/推論とも同じ窓で一致する。
+  attention_window: 512
   rope_theta: 10000.0
   bitnet: false             # 境界判定用なので FP の通常 Transformer
   gradient_checkpointing: false
@@ -136,16 +141,23 @@ data:
 optim:
   optimizer: adamw
   state_precision: fp32     # choices: fp32 | int8 | bf8。全parameterのmoment stateへ一様適用
-  lr: 3.0e-4
+  lr: 4.0e-4                # BLT の entropy model 設定と同じ
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 0.0
   grad_clip: 1.0
-  scheduler: cosine_warmup
-  min_lr_ratio: 0.05            # lr 下限 = ピークの 5%
-  decay_end_ratio: 0.6          # 総 step の 60% で下限到達、残りは下限で一定
+  # WSD: stable 区間は lr 一定なので、検証 bpb が頭打ちになった時点で打ち切って
+  # decay だけ回す / total_steps を延ばす、のどちらもできる (本走と同じ運用)。
+  scheduler: wsd
+  decay_start_ratio: 0.8
+  decay_end_ratio: 1.0
+  decay_shape: inv_sqrt
+  min_lr_ratio: 0.02
   warmup_steps: 1000
-  total_steps: 500000
+  # 200k step × (4 × 2) × 8192 byte ≈ 13.1B byte。BLT の公開設定 (100k step × 2×8192 byte/GPU、
+  # 8 GPU なら ~13B byte) と同程度。ByteLM は本体の全規模で使い回すトークナイザ相当なので
+  # 1B 用の最適量ではなく、将来の大きい本体まで見据えた量にしている。
+  total_steps: 200000
 
 speed:
   device: auto              # choices: auto | cuda | mps | cpu
@@ -155,8 +167,11 @@ speed:
   torch_compile: true
   cuda_prefetch: true
   sync_each_step: false
-  micro_batch_size: 8
-  grad_accum_steps: 1
+  # micro 8 だと活性化のピークが 20.6GB になり、4090 (実効 ~21GB) で VRAM が溢れて
+  # WDDM の共有 GPU メモリ (host RAM) に逃げ、1 step 20s・host RSS 21GB になった
+  # (2026-09-26)。1 step の byte 数 (8 × 8192) は保ったまま micro 4 × accum 2 にする。
+  micro_batch_size: 4
+  grad_accum_steps: 2
 
 checkpoint:
   dir: ./checkpoints/entropy_lm
@@ -166,6 +181,42 @@ checkpoint:
 
 sampling:
   enabled: false            # 境界判定用 LM なので生成品質は見ない
+
+# 本走 (Arbor) と同じ 5 ドメインの held-out bpb。頭打ち判定と本体との比較用。
+validation:
+  enabled: true
+  torch_compile: false
+  max_batches: 64
+  micro_batch_size: 2
+  domains:
+    ja_web:
+      source: HuggingFaceFW/fineweb-2
+      name: jpn_Jpan
+      revision: main
+      split: train
+      skip_samples: 200000
+    wikipedia_ja:
+      source: wikimedia/wikipedia
+      name: 20231101.ja
+      revision: main
+      split: train
+      skip_samples: 20000
+    english:
+      source: HuggingFaceFW/fineweb-edu
+      revision: main
+      split: train
+      skip_samples: 200000
+    math:
+      source: HuggingFaceTB/finemath
+      name: finemath-4plus
+      revision: main
+      split: train
+      skip_samples: 20000
+    code:
+      source: OpenCoder-LLM/opc-fineweb-code-corpus
+      revision: main
+      split: train
+      skip_samples: 20000
 
 logging:
   log_every_steps: 50

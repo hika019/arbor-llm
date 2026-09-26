@@ -70,5 +70,11 @@ def _load_extension():
             os.environ["CPLUS_INCLUDE_PATH"] = old_cplus_include
 
 
-def patch_starts_cuda(raw: torch.Tensor, min_len: int, max_len: int) -> torch.Tensor:
-    return _load_extension().patch_starts_cuda(raw.contiguous(), int(min_len), int(max_len))
+def patch_starts_cuda(
+    raw: torch.Tensor, force: torch.Tensor, min_len: int, max_len: int,
+    budget: int = 0, horizon: int = 0,
+) -> torch.Tensor:
+    """規則は src/model/arbor.py の _patch_starts_reference と同一 (budget=0 で予算ガード無し)."""
+    return _load_extension().patch_starts_cuda(
+        raw.contiguous(), force.contiguous(), int(min_len), int(max_len), int(budget), int(horizon)
+    )
