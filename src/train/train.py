@@ -869,6 +869,10 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
     resolved = copy.deepcopy(cfg)
     model_cfg = resolved.setdefault("model", {})
     speed_cfg = resolved.setdefault("speed", {})
+    if "autocast" in speed_cfg:
+        raise ValueError(
+            "speed.autocast は廃止: autocast は speed.precision が bf16/fp16 なら全 device で常に ON"
+        )
     attn_impl = str(model_cfg.get("global_attn_impl", "sdpa")).lower()
     if attn_impl not in {"sdpa", "flex"}:
         raise ValueError(
@@ -1070,16 +1074,6 @@ def resolve_param_dtype(name: str | None, compute_dtype: torch.dtype) -> torch.d
             f"speed.param_dtype={name} は speed.precision と同じか fp32 のみ (計算より低精度では保持しない)"
         )
     return param_dtype
-
-
-def resolve_autocast(speed: dict, default: bool) -> bool:
-    """autocast の明示 override を検証する。文字列等を bool 化しない。"""
-    if "autocast" not in speed:
-        return default
-    value = speed["autocast"]
-    if not isinstance(value, bool):
-        raise TypeError(f"speed.autocast must be bool, got {type(value).__name__}")
-    return value
 
 
 def byte_kind_loss_stats(
@@ -1416,18 +1410,11 @@ def main() -> int:
         from src.model.arbor import build_arbor as build_model
     else:
         raise ValueError(f"unknown model.arch: {arch}")
-    compute_dtype, precision_autocast = resolve_precision(
+    # autocast は bf16/fp16 なら全 device で常に ON (device ごとに数値経路を変えない)。
+    compute_dtype, use_autocast = resolve_precision(
         cfg.get("speed", {}).get("precision", "bf16")
     )
-    # autocast は結果に影響する compute 設定だが、MPS では autocast を挟むと
-    # 実測で遅くなるため、既定は CUDA のみ ON。明示 speed.autocast で上書き可能。
-    default_autocast = precision_autocast and device.type == "cuda"
-    use_autocast = resolve_autocast(cfg.get("speed", {}), default_autocast)
-    if use_autocast and compute_dtype == torch.float32:
-        raise ValueError("speed.autocast=true と speed.precision=fp32 は併用できません")
     param_dtype = resolve_param_dtype(cfg.get("speed", {}).get("param_dtype"), compute_dtype)
-    if param_dtype != compute_dtype and not use_autocast:
-        raise ValueError("speed.param_dtype を計算 dtype と変えるには autocast が必要 (CUDA で speed.autocast を切らないこと)")
     print(f"[train] arch={arch} precision={compute_dtype} param_dtype={param_dtype} autocast={use_autocast}")
     print("[train] building model...")
     timing_mark("before_model_build", device)

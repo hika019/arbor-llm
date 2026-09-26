@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from src.train.train import resolve_precision
-from src.train.train import resolve_autocast
 from src.train.train import resolve_entropy_lm_reference
 from src.train.train import adapt_config_for_device
 from src.train.train import resolve_bitlinear_compute_mode
@@ -139,11 +138,11 @@ def test_resolve_precision_bf8_is_explicit_error_not_silent():
         resolve_precision("bf8")
 
 
-def test_resolve_autocast_requires_real_bool():
-    assert resolve_autocast({}, True) is True
-    assert resolve_autocast({"autocast": False}, True) is False
-    with pytest.raises(TypeError, match="speed.autocast"):
-        resolve_autocast({"autocast": "false"}, True)
+@pytest.mark.parametrize("value", [True, False])
+def test_speed_autocast_is_removed(value):
+    # autocast は precision で決まり全 device で固定。残った設定は黙って無視せず弾く
+    with pytest.raises(ValueError, match="speed.autocast は廃止"):
+        adapt_config_for_device({"speed": {"autocast": value}}, torch.device("cpu"))
 
 
 @pytest.mark.parametrize("device", ["cuda", "mps", "cpu"])
