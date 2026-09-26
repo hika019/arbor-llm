@@ -68,11 +68,12 @@ data:
     - path: "llm-jp/magpie-sft-v1.0"    # 合成の日本語対話 (252MB)。発話を空行でつないで 1 文書
       conversation_column: "conversations"
       weight: 0.02
-    # 話し言葉: ReazonSpeech (TV 放送) の書き起こし 1,922 万発話 ~1.5GB を
-    # scripts/extract_reazonspeech_text.py で公式 tsv から作ったもの (30 発話 = 1 文書)。
+    # 話し言葉: ReazonSpeech v2 (TV 放送) の書き起こし 2,194 万発話 1.63GB (30 発話 = 1 文書)。
+    # 未作成なら学習開始時に公式 tsv から作る (prepare、src/data/prepare.py。完了印があればスキップ)。
     # 著作権法 30 条の 4 の情報解析目的に限る (再配布不可)。
     - path: "parquet"
-      data_files: "/home/hi/datasets/reazonspeech_text/part-*.parquet"
+      data_files: "~/datasets/reazonspeech_text/part-*.parquet"
+      prepare: reazonspeech_v2_text
       id: "reazonspeech_text"
       weight: 0.025
     # ---- 英語 0.10 ----

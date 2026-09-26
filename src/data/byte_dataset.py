@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import mmap
+import os
 import itertools
 import random
 import time
@@ -64,7 +65,18 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
     if spec.get("revision"):
         kwargs["revision"] = spec["revision"]
     if spec.get("data_files"):
-        kwargs["data_files"] = spec["data_files"]
+        data_files = spec["data_files"]
+        if isinstance(data_files, str) and "://" not in data_files:
+            data_files = os.path.expanduser(data_files)   # ローカルは ~ 表記を許す (マシン間で共通の config)
+        if spec.get("prepare"):
+            # HF から直接読めないデータ (例: ReazonSpeech の書き起こし) を data_files の親ディレクトリに
+            # 用意する。完了印があれば何もしない (src/data/prepare.py)
+            from src.data.prepare import ensure_prepared
+
+            if not isinstance(data_files, str):
+                raise ValueError("prepare を使う source の data_files は 1 つの glob 文字列にすること")
+            ensure_prepared(spec["prepare"], Path(data_files).parent)
+        kwargs["data_files"] = data_files
     builder = load_dataset_builder(path, name=name, **kwargs)
     if isinstance(builder.config, ParquetConfig):
         import pyarrow.dataset as pds

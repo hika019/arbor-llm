@@ -1,7 +1,7 @@
 # 構造 A/B (1B・20k step、ゼロから・同じデータ順): E = B + entropy patching (小型 LM 83M、予算 512 patch = static16 と同じ global 計算量)。entropy_threshold は小型 LM 学習後に scripts/calibrate_entropy_threshold.py で校正すること
 # 生成元: configs/arbor.yaml (本走) の total_steps / checkpoint + 上記の model 差分だけを変えたもの
 # 実行: python -m src.train.train --config configs/ab_c/e_entropy.yaml
-# data: 本走の混合 + ReazonSpeech 書き起こし 3%、code 9% → 6%・math 6% → 4% (fineweb2_ja 46.5% → 48.5%)。scripts/extract_reazonspeech_text.py で抽出済みであること
+# data: 本走の混合 + ReazonSpeech 書き起こし 3%、code 9% → 6%・math 6% → 4% (fineweb2_ja 46.5% → 48.5%)。ReazonSpeech は未作成なら学習開始時に自動で用意 (prepare)
 run_name: abc_e_entropy
 seed: 42
 entropy_lm_config: ../entropy_lm.yaml
@@ -62,8 +62,9 @@ data:
     max_epochs: 5
   - id: reazonspeech_text
     path: parquet
-    data_files: /home/hi/datasets/reazonspeech_text/part-*.parquet
+    data_files: ~/datasets/reazonspeech_text/part-*.parquet
     weight_bytes: 0.03
+    prepare: reazonspeech_v2_text
   - id: fineweb_edu_en
     path: HuggingFaceFW/fineweb-edu
     revision: main
