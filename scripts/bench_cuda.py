@@ -211,8 +211,8 @@ def main() -> None:
         n_buf, buf_bytes = prepare_cudagraph_gradient_buffers(model, opt)
         print(f"[bench] cudagraph_grad_buffers=persistent tensors={n_buf} memory={buf_bytes / 2**30:.2f}GiB")
 
-    # train.py と同じく bf16/fp16 は autocast 下で forward する (CUDA のみ)。
-    use_autocast = device.type == "cuda" and dtype != torch.float32
+    # train.py と同じく bf16/fp16 は autocast 下で forward する (device を問わず常に ON)。
+    use_autocast = dtype != torch.float32
 
     def amp_context():
         if use_autocast:
