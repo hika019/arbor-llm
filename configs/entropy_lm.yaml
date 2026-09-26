@@ -187,6 +187,7 @@ speed:
   # (2026-09-26)。1 step の byte 数 (8 × 8192) は保ったまま micro 4 × accum 2 にする。
   micro_batch_size: 4
   grad_accum_steps: 2
+  cpu_prefetch_depth: 6
 
 checkpoint:
   dir: ./checkpoints/entropy_lm
