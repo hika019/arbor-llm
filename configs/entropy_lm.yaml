@@ -28,6 +28,8 @@ model:
   # 次バイト予測の不確かさは局所文脈でほぼ決まるので直近 512 byte だけを見る (BLT と同じ)。
   # 全文脈 causal より attention が ~1/8 (8k 系列) になり、学習/推論とも同じ窓で一致する。
   attention_window: 512
+  sub_norm: false           # FP なので BitNet の SubLN は不要 (BLT と同じ Llama 型)
+  ffn_activation: swiglu
   rope_theta: 10000.0
   bitnet: false             # 境界判定用なので FP の通常 Transformer
   gradient_checkpointing: false

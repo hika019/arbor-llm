@@ -798,3 +798,18 @@ def test_byte_layers_flex_mask_matches_dense_under_compile(window):
         eager = m(x).logits
         compiled = torch.compile(m)(x).logits
     assert (eager - compiled).abs().max().item() < 1e-4
+
+
+def test_bytelm_is_llama_style_by_default():
+    m = ByteLM(dict(TINY_ENTROPY_LM, max_bytes=32))
+    blk = m.layers[0]
+    assert blk.attn.attn_sub_norm is None and blk.ffn.ffn_sub_norm is None
+    assert blk.ffn.activation == "swiglu"
+    old = ByteLM(dict(TINY_ENTROPY_LM, max_bytes=32, sub_norm=True, ffn_activation="relu2"))
+    assert old.layers[0].ffn.ffn_sub_norm is not None and old.layers[0].ffn.activation == "relu2"
+
+
+def test_arbor_blocks_keep_bitnet_subln_relu2():
+    m = ArborModel(ArborConfig.from_dict(TINY))
+    for blk in (m.global_layers[0], m.decoder_layers[0]):
+        assert blk.attn.attn_sub_norm is not None and blk.ffn.activation == "relu2"

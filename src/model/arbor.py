@@ -273,6 +273,7 @@ class Attention(nn.Module):
     def __init__(
         self, dim: int, n_heads: int, n_kv_heads: int, rope: RotaryEmbedding,
         bitnet: bool, norm_eps: float, causal: bool, activation_precision: str = "int8",
+        sub_norm: bool = True,
     ):
         super().__init__()
         if dim % n_heads != 0 or n_heads % n_kv_heads != 0:
@@ -287,7 +288,7 @@ class Attention(nn.Module):
         self.wv = _make_linear(dim, n_kv_heads * self.head_dim, bitnet, activation_precision)
         self.wo = _make_linear(n_heads * self.head_dim, dim, bitnet, activation_precision)
         # SubLN: 出力射影の前に正規化 (BitNet 2B4T の attn_sub_norm)
-        self.attn_sub_norm = RMSNorm(n_heads * self.head_dim, norm_eps)
+        self.attn_sub_norm = RMSNorm(n_heads * self.head_dim, norm_eps) if sub_norm else None
 
     def forward(
         self,
@@ -358,19 +359,25 @@ class Attention(nn.Module):
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal, enable_gqa=native_gqa)
         out = out.transpose(1, 2).reshape(b, t, -1)
-        return self.wo(self.attn_sub_norm(out))
+        if self.attn_sub_norm is not None:
+            out = self.attn_sub_norm(out)
+        return self.wo(out)
 
 
 class FeedForward(nn.Module):
-    """ReLU² gated FFN (BitNet 2B4T): down(subln(relu(gate(x))^2 * up(x)))"""
+    """gated FFN。relu2: down(subln(relu(gate(x))^2 * up(x))) (BitNet 2B4T)、swiglu: down(silu(gate(x)) * up(x))"""
 
     def __init__(self, dim: int, hidden: int, bitnet: bool, norm_eps: float,
-                 activation_precision: str = "int8"):
+                 activation_precision: str = "int8", sub_norm: bool = True,
+                 activation: str = "relu2"):
         super().__init__()
+        if activation not in ("relu2", "swiglu"):
+            raise ValueError(f"unknown ffn activation: {activation!r} (choices: relu2 | swiglu)")
+        self.activation = activation
         self.gate = _make_linear(dim, hidden, bitnet, activation_precision)
         self.up = _make_linear(dim, hidden, bitnet, activation_precision)
         self.down = _make_linear(hidden, dim, bitnet, activation_precision)
-        self.ffn_sub_norm = RMSNorm(hidden, norm_eps)
+        self.ffn_sub_norm = RMSNorm(hidden, norm_eps) if sub_norm else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         group = getattr(self, "_fast_gate_up_group", None)
@@ -378,8 +385,14 @@ class FeedForward(nn.Module):
             gate, up = group(x).split((self.gate.out_features, self.up.out_features), dim=-1)
         else:
             gate, up = self.gate(x), self.up(x)
-        a = F.relu(gate)
-        return self.down(self.ffn_sub_norm(a * a * up))
+        if self.activation == "swiglu":
+            h = F.silu(gate) * up
+        else:
+            a = F.relu(gate)
+            h = a * a * up
+        if self.ffn_sub_norm is not None:
+            h = self.ffn_sub_norm(h)
+        return self.down(h)
 
 
 # flash-linear-attention の chunk_simple_gla (head ごとスカラー減衰の chunk scan、Triton) を
@@ -610,13 +623,13 @@ class Block(nn.Module):
         rope: RotaryEmbedding, bitnet: bool, norm_eps: float, causal: bool,
         activation_precision: str = "int8", mixer: str = "attention",
         ssd_conv_width: int = 4, ssd_chunk: int = 64, ssd_output_gate: bool = True,
-        ssd_backend: str = "auto",
+        ssd_backend: str = "auto", sub_norm: bool = True, ffn_activation: str = "relu2",
     ):
         super().__init__()
         self.attn_norm = RMSNorm(dim, norm_eps)
         if mixer == "attention":
             self.attn = Attention(dim, n_heads, n_kv_heads, rope, bitnet, norm_eps, causal,
-                                  activation_precision)
+                                  activation_precision, sub_norm=sub_norm)
             self.mixer = None
         elif mixer == "ssd":
             if not causal:
@@ -628,7 +641,8 @@ class Block(nn.Module):
         else:
             raise ValueError(f"unknown mixer: {mixer!r} (choices: attention | ssd)")
         self.ffn_norm = RMSNorm(dim, norm_eps)
-        self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps, activation_precision)
+        self.ffn = FeedForward(dim, ffn_hidden, bitnet, norm_eps, activation_precision,
+                               sub_norm=sub_norm, activation=ffn_activation)
 
     @property
     def out_proj_owner(self) -> nn.Module:
@@ -691,7 +705,9 @@ class ByteLM(nn.Module):
         nn.init.trunc_normal_(self.embed.weight, std=0.02, a=-0.06, b=0.06)
         self.layers = nn.ModuleList(
             Block(h, n_heads, n_kv, ffn, rope, bitnet, norm_eps, causal=True,
-                  activation_precision=activation_precision)
+                  activation_precision=activation_precision,
+                  sub_norm=bool(cfg.get("sub_norm", False)),
+                  ffn_activation=cfg.get("ffn_activation", "swiglu"))
             for _ in range(n_layers)
         )
         self.norm = RMSNorm(h, norm_eps)
