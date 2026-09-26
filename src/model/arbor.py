@@ -81,8 +81,6 @@ class WindowMask:
     1 patch の長さは max_patch_len (= w) 以下なので、同一 patch の kv は
     q の前後 w バイト以内に必ず収まる。これを利用して T×T の密マスクの
     代わりに chunk ごとの窓だけを見る (メモリ O(T·窓)、計算 ~T/窓 分の 1)。
-    causal (decoder / ByteLM) は q より後ろの kv を必ずマスクするので、窓を
-    過去側だけ (chunk + w) にして未来側 w 個の計算とメモリを持たない。
     """
 
     mask: torch.Tensor  # (B, n_chunk, chunk, chunk + 2w) bool。causal なら (B, n_chunk, chunk, chunk + w)
@@ -1268,7 +1266,6 @@ class ArborModel(nn.Module):
                 ar_q = torch.arange(c, device=x.device).unsqueeze(1)
                 ar_k = torch.arange(c + 2 * w, device=x.device).unsqueeze(0)
                 enc_mask: torch.Tensor | WindowMask = WindowMask(same_win, c, w)
-                # decoder は causal: 窓の先頭 c + w 列 (kv = i*c - w .. i*c + c - 1) だけを使う
                 dec_mask: torch.Tensor | WindowMask = WindowMask(
                     (same_win & (ar_q + w >= ar_k))[..., :c + w], c, w, causal=True
                 )

@@ -140,14 +140,12 @@ def test_resolve_precision_bf8_is_explicit_error_not_silent():
 
 @pytest.mark.parametrize("value", [True, False])
 def test_speed_autocast_is_removed(value):
-    # autocast は precision で決まり全 device で固定。残った設定は黙って無視せず弾く
     with pytest.raises(ValueError, match="speed.autocast は廃止"):
         adapt_config_for_device({"speed": {"autocast": value}}, torch.device("cpu"))
 
 
 @pytest.mark.parametrize("device", ["cuda", "mps", "cpu"])
 def test_adaptation_does_not_change_config(device):
-    # device に合わせた batch / checkpointing の暗黙の書き換えはしない (足りなければ OOM で落ちる)
     cfg = {
         "model": {"gradient_checkpointing": False},
         "optim": {"optimizer": "adamw", "state_precision": "fp32"},

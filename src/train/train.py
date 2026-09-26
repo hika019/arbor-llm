@@ -861,18 +861,12 @@ def resolve_bitlinear_compute_mode(speed_cfg: dict) -> str:
 
 
 def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
-    """config を device の実行制約に照らして検証し、表記を正規化した copy を返す。
-
-    device に合わせて batch・checkpointing 等の値を暗黙に書き換えることはしない
-    (メモリが足りなければ OOM で落ちる。変えたいなら config 側で明示する)。
-    """
+    """config を device の実行制約に照らして検証し、表記を正規化した copy を返す。"""
     resolved = copy.deepcopy(cfg)
     model_cfg = resolved.setdefault("model", {})
     speed_cfg = resolved.setdefault("speed", {})
     if "autocast" in speed_cfg:
-        raise ValueError(
-            "speed.autocast は廃止: autocast は speed.precision が bf16/fp16 なら全 device で常に ON"
-        )
+        raise ValueError("speed.autocast は廃止。config から削除する")
     attn_impl = str(model_cfg.get("global_attn_impl", "sdpa")).lower()
     if attn_impl not in {"sdpa", "flex"}:
         raise ValueError(
@@ -1410,7 +1404,6 @@ def main() -> int:
         from src.model.arbor import build_arbor as build_model
     else:
         raise ValueError(f"unknown model.arch: {arch}")
-    # autocast は bf16/fp16 なら全 device で常に ON (device ごとに数値経路を変えない)。
     compute_dtype, use_autocast = resolve_precision(
         cfg.get("speed", {}).get("precision", "bf16")
     )
