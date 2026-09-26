@@ -69,10 +69,10 @@ data:
       conversation_column: "conversations"
       weight: 0.02
     # 話し言葉: ReazonSpeech (TV 放送) の書き起こし 1,922 万発話 ~1.5GB を
-    # scripts/extract_reazonspeech_text.py でローカルに抜き出したもの (30 発話 = 1 文書)。
+    # scripts/extract_reazonspeech_text.py で公式 tsv から作ったもの (30 発話 = 1 文書)。
     # 著作権法 30 条の 4 の情報解析目的に限る (再配布不可)。
     - path: "parquet"
-      data_files: "/home/hi/datasets/reazonspeech_text/*/*.parquet"
+      data_files: "/home/hi/datasets/reazonspeech_text/part-*.parquet"
       id: "reazonspeech_text"
       weight: 0.025
     # ---- 英語 0.10 ----

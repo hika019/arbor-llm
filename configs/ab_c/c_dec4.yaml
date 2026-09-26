@@ -60,7 +60,7 @@ data:
     max_epochs: 5
   - id: reazonspeech_text
     path: parquet
-    data_files: /home/hi/datasets/reazonspeech_text/*/*.parquet
+    data_files: /home/hi/datasets/reazonspeech_text/part-*.parquet
     weight_bytes: 0.03
   - id: fineweb_edu_en
     path: HuggingFaceFW/fineweb-edu
