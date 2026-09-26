@@ -463,3 +463,27 @@ def test_exhausted_source_restarts_next_epoch_from_beginning_after_resume(monkey
     # 残り (ccc, ddd) の後、次の周は epoch 1 (逆順) を頭から 4 件すべて読む
     assert got == ["ccc", "ddd", "ddd", "ccc", "bbb", "aaa"]
     assert stream.state_applied == 1  # 復元は resume 時の 1 回だけ
+
+
+def test_parquet_stream_reads_all_rows_in_order_and_resumes(tmp_path):
+    """parquet source (iter_batches 読み) が複数 row group を順に全行返し、state_dict から続きを読めること."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from src.data.byte_dataset import _load_hf_streaming
+
+    path = tmp_path / "part-00000.parquet"
+    texts = [f"doc{i:03d}" for i in range(50)]
+    pq.write_table(pa.table({"text": texts, "extra": list(range(50))}), path, row_group_size=12)
+    spec = {"data_files": str(path), "parquet_batch_rows": 5}
+
+    stream = _load_hf_streaming("parquet", None, "train", spec)
+    assert [row["text"] for row in stream] == texts
+
+    it = iter(stream)
+    head = [next(it)["text"] for _ in range(17)]
+    state = stream.state_dict()
+    resumed = _load_hf_streaming("parquet", None, "train", spec)
+    resumed.load_state_dict(state)
+    assert head + [row["text"] for row in resumed] == texts
+    assert set(next(iter(resumed)).keys()) == {"text"}
