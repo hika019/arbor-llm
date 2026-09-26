@@ -7,7 +7,6 @@ import torch
 
 from src.train.grad_accum import GradAccumSchedule
 from src.train.optim import build_scheduler
-from src.train.train import adapt_config_for_device
 
 
 def test_constant_schedule_when_config_has_no_schedule():
@@ -91,23 +90,6 @@ def test_build_scheduler_applies_lr_scale_to_every_scheduler(name):
     assert scaled[30] == pytest.approx(base[30])
     # warmup 前半は √(1/4) = 0.5 倍
     assert scaled[3] == pytest.approx(base[3] * 0.5)
-
-
-def test_mps_adaptation_scales_schedule_with_micro_batch():
-    cfg = {
-        "model": {"gradient_checkpointing": False},
-        "optim": {"optimizer": "adamw", "state_precision": "fp32"},
-        "speed": {
-            "micro_batch_size": 2,
-            "grad_accum_steps": [[0, 8], [1000, 32]],
-        },
-    }
-    resolved = adapt_config_for_device(cfg, torch.device("mps"))
-    assert resolved["speed"]["grad_accum_steps"] == [[0, 16], [1000, 64]]
-    # 振替後も schedule と定常値の整合が保たれる
-    sched = GradAccumSchedule.from_speed_cfg(resolved["speed"])
-    assert sched.final_accum == 64
-    assert sched.accum_at(0) == 16
 
 
 def test_cumulative_accum_and_bytes_fraction():

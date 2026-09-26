@@ -861,11 +861,10 @@ def resolve_bitlinear_compute_mode(speed_cfg: dict) -> str:
 
 
 def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
-    """単一 config を device の実行制約へ、意味を変えずに適合させる。
+    """config を device の実行制約に照らして検証し、表記を正規化した copy を返す。
 
-    MPS では 1B/8K の activation memory を抑えるため checkpointing と
-    micro-batch=1 を使い、grad_accum を同率で増やして effective batch を保つ。
-    optimizer、state_precision、モデル形状、データ混合は変更しない。
+    device に合わせて batch・checkpointing 等の値を暗黙に書き換えることはしない
+    (メモリが足りなければ OOM で落ちる。変えたいなら config 側で明示する)。
     """
     resolved = copy.deepcopy(cfg)
     model_cfg = resolved.setdefault("model", {})
@@ -1027,31 +1026,6 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             "unknown speed.bitlinear_ternary_wgrad_backend: "
             f"{ternary_wgrad_backend!r} (choices: int8 | fp8 | auto)"
         )
-    if device.type != "mps":
-        return resolved
-
-    if not model_cfg.get("gradient_checkpointing", False):
-        model_cfg["gradient_checkpointing"] = True
-        print("[train] MPS: gradient_checkpointing=ON (model shape/precision unchanged)")
-
-    micro_batch = int(speed_cfg.get("micro_batch_size", 1))
-    schedule = GradAccumSchedule.from_speed_cfg(speed_cfg)
-    if micro_batch > 1:
-        speed_cfg["micro_batch_size"] = 1
-        scaled = schedule.scaled(micro_batch)
-        speed_cfg["grad_accum_steps"] = (
-            scaled.final_accum if scaled.is_constant else [list(pt) for pt in scaled.points]
-        )
-        print(
-            "[train] MPS: micro_batch_size=1 grad_accum_steps={} "
-            "(effective batch preserved: {} sequences)".format(
-                speed_cfg["grad_accum_steps"], micro_batch * schedule.final_accum
-            )
-        )
-
-    validation_cfg = resolved.get("validation")
-    if isinstance(validation_cfg, dict):
-        validation_cfg["micro_batch_size"] = 1
     return resolved
 
 
