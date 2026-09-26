@@ -25,6 +25,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from src.eval.cloze import CLOZE_TASKS, evaluate_cloze  # noqa: E402
 from src.eval.multiple_choice import evaluate_mc, selftest  # noqa: E402
 from src.eval.tasks import TASKS, format_fewshot_prefix, sample_fewshot  # noqa: E402
 from src.model.arbor import build_arbor  # noqa: E402
@@ -54,7 +55,8 @@ def main() -> int:
     p.add_argument("--ckpt", action="append", required=True, type=Path,
                    help="checkpoint ディレクトリ。複数指定で横並び比較")
     p.add_argument("--tasks", default="jcommonsenseqa", help="カンマ区切り")
-    p.add_argument("--num-fewshot", type=int, default=3)
+    p.add_argument("--num-fewshot", type=int, default=None,
+                   help="全タスク共通で上書き。未指定ならタスク既定 (JCQA 3 / 他 0 = lm-eval 準拠)")
     p.add_argument("--limit", type=int, default=None, help="評価問題数の上限 (試走用)")
     p.add_argument("--batch-size", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
@@ -69,15 +71,25 @@ def main() -> int:
 
     task_names = [t.strip() for t in args.tasks.split(",") if t.strip()]
     for name in task_names:
-        if name not in TASKS:
-            raise SystemExit(f"unknown task: {name} (available: {', '.join(TASKS)})")
+        if name not in TASKS and name not in CLOZE_TASKS:
+            raise SystemExit(
+                f"unknown task: {name} (available: {', '.join([*TASKS, *CLOZE_TASKS])})"
+            )
 
     # データは checkpoint 間で共有 (同じ問題・同じ few-shot 例で比較する)
     prepared = {}
     for name in task_names:
+        if name in CLOZE_TASKS:
+            eval_docs = CLOZE_TASKS[name].load()
+            if args.limit:
+                eval_docs = eval_docs[: args.limit]
+            prepared[name] = (eval_docs, None)
+            print(f"[data] {name}: eval={len(eval_docs)}問 (cloze: greedy 完全一致)")
+            continue
         task = TASKS[name]
         eval_docs = task.load(task.eval_split)
-        shots = sample_fewshot(task.load(task.fewshot_split), args.num_fewshot, args.seed)
+        k = task.num_fewshot if args.num_fewshot is None else args.num_fewshot
+        shots = sample_fewshot(task.load(task.fewshot_split), k, args.seed) if k > 0 else []
         if args.limit:
             eval_docs = eval_docs[: args.limit]
         prepared[name] = (eval_docs, format_fewshot_prefix(shots))
@@ -109,6 +121,12 @@ def main() -> int:
         results[tag] = {}
         for name in task_names:
             docs, prefix = prepared[name]
+            if name in CLOZE_TASKS:
+                m = evaluate_cloze(model, docs, device=device, dtype=dtype,
+                                   batch_size=args.batch_size, patch_size=patch_size)
+                results[tag][name] = m
+                print(f"  {name}: acc={m['acc']:.3f} target_bpb={m['target_bpb']:.4f} (n={m['n']})")
+                continue
             m = evaluate_mc(model, docs, prefix, device=device, dtype=dtype,
                             batch_size=args.batch_size, patch_size=patch_size)
             results[tag][name] = m
@@ -127,6 +145,9 @@ def main() -> int:
             print(f"--- {name}")
             for tag, r in results.items():
                 m = r[name]
+                if name in CLOZE_TASKS:
+                    print(f"  {tag:>28}  acc={m['acc']:.3f}  target_bpb={m['target_bpb']:.4f}")
+                    continue
                 print(f"  {tag:>28}  acc={m['acc']:.3f}  acc_norm={m['acc_norm']:.3f}  "
                       f"margin_mean={m['margin_mean']:+.4f}  margin={m['margin']:+.4f}  "
                       f"gold_bpb={m['gold_bpb']:.4f}")

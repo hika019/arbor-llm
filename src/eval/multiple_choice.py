@@ -52,8 +52,8 @@ def _ids(text: str) -> list[int]:
 def _build_seqs(docs: list[MCDoc], prefix: str) -> list[_Seq]:
     seqs: list[_Seq] = []
     for d_i, doc in enumerate(docs):
-        for c_i, choice in enumerate(doc.choices):
-            context, continuation = format_doc(doc, choice)
+        for c_i in range(len(doc.choices)):
+            context, continuation = format_doc(doc, c_i)
             ctx_ids = _ids(prefix + context)
             tgt_ids = _ids(continuation)
             if not tgt_ids:
