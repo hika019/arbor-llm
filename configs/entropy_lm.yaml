@@ -175,6 +175,7 @@ optim:
 speed:
   device: auto              # choices: auto | cuda | mps | cpu
   precision: bf16           # 計算dtype。choices: bf16 | fp16 | fp32 (bf8 非対応)
+  param_dtype: fp32         # parameter は fp32 で保持し計算だけ bf16 (BLT の ByteLM と同じ)
   tf32_matmul: true
   cudnn_benchmark: false
   torch_compile: true

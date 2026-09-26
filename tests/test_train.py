@@ -1121,3 +1121,17 @@ def test_threaded_batch_prefetcher_close_unblocks_full_buffer():
     _drain(pf, 3)
     pf.close()  # worker が buffer 満杯待ちでも deadlock しない
     assert not pf._thread.is_alive()
+
+
+def test_resolve_param_dtype():
+    import torch
+
+    from src.train.train import resolve_param_dtype
+
+    assert resolve_param_dtype(None, torch.bfloat16) is torch.bfloat16      # 未指定は純 bf16
+    assert resolve_param_dtype("fp32", torch.bfloat16) is torch.float32     # fp32 保持 + bf16 計算
+    assert resolve_param_dtype("bf16", torch.bfloat16) is torch.bfloat16
+    with pytest.raises(ValueError):
+        resolve_param_dtype("bf16", torch.float32)                          # 計算より低精度は不可
+    with pytest.raises(ValueError):
+        resolve_param_dtype("int8", torch.bfloat16)

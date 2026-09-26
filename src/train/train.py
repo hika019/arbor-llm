@@ -1076,6 +1076,28 @@ def resolve_precision(name: str) -> tuple[torch.dtype, bool]:
     raise ValueError(f"unknown speed.precision: {name} (choices: bf16 | fp16 | fp32)")
 
 
+def resolve_param_dtype(name: str | None, compute_dtype: torch.dtype) -> torch.dtype:
+    """speed.param_dtype (parameter の保持 dtype)。未指定は計算 dtype と同じ (純 bf16 学習).
+
+    fp32 を指定すると parameter と optimizer の更新は fp32、forward/backward は autocast で
+    計算 dtype (bf16) になる (BLT の ByteLM と同じ mixed precision)。計算より低い精度での保持は不可。
+    """
+    if name is None:
+        return compute_dtype
+    table = {"fp32": torch.float32, "float32": torch.float32,
+             "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+             "fp16": torch.float16, "float16": torch.float16}
+    key = str(name).lower()
+    if key not in table:
+        raise ValueError(f"unknown speed.param_dtype: {name} (choices: fp32 | bf16 | fp16)")
+    param_dtype = table[key]
+    if param_dtype != compute_dtype and param_dtype != torch.float32:
+        raise ValueError(
+            f"speed.param_dtype={name} は speed.precision と同じか fp32 のみ (計算より低精度では保持しない)"
+        )
+    return param_dtype
+
+
 def resolve_autocast(speed: dict, default: bool) -> bool:
     """autocast の明示 override を検証する。文字列等を bool 化しない。"""
     if "autocast" not in speed:
@@ -1429,11 +1451,14 @@ def main() -> int:
     use_autocast = resolve_autocast(cfg.get("speed", {}), default_autocast)
     if use_autocast and compute_dtype == torch.float32:
         raise ValueError("speed.autocast=true と speed.precision=fp32 は併用できません")
-    print(f"[train] arch={arch} precision={compute_dtype} autocast={use_autocast}")
+    param_dtype = resolve_param_dtype(cfg.get("speed", {}).get("param_dtype"), compute_dtype)
+    if param_dtype != compute_dtype and not use_autocast:
+        raise ValueError("speed.param_dtype を計算 dtype と変えるには autocast が必要 (CUDA で speed.autocast を切らないこと)")
+    print(f"[train] arch={arch} precision={compute_dtype} param_dtype={param_dtype} autocast={use_autocast}")
     print("[train] building model...")
     timing_mark("before_model_build", device)
     t0 = time.perf_counter()
-    model = build_model(cfg["model"]).to(device=device, dtype=compute_dtype)
+    model = build_model(cfg["model"]).to(device=device, dtype=param_dtype)
     print(f"[train] model built and moved to {device} in {time.perf_counter() - t0:.1f}s")
     timing_mark("model_build_to_device", device)
     # checkpoint 保存とサンプル生成は compile 前のモデルで行う
