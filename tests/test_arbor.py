@@ -656,3 +656,126 @@ def test_generator_matches_full_forward_with_budget(mode):
             inc = gen.push(int(ids[i]))
             full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
             assert torch.allclose(inc, full, atol=2e-4), f"mode={mode} pos={i}"
+
+
+# ---------------------------------------------------------------- byte 層 (全文脈 causal の byte 単位 attention)
+def _byte_cfg(mode, window=None, n=2, **over):
+    cfg = dict(tiny_cfg(mode), num_byte_layers=n, byte_attn_window=window)
+    if mode != "static":
+        cfg.update(min_patch_len=1, max_patch_len=8)
+    cfg.update(over)
+    return cfg
+
+
+@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
+@pytest.mark.parametrize("window", [None, 5])
+def test_byte_layers_forward_and_grads(mode, window):
+    torch.manual_seed(0)
+    m = ArborModel(ArborConfig.from_dict(_byte_cfg(mode, window)))
+    x = torch.randint(4, 260, (2, 30))
+    x[0, 10] = 2  # 文書境界
+    out = m(x)
+    assert out.logits.shape == (2, 30, 260)
+    out.logits.float().square().mean().backward()
+    missing = [n for n, p in m.named_parameters()
+               if p.requires_grad and n.startswith("byte_layers") and p.grad is None]
+    assert not missing, missing
+
+
+@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
+@pytest.mark.parametrize("window", [None, 6])
+@pytest.mark.parametrize("pos", [4, 13, 29])
+def test_byte_layers_causality(mode, window, pos):
+    torch.manual_seed(1)
+    m = ArborModel(ArborConfig.from_dict(_byte_cfg(mode, window))).eval()
+    a = torch.randint(4, 260, (1, 40))
+    a[0, ::5] = 0x20 + 4
+    a[0, 20] = 2
+    b = a.clone()
+    b[0, pos] = (a[0, pos] - 4 + 1) % 256 + 4
+    with torch.inference_mode():
+        la, lb = m(a).logits, m(b).logits
+    assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5)
+    assert not torch.allclose(la[:, pos:], lb[:, pos:], atol=1e-5)
+
+
+def test_byte_layers_see_far_past_bytes_directly():
+    """byte 層があると、同じ patch に属さない遠い byte が patch 内 decoder を経ずに効く.
+
+    global を切った (出力 0) モデルでも、byte 層経由で過去 patch の byte が後ろの logits を変える。
+    byte 層無しなら global を切ると patch を跨ぐ情報は完全に途切れる (対照)。
+    """
+    torch.manual_seed(2)
+    x = torch.randint(4, 260, (1, 32))
+    y = x.clone()
+    y[0, 1] = (x[0, 1] - 4 + 1) % 256 + 4  # patch 0 の byte
+    for n_byte, expect_change in ((1, True), (0, False)):
+        m = ArborModel(ArborConfig.from_dict(dict(TINY, num_byte_layers=n_byte))).eval()
+        with torch.no_grad():
+            m.global_to_local.weight.zero_()  # global の寄与を消す
+            la, lb = m(x).logits, m(y).logits
+        changed = not torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-6)
+        assert changed == expect_change, f"num_byte_layers={n_byte}"
+
+
+def test_byte_layers_document_isolation():
+    torch.manual_seed(3)
+    m = ArborModel(ArborConfig.from_dict(_byte_cfg("static"))).eval()
+    a = torch.randint(4, 260, (1, 16))
+    a[0, 7] = 2
+    b = a.clone()
+    b[0, 2] = (a[0, 2] - 4 + 1) % 256 + 4
+    with torch.inference_mode():
+        la, lb = m(a).logits, m(b).logits
+    assert torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-5), "doc1 の変更が byte 層経由で doc2 に漏れている"
+
+
+@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
+@pytest.mark.parametrize("window", [None, 5])
+def test_generator_matches_full_forward_with_byte_layers(mode, window):
+    torch.manual_seed(4)
+    m = ArborModel(ArborConfig.from_dict(_byte_cfg(mode, window, bitnet=False))).eval()
+    ids = torch.randint(4, 260, (30,))
+    ids[ids == 2] = 5
+    ids[::4] = 0x20 + 4
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i in range(len(ids)):
+            inc = gen.push(int(ids[i]))
+            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
+            assert torch.allclose(inc, full, atol=2e-5), f"mode={mode} window={window} pos={i}"
+
+
+def test_generator_rebuild_with_byte_layers():
+    torch.manual_seed(5)
+    m = ArborModel(ArborConfig.from_dict(dict(TINY, max_bytes=16, num_byte_layers=1))).eval()
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i in range(40):
+            logits = gen.push(4 + (i * 7) % 256)
+    assert torch.isfinite(logits).all() and len(gen.byte_ids) <= 16
+
+
+def test_local_bitnet_switch():
+    from src.model.bitlinear import BitLinear
+
+    m = ArborModel(ArborConfig.from_dict(dict(TINY, num_byte_layers=1, local_bitnet=False)))
+    for name in ("encoder_layers", "byte_layers", "decoder_layers"):
+        assert not any(isinstance(x, BitLinear) for x in getattr(m, name).modules()), name
+    assert any(isinstance(x, BitLinear) for x in m.global_layers.modules())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("window", [None, 40])
+def test_byte_layers_flex_mask_matches_dense_under_compile(window):
+    """compile 下の flex BlockMask 経路が eager の密 mask 経路と一致すること (fp32)."""
+    torch.manual_seed(6)
+    cfg = dict(TINY, max_bytes=256, num_byte_layers=2, byte_attn_window=window, bitnet=False)
+    m = ArborModel(ArborConfig.from_dict(cfg)).cuda().eval()
+    x = torch.randint(4, 260, (2, 256), device="cuda")
+    x[0, 100] = 2
+    x[1, 37] = 2
+    with torch.no_grad():
+        eager = m(x).logits
+        compiled = torch.compile(m)(x).logits
+    assert (eager - compiled).abs().max().item() < 1e-4

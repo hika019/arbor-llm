@@ -50,6 +50,7 @@ _ARBOR_FIELDS = (
     "num_hidden_layers",
     "local_hidden_size", "local_num_heads", "local_num_kv_heads",
     "local_intermediate_size", "num_local_encoder_layers", "num_local_decoder_layers",
+    "num_byte_layers", "byte_attn_window", "local_bitnet", "max_patches",
     "rope_theta", "rope_theta_global", "rope_theta_local", "norm_eps", "bitnet",
 )
 

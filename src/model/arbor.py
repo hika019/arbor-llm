@@ -135,6 +135,16 @@ class ArborConfig:
     local_intermediate_size: int = 1280
     num_local_encoder_layers: int = 1
     num_local_decoder_layers: int = 3
+    # byte 層: global の出力を足した直後、patch 内 decoder の前に置く「全文脈 causal」の
+    # byte 単位 attention 層 (文書内に閉じる)。patch 単位の global だけだと遠くの情報は
+    # patch ごとに 1 回・1 本のベクトルでしか届かず、逐語コピーの誤りが patch 内位置
+    # (= global 情報の古さ) とともに単調に増える (2026-09-26 実測)。byte 層は各 byte が
+    # 過去の byte を直接参照できるようにする。0 で無効 (従来構造)。
+    num_byte_layers: int = 0
+    byte_attn_window: int | None = None   # None = 文書内の全文脈、N = 直近 N byte
+    # local 層 (encoder / byte 層 / decoder) の Linear を BitLinear にするか。None は bitnet に従う。
+    # local は ~20M と小さく 3 値化のメモリ利得がほぼ無い一方、byte 精度を落とす可能性がある。
+    local_bitnet: bool | None = None
     # ---- global (patch 階層) ----
     hidden_size: int = 2048
     num_heads: int = 16
@@ -955,11 +965,16 @@ class ArborModel(nn.Module):
             theta_local,
         )
         global_rope = RotaryEmbedding(dg // cfg.num_heads, self.max_patches, theta_global)
+        local_bitnet = cfg.bitnet if cfg.local_bitnet is None else bool(cfg.local_bitnet)
+        if cfg.num_byte_layers < 0:
+            raise ValueError(f"num_byte_layers must be >= 0, got {cfg.num_byte_layers}")
+        if cfg.byte_attn_window is not None and cfg.byte_attn_window <= 0:
+            raise ValueError(f"byte_attn_window must be positive or None, got {cfg.byte_attn_window}")
 
         # Local Encoder: patch 内 bidirectional (patch 表現は次 patch 以降でしか使わない)
         self.encoder_layers = nn.ModuleList(
             Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
-                  cfg.local_intermediate_size, local_rope, cfg.bitnet, cfg.norm_eps,
+                  cfg.local_intermediate_size, local_rope, local_bitnet, cfg.norm_eps,
                   causal=False, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_encoder_layers)
         )
@@ -996,9 +1011,17 @@ class ArborModel(nn.Module):
         self.global_to_local = nn.Linear(dg, dl, bias=False)  # FP
         nn.init.trunc_normal_(self.global_to_local.weight, std=0.02, a=-0.06, b=0.06)
 
+        # byte 層: 系列全体 (flat な byte 列) を見るので RoPE は絶対 byte 位置 (max_bytes)
+        byte_rope = RotaryEmbedding(dl // cfg.local_num_heads, cfg.max_bytes, theta_local)
+        self.byte_layers = nn.ModuleList(
+            Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
+                  cfg.local_intermediate_size, byte_rope, local_bitnet, cfg.norm_eps,
+                  causal=True, activation_precision=cfg.activation_precision)
+            for _ in range(cfg.num_byte_layers)
+        )
         self.decoder_layers = nn.ModuleList(
             Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
-                  cfg.local_intermediate_size, local_rope, cfg.bitnet, cfg.norm_eps,
+                  cfg.local_intermediate_size, local_rope, local_bitnet, cfg.norm_eps,
                   causal=True, activation_precision=cfg.activation_precision)
             for _ in range(cfg.num_local_decoder_layers)
         )
@@ -1007,7 +1030,7 @@ class ArborModel(nn.Module):
         nn.init.trunc_normal_(self.head.weight, std=0.02, a=-0.06, b=0.06)
 
         _scale_residual_projections(
-            [self.encoder_layers, self.global_layers, self.decoder_layers]
+            [self.encoder_layers, self.global_layers, self.byte_layers, self.decoder_layers]
         )
 
         # entropy 用の凍結 ByteLM (checkpoint に同梱される)
@@ -1152,10 +1175,12 @@ class ArborModel(nn.Module):
             patches, self._global_mask(patch_doc), patch_doc
         )  # (B, K, dl)
 
-        # Local Decoder: byte_emb[i] + h_patch(i) を patch 内 causal で
+        # Local Decoder: byte_emb[i] + h_patch(i) を (byte 層で全文脈 →) patch 内 causal で
         d = x.view(b, k, p, -1) + g.unsqueeze(2)
         if os.environ.get("ARBOR_DEBUG_CONTEXT", "0") == "1":
             self._debug_context_contribution(x, g, d)
+        if len(self.byte_layers):
+            d = self._run_byte_layers(d.view(b, k * p, -1), input_ids)
         d = d.view(b * k, p, -1)
         for layer in self.decoder_layers:
             d = self._maybe_ckpt(layer, d)
@@ -1285,10 +1310,12 @@ class ArborModel(nn.Module):
             )  # (B, K, dl)
             h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
 
-            # Local Decoder: patch 内 causal (block 対角 ∧ 下三角)
+            # Local Decoder: (byte 層で全文脈 →) patch 内 causal (block 対角 ∧ 下三角)
             d = x + h_byte
             if os.environ.get("ARBOR_DEBUG_CONTEXT", "0") == "1":
                 self._debug_context_contribution(x, h_byte, d)
+            if len(self.byte_layers):
+                d = self._run_byte_layers(d, input_ids)
             for layer in self.decoder_layers:
                 d = self._maybe_ckpt(layer, d, dec_mask)
             return self.head(self.head_norm(d))
@@ -1344,6 +1371,43 @@ class ArborModel(nn.Module):
         section_ms["patch_id_max"] = float(patch_id.max().cpu() + 1)
         return section_ms
 
+    def _byte_attn_mask(self, input_ids: torch.Tensor):
+        """byte 層の mask: causal ∧ 同一文書 (∧ 直近 byte_attn_window byte).
+
+        compile 下の CUDA では flex_attention の BlockMask (窓外・文書外の block を丸ごと
+        飛ばす fused kernel)、それ以外 (eager / CPU / 評価) は同じ規則の密 bool mask。
+        文書境界も窓も無い入力では None を返し、Attention 側の素の causal (flash) を使う。
+        """
+        b, t = input_ids.shape
+        w = self.cfg.byte_attn_window
+        doc = self._byte_doc_ids(input_ids)                       # (B, T)
+        if input_ids.is_cuda and torch.compiler.is_compiling():
+            from torch.nn.attention.flex_attention import create_block_mask
+
+            def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+                keep = (kv_idx <= q_idx) & (doc[b_idx, q_idx] == doc[b_idx, kv_idx])
+                if w is not None:
+                    keep = keep & (q_idx - kv_idx < w)
+                return keep
+
+            return create_block_mask(mask_mod, B=b, H=None, Q_LEN=t, KV_LEN=t,
+                                     device=input_ids.device)
+        if w is None and not bool((doc[:, -1] != doc[:, 0]).any()):
+            return None
+        q = torch.arange(t, device=input_ids.device).view(t, 1)
+        kv = torch.arange(t, device=input_ids.device).view(1, t)
+        allow = (kv <= q).unsqueeze(0) & (doc.unsqueeze(2) == doc.unsqueeze(1))
+        if w is not None:
+            allow = allow & (q - kv < w).unsqueeze(0)
+        return allow.unsqueeze(1)                                # (B, 1, T, T)
+
+    def _run_byte_layers(self, d: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """d: (B, T, dl) の flat byte 列に byte 層 (全文脈 causal、文書内) を通す."""
+        mask = self._byte_attn_mask(input_ids)
+        for layer in self.byte_layers:
+            d = self._maybe_ckpt(layer, d, mask)
+        return d
+
     def _run_global(
         self,
         patches: torch.Tensor,
@@ -1391,6 +1455,7 @@ class ArborModel(nn.Module):
             "global": sum(count(m) for m in self.global_layers),
             "local_encoder": sum(count(m) for m in self.encoder_layers),
             "local_decoder": sum(count(m) for m in self.decoder_layers),
+            "local_byte": sum(count(m) for m in self.byte_layers),
             "embedding_head": count(self.byte_emb) + count(self.head)
             + count(self.patch_proj) + count(self.global_to_local),
             "entropy_model": count(self.entropy_model),
@@ -1438,6 +1503,10 @@ class ArborByteGenerator:
         if self.cfg.patching_mode == "entropy":
             self.lm_caches = [_LayerKVCache() for _ in self.m.entropy_model.layers]
             self.prev_entropy = 0.0
+        # byte 層: 全 byte の KV cache を持ち、新しい byte の分だけ増分計算する。
+        # 出力 (decoder 入力) は現 patch 分だけ保持して patch 内 decoder に渡す
+        self.byte_caches = [_LayerKVCache() for _ in self.m.byte_layers]
+        self.cur_dec_in: list[torch.Tensor] = []
         self._push_global(self.m.global_bos.view(1, 1, -1))
 
     @torch.inference_mode()
@@ -1455,13 +1524,26 @@ class ArborByteGenerator:
     def push(self, byte_id: int) -> torch.Tensor:
         if len(self.byte_ids) >= self.cfg.max_bytes:
             self._rebuild(keep=self.cfg.max_bytes // 2)
+        self._append_byte(byte_id)
+        return self._decode_current()
+
+    def _append_byte(self, byte_id: int) -> None:
+        """1 byte 進める (patch 確定・ByteLM・byte 層の状態更新)。logits は計算しない."""
         if self._starts_new_patch(byte_id):
             self._commit_patch()
         self.cur_patch.append(byte_id)
         self.byte_ids.append(byte_id)
         if self.cfg.patching_mode == "entropy":
             self._advance_entropy_lm(byte_id)
-        return self._decode_current()
+        # decoder 入力 = byte_emb + 現 patch の global 文脈 (+ byte 層)。h_cur は patch 確定後の値
+        pos = len(self.byte_ids) - 1
+        d = self.m.byte_emb(torch.tensor([[byte_id]], dtype=torch.long, device=self.device)) + self.h_cur
+        window = self.cfg.byte_attn_window
+        for layer, cache in zip(self.m.byte_layers, self.byte_caches):
+            if window is not None:
+                cache.trim(max(0, window - 1))
+            d = layer(d, kv_cache=cache, pos_offset=pos)
+        self.cur_dec_in.append(d)
 
     # ----------------------------------------------------------- internal
     def _starts_new_patch(self, next_byte_id: int | None = None) -> bool:
@@ -1514,10 +1596,10 @@ class ArborByteGenerator:
         self._push_global(patch_emb.view(1, 1, -1))
         self.cur_patch_start += len(self.cur_patch)
         self.cur_patch = []
+        self.cur_dec_in = []
 
     def _decode_current(self) -> torch.Tensor:
-        ids = torch.tensor([self.cur_patch], dtype=torch.long, device=self.device)
-        d = self.m.byte_emb(ids) + self.h_cur
+        d = torch.cat(self.cur_dec_in, dim=1)  # (1, 現 patch 長, dl)
         pos = 0 if not self.m.dynamic else self.cur_patch_start
         for layer in self.m.decoder_layers:
             d = layer(d, pos_offset=pos)  # causal (<= max_patch_len トークン)
@@ -1539,12 +1621,7 @@ class ArborByteGenerator:
         tail = self.byte_ids[-keep:]
         self.reset()
         for byte_id in tail:
-            if self._starts_new_patch(byte_id):
-                self._commit_patch()
-            self.cur_patch.append(byte_id)
-            self.byte_ids.append(byte_id)
-            if self.cfg.patching_mode == "entropy":
-                self._advance_entropy_lm(byte_id)
+            self._append_byte(byte_id)
         # 次の push/_decode_current から通常運転
 
 
@@ -1589,7 +1666,10 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
     print(
         f"[arbor] params={counts['total'] / 1e6:.1f}M "
         f"(global={counts['global'] / 1e6:.1f}M local_enc={counts['local_encoder'] / 1e6:.1f}M "
-        f"local_dec={counts['local_decoder'] / 1e6:.1f}M emb/head={counts['embedding_head'] / 1e6:.1f}M "
+        f"local_dec={counts['local_decoder'] / 1e6:.1f}M "
+        + (f"byte_layers={cfg.num_byte_layers}x({counts['local_byte'] / max(cfg.num_byte_layers, 1) / 1e6:.1f}M, "
+           f"window={cfg.byte_attn_window or 'doc'}) " if cfg.num_byte_layers else "")
+        + f"emb/head={counts['embedding_head'] / 1e6:.1f}M "
         f"entropy_lm={counts['entropy_model'] / 1e6:.1f}M) "
         f"patching={cfg.patching_mode} bitnet={'ON' if cfg.bitnet else 'OFF'} "
         f"bitlinear_layers={n_bit} "
