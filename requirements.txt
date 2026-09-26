@@ -9,6 +9,7 @@ numpy>=1.26          # RNG state 保存ほか
 safetensors>=0.4.3   # checkpoint の重み保存
 datasets==4.8.5       # HF streaming (state_dict resume には >=2.18 必須)
 zstandard>=0.22      # HF 生ファイル (.jsonl.zst) の streaming 展開 (entropy_lm の proof-pile-2 arxiv)
+pyarrow==25.0.1       # parquet 直接読み書き (src/data/prepare.py の ReazonSpeech 変換、HF streaming の scan 設定)
 # cuBLASLt FP8 dW 直接累積拡張 (src/model/csrc/fp8_wgrad_lt.cpp) の build に必要な
 # CUDA header (crt/, nv/target)。torch の CUDA major (cu13 なら 13.0.*) に合わせる。
 nvidia-cuda-nvcc==13.0.*

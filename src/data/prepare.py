@@ -11,7 +11,7 @@ HF から直接 streaming できないデータ (音声コーパスの書き起�
 from __future__ import annotations
 
 import shutil
-import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Callable
 
@@ -47,7 +47,8 @@ def build_reazonspeech_v2_text(
         tsv_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"[prepare] downloading {REAZON_TSV_URL} -> {tsv_path}", flush=True)
         tmp = tsv_path.with_name(tsv_path.name + ".tmp")
-        subprocess.run(["curl", "-sSL", "--fail", "-o", str(tmp), REAZON_TSV_URL], check=True)
+        with urllib.request.urlopen(REAZON_TSV_URL, timeout=60) as resp, tmp.open("wb") as f:
+            shutil.copyfileobj(resp, f, length=1 << 20)
         tmp.rename(tsv_path)
 
     work = out_dir.with_name(out_dir.name + ".tmp")

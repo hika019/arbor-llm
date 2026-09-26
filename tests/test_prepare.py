@@ -16,7 +16,7 @@ def test_reazonspeech_builds_docs_and_skips_when_complete(tmp_path, monkeypatch)
     tsv = tmp_path / "reazonspeech_v2_all.tsv"
     _write_tsv(tsv, 70)
     out = tmp_path / "reazonspeech_text"
-    monkeypatch.setattr(prepare.subprocess, "run", lambda *a, **k: pytest.fail("tsv があるのにダウンロードした"))
+    monkeypatch.setattr(prepare.urllib.request, "urlopen", lambda *a, **k: pytest.fail("tsv があるのにダウンロードした"))
     prepare.ensure_prepared("reazonspeech_v2_text", out)
     docs = [d for f in sorted(out.glob("part-*.parquet")) for d in pq.read_table(f).column("text").to_pylist()]
     assert len(docs) == 3                          # 30 + 30 + 10 発話 (空の書き起こしは捨てる)
