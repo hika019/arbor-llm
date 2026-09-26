@@ -1,29 +1,18 @@
-# PyTorch は CUDA 版を別途インストールする (README 参照):
-#   pip install torch --index-url https://download.pytorch.org/whl/cu128
-# 学習検証済み: torch 2.11+cu128 / Python 3.12 (RTX 4090, WSL2)
-# Python 3.13.15: project-local interpreterでproject sourceのcompileall確認済み
-
-# ---- 学習コア ----
-pyyaml>=6.0          # config 読み込み
-numpy>=1.26          # RNG state 保存ほか
-safetensors>=0.4.3   # checkpoint の重み保存
-datasets==4.8.5       # HF streaming (state_dict resume には >=2.18 必須)
-zstandard>=0.22      # HF 生ファイル (.jsonl.zst) の streaming 展開 (entropy_lm の proof-pile-2 arxiv)
-pyarrow==25.0.1       # parquet 直接読み書き (src/data/prepare.py の ReazonSpeech 変換、HF streaming の scan 設定)
-# cuBLASLt FP8 dW 直接累積拡張 (src/model/csrc/fp8_wgrad_lt.cpp) の build に必要な
-# CUDA header (crt/, nv/target)。torch の CUDA major (cu13 なら 13.0.*) に合わせる。
+# torch は CUDA 版を別途: pip install torch --index-url https://download.pytorch.org/whl/cu130
+pyyaml>=6.0
+numpy>=1.26
+safetensors>=0.4.3
+datasets==4.8.5
+zstandard>=0.22
+pyarrow==25.0.1
 nvidia-cuda-nvcc==13.0.*
 nvidia-cuda-cccl==13.0.*
-ninja>=1.11          # torch.utils.cpp_extension.load の build に必須
-
-# ---- HF エクスポート / transformers からの推論 ----
+ninja>=1.11
 transformers>=4.45
-accelerate>=0.33     # transformers のモデルロード補助 (推奨)
-huggingface_hub==1.17.0  # エクスポートした modeling が Hub repo id 解決に使用
+accelerate>=0.33
+huggingface_hub==1.17.0
 fsspec==2026.2.0
 hf-xet==1.5.0
-
-# ---- dev ----
+flash-linear-attention>=0.5.2
 pytest>=8.2
 ruff>=0.6
-flash-linear-attention>=0.5.2  # SSDMixer (global_layer_pattern S) の chunk scan kernel
