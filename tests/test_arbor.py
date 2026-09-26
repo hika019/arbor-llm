@@ -244,6 +244,25 @@ def test_bytelm_attention_window_matches_full_when_large():
     assert torch.allclose(window_logits, full_logits, atol=1e-5)
 
 
+@pytest.mark.parametrize("window", [32, 200])
+def test_bytelm_window_path_matches_dense(window, monkeypatch):
+    """T が chunk の倍数のときの ByteLM の窓経路 (causal、未来側 kv を持たない) が密マスク経路と一致する."""
+    import src.model.arbor as arbor_mod
+
+    torch.manual_seed(3)
+    t = 2 * arbor_mod._WINDOW_CHUNK
+    m = ByteLM(dict(TINY_ENTROPY_LM, vocab_size=260, max_bytes=t, attention_window=window)).eval()
+    x = torch.randint(4, 260, (2, t))
+    wm = m._attention_mask(x)
+    assert isinstance(wm, arbor_mod.WindowMask) and wm.causal
+    assert wm.mask.shape[-1] == arbor_mod._WINDOW_CHUNK + window   # 未来側 w 列を持たない
+    with torch.inference_mode():
+        win = m(x).logits
+        monkeypatch.setattr(arbor_mod, "_WINDOW_CHUNK", 10**9)      # t >= c を破り密経路へ
+        dense = m(x).logits
+    assert torch.allclose(win, dense, atol=1e-5), f"max diff={(win - dense).abs().max().item():.2e}"
+
+
 def test_bytelm_attention_window_forward_shape():
     torch.manual_seed(0)
     m = ByteLM(dict(TINY_ENTROPY_LM, vocab_size=260, max_bytes=64, attention_window=8)).eval()

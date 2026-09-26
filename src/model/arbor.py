@@ -81,11 +81,14 @@ class WindowMask:
     1 patch の長さは max_patch_len (= w) 以下なので、同一 patch の kv は
     q の前後 w バイト以内に必ず収まる。これを利用して T×T の密マスクの
     代わりに chunk ごとの窓だけを見る (メモリ O(T·窓)、計算 ~T/窓 分の 1)。
+    causal (decoder / ByteLM) は q より後ろの kv を必ずマスクするので、窓を
+    過去側だけ (chunk + w) にして未来側 w 個の計算とメモリを持たない。
     """
 
-    mask: torch.Tensor  # (B, n_chunk, chunk, chunk + 2w) bool
+    mask: torch.Tensor  # (B, n_chunk, chunk, chunk + 2w) bool。causal なら (B, n_chunk, chunk, chunk + w)
     chunk: int
     w: int
+    causal: bool = False
 
 
 def _windowed_sdpa(
@@ -94,12 +97,13 @@ def _windowed_sdpa(
     """q/k/v: (B, H, T, d), T = n * chunk。戻り値も (B, H, T, d)。"""
     b, h, t, d = q.shape
     c, w = wm.chunk, wm.w
+    right = 0 if wm.causal else w
     n = t // c
-    win = c + 2 * w
+    win = c + w + right
     qc = q.view(b, h, n, c, d).permute(0, 2, 1, 3, 4).reshape(b * n, h, c, d)
-    # kv は両側 w を pad してから chunk 幅 c でスライドして窓を切り出す
-    kw = F.pad(k, (0, 0, w, w)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
-    vw = F.pad(v, (0, 0, w, w)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
+    # kv は左 w (causal でなければ右も w) を pad してから chunk 幅 c でスライドして窓を切り出す
+    kw = F.pad(k, (0, 0, w, right)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
+    vw = F.pad(v, (0, 0, w, right)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
     out = F.scaled_dot_product_attention(qc, kw, vw, attn_mask=wm.mask.reshape(b * n, 1, c, win))
     return out.view(b, n, h, c, d).permute(0, 2, 1, 3, 4).reshape(b, h, t, d)
 
@@ -730,12 +734,12 @@ class ByteLM(nn.Module):
         c = _WINDOW_CHUNK
         if t % c == 0 and t >= c:
             ar_q = torch.arange(c, device=input_ids.device).view(1, 1, c, 1)
-            ar_k = torch.arange(c + 2 * w, device=input_ids.device).view(1, 1, 1, c + 2 * w)
+            ar_k = torch.arange(c + w, device=input_ids.device).view(1, 1, 1, c + w)
             chunk_start = (torch.arange(t // c, device=input_ids.device) * c).view(1, -1, 1, 1)
             q_pos = chunk_start + ar_q
             k_pos = chunk_start - w + ar_k
             mask = (k_pos >= 0) & (k_pos <= q_pos) & (q_pos - k_pos < w)
-            return WindowMask(mask.expand(b, -1, -1, -1), c, w)
+            return WindowMask(mask.expand(b, -1, -1, -1), c, w, causal=True)
         q = torch.arange(t, device=input_ids.device).unsqueeze(1)
         k = torch.arange(t, device=input_ids.device).unsqueeze(0)
         return ((k <= q) & (q - k < w)).view(1, 1, t, t)
@@ -1264,7 +1268,10 @@ class ArborModel(nn.Module):
                 ar_q = torch.arange(c, device=x.device).unsqueeze(1)
                 ar_k = torch.arange(c + 2 * w, device=x.device).unsqueeze(0)
                 enc_mask: torch.Tensor | WindowMask = WindowMask(same_win, c, w)
-                dec_mask: torch.Tensor | WindowMask = WindowMask(same_win & (ar_q + w >= ar_k), c, w)
+                # decoder は causal: 窓の先頭 c + w 列 (kv = i*c - w .. i*c + c - 1) だけを使う
+                dec_mask: torch.Tensor | WindowMask = WindowMask(
+                    (same_win & (ar_q + w >= ar_k))[..., :c + w], c, w, causal=True
+                )
             else:
                 same = patch_id.unsqueeze(2) == patch_id.unsqueeze(1)  # (B, T, T)
                 causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device))
