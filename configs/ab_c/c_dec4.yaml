@@ -1,0 +1,214 @@
+# 構造 A/B (1B・20k step、ゼロから・同じデータ順): C' = A の patch 内 decoder を 2 → 4 層 (「decoder が少ない」の切り分け)
+# 生成元: configs/arbor.yaml (本走) の total_steps / checkpoint + 上記の model 差分だけを変えたもの
+# 実行: python -m src.train.train --config configs/ab_c/c_dec4.yaml
+run_name: abc_c_dec4
+seed: 42
+entropy_lm_config: entropy_lm.yaml
+model:
+  vocab_size: 260
+  patching_mode: static
+  patch_size: 16
+  patch_pooling: concat
+  min_patch_len: 3
+  max_patch_len: 16
+  entropy_threshold: 2.0
+  max_bytes: 8192
+  hidden_size: 2048
+  num_heads: 16
+  num_kv_heads: 4
+  intermediate_size: 5632
+  num_hidden_layers: 20
+  local_hidden_size: 768
+  local_num_heads: 12
+  local_num_kv_heads: 12
+  local_intermediate_size: 2048
+  num_local_encoder_layers: 1
+  num_local_decoder_layers: 4
+  rope_theta: 500000.0
+  rope_theta_global: 10000.0
+  rope_theta_local: 500000.0
+  norm_eps: 1.0e-05
+  bitnet: true
+  activation_precision: int8
+  gradient_checkpointing: false
+  global_attn_impl: flex
+data:
+  sources:
+  - id: fineweb2_ja
+    path: HuggingFaceFW/fineweb-2
+    name: jpn_Jpan
+    revision: main
+    weight_bytes: 0.465
+    text_filter:
+      preset: ja_web_v1
+  - id: wikipedia_ja
+    path: wikimedia/wikipedia
+    name: 20231101.ja
+    revision: main
+    weight_bytes: 0.19
+  - id: aozora_modern
+    path: globis-university/aozorabunko-clean
+    revision: main
+    weight_bytes: 0.02
+    max_epochs: 3
+  - id: japan_law
+    path: y2lan/japan-law
+    text_column: body
+    revision: main
+    weight_bytes: 0.005
+    max_epochs: 5
+  - id: fineweb_edu_en
+    path: HuggingFaceFW/fineweb-edu
+    revision: main
+    weight_bytes: 0.12
+  - id: fineweb_en
+    path: HuggingFaceFW/fineweb
+    revision: main
+    weight_bytes: 0.05
+  - id: finemath_4plus
+    path: HuggingFaceTB/finemath
+    name: finemath-4plus
+    revision: main
+    weight_bytes: 0.06
+    text_filter:
+      preset: en_web_quality_v1
+  - id: opc_code_web
+    path: OpenCoder-LLM/opc-fineweb-code-corpus
+    revision: main
+    weight_bytes: 0.09
+    text_filter:
+      preset: en_web_quality_v1
+  streaming: true
+  packing: document
+  eos_token_id: 2
+  pad_token_id: 3
+  shuffle_buffer: 2000
+  context_length: 8192
+  num_workers: 0
+  pin_memory: true
+optim:
+  optimizer: adamw
+  state_precision: fp32
+  fp32_backend: auto
+  param_rounding: stochastic
+  lr: 0.0008
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  weight_decay: 0.1
+  grad_clip: 1.0
+  scheduler: wsd
+  decay_start_ratio: 0.8
+  decay_end_ratio: 1.0
+  decay_shape: inv_sqrt
+  weight_decay_decay_phase: 0.0
+  min_lr_ratio: 0.02
+  warmup_steps: 1000
+  total_steps: 20000
+speed:
+  device: auto
+  precision: bf16
+  tf32_matmul: true
+  cudnn_benchmark: true
+  torch_compile: true
+  compile_mode: reduce-overhead
+  cuda_prefetch: true
+  cpu_prefetch_depth: 3
+  bitlinear_compute_mode: ternary
+  bitlinear_int8_backend: auto
+  bitlinear_ternary_backend: kmajor_single_dot
+  bitlinear_ternary_execution: custom_op
+  bitlinear_ternary_tuning: auto
+  bitlinear_ternary_tuning_cache: true
+  bitlinear_ternary_tuning_cache_path: auto
+  bitlinear_ternary_fixed_tile: null
+  bitlinear_ternary_tuning_warmup: 10
+  bitlinear_ternary_tuning_iters: 30
+  bitlinear_ternary_tuning_verbose: false
+  bitlinear_ternary_wgrad_backend: fp8
+  bitnet_weight_cache: full
+  bitnet_weight_cache_gib: 3.25
+  bitnet_weight_cache_min_numel: 0
+  sync_each_step: false
+  micro_batch_size: 2
+  grad_accum_steps:
+  - - 0
+    - 8
+  - - 20000
+    - 16
+  - - 50000
+    - 32
+  grad_accum_lr_scaling: sqrt
+validation:
+  enabled: true
+  torch_compile: false
+  compile_mode: default
+  max_batches: 64
+  micro_batch_size: 2
+  domains:
+    ja_web:
+      source: HuggingFaceFW/fineweb-2
+      name: jpn_Jpan
+      revision: main
+      split: train
+      skip_samples: 200000
+    wikipedia_ja:
+      source: wikimedia/wikipedia
+      name: 20231101.ja
+      revision: main
+      split: train
+      skip_samples: 20000
+    english:
+      source: HuggingFaceFW/fineweb-edu
+      revision: main
+      split: train
+      skip_samples: 200000
+    math:
+      source: HuggingFaceTB/finemath
+      name: finemath-4plus
+      revision: main
+      split: train
+      skip_samples: 20000
+    code:
+      source: OpenCoder-LLM/opc-fineweb-code-corpus
+      revision: main
+      split: train
+      skip_samples: 20000
+checkpoint:
+  dir: ./checkpoints/abc_c_dec4
+  save_every_steps: 2000
+  keep_last_k: 2
+  keep_every_n_steps: 10000
+  async_save: true
+sampling:
+  enabled: true
+  prompts:
+  - 日本の四季は
+  - The most important thing in life is
+  - 'def fibonacci(n):'
+  max_new_bytes: 100
+  temperature: 0.8
+  top_p: 0.95
+  seed: 42
+  use_cache: true
+probes:
+  enabled: true
+  items:
+  - name: ja_seasons
+    prompt: 日本には春、夏、秋、冬という四つの季節があり、
+    target: それぞれに異なる気候と風景を楽しむことができる。
+    bad_targets:
+    - あっという間においしくなった。
+    - 天然記念物になるという。
+  - name: ja_buttons
+    prompt: この装置には赤、青、緑、黄色という四つのボタンがあり、
+    target: それぞれに異なる機能が割り当てられている。
+    bad_targets:
+    - あっという間においしくなった。
+    - 天然記念物になるという。
+logging:
+  log_every_steps: 50
+  throughput_window: 50
+  byte_kind_metrics: true
+  best_ema_decay: 0.98
