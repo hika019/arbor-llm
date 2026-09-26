@@ -37,6 +37,8 @@ class _ResumeState:
 # 同時に開くので、既定 (CPU 数 = 20) だと source ごとにスレッド分の作業バッファが居座る。
 # 2 で 5000 rows/5s 出るので学習 (数十 rows/s) には十分。
 _ARROW_THREADS = 2
+# parquet source の読み出し単位 (行)。row group 丸ごと読みを避けて host RAM を抑える
+_PARQUET_BATCH_ROWS = 256
 
 
 def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dict):
@@ -68,6 +70,14 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
         import pyarrow.dataset as pds
 
         builder.config.fragment_scan_options = pds.ParquetFragmentScanOptions(pre_buffer=False)
+        # 既定の batch は row group 丸ごと (fineweb 系で数万行) かつ全列を展開するため、
+        # 大きい web source 1 つで ~1GB が常駐し、28 source 混合の ByteLM 学習で host RSS が
+        # 21GB に達して止めた (2026-09-26)。使う列だけを小さい batch で読む。
+        builder.config.batch_size = int(spec.get("parquet_batch_rows", _PARQUET_BATCH_ROWS))
+        columns = [spec.get("text_column", "text")]
+        if spec.get("min_score") is not None:
+            columns.append(spec.get("score_column", "score"))
+        builder.config.columns = columns
     return builder.as_streaming_dataset(split=split)
 
 
