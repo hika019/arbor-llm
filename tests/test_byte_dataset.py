@@ -487,3 +487,17 @@ def test_parquet_stream_reads_all_rows_in_order_and_resumes(tmp_path):
     resumed.load_state_dict(state)
     assert head + [row["text"] for row in resumed] == texts
     assert set(next(iter(resumed)).keys()) == {"text"}
+
+
+def test_parquet_stream_is_picklable(tmp_path):
+    import pickle
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from src.data.byte_dataset import _load_hf_streaming
+
+    pq.write_table(pa.table({"text": ["abc", "def", "ghi"], "other": [1, 2, 3]}), tmp_path / "part-0.parquet")
+    ds = _load_hf_streaming("parquet", None, "train", {"data_files": str(tmp_path / "part-*.parquet")})
+    restored = pickle.loads(pickle.dumps(ds))
+    assert [row["text"] for row in restored] == ["abc", "def", "ghi"]

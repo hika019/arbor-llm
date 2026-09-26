@@ -47,6 +47,7 @@ def _parquet_tables_without_readahead(self, files, row_groups_list):
 
     元実装の fragment.to_batches (pyarrow dataset scanner) は batch_readahead=0 でも裏で
     ファイルを先読みし、stream ごとに ~260MB を抱え続ける (29 source で ~4.4GB)。
+    datasets==4.8.5 の内部 (_generate_tables の引数・Key・_cast_table・streaming 時の open 差し替え) に依存。
     """
     import builtins
     import sys
@@ -80,7 +81,7 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
     Hub 上の生ファイルを直接 stream する (例: script 型で datasets 4.x が読めない
     repo の `hf://datasets/<repo>/<dir>/*.jsonl.zst`)。.zst は zstandard が必要。
     """
-    import types
+    import functools
 
     import pyarrow as pa
     from datasets import load_dataset_builder
@@ -107,7 +108,7 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
         kwargs["data_files"] = data_files
     builder = load_dataset_builder(path, name=name, **kwargs)
     if isinstance(builder.config, ParquetConfig):
-        builder._generate_tables = types.MethodType(_parquet_tables_without_readahead, builder)
+        builder._generate_tables = functools.partial(_parquet_tables_without_readahead, builder)
         # 既定の batch は row group 丸ごと (fineweb 系で数万行) かつ全列を展開するため、
         # 大きい web source 1 つで ~1GB が常駐し、28 source 混合の ByteLM 学習で host RSS が
         # 21GB に達して止めた (2026-09-26)。使う列だけを小さい batch で読む。

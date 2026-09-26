@@ -238,7 +238,7 @@ def generate_byte_stream(
     if seed is not None:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    use_autocast = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
+    use_autocast = dtype in (torch.bfloat16, torch.float16)
 
     gen: ArborByteGenerator | None = None
     if use_cache and isinstance(model, ArborModel):

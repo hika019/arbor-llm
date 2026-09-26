@@ -171,7 +171,7 @@ def evaluate_cloze(
         seqs.append((ctx + tgt, len(ctx) - 1, len(tgt)))
     width = math.ceil((max(len(ids) for ids, _, _ in seqs) - 1) / patch_size) * patch_size
 
-    use_autocast = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
+    use_autocast = dtype in (torch.bfloat16, torch.float16)
     n_correct = 0
     total_nll = 0.0
     total_bytes = 0

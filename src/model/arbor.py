@@ -76,14 +76,14 @@ def _is_block_mask(m: object) -> bool:
 
 @dataclass
 class WindowMask:
-    """patch 内 attention 用の窓マスク (chunk × (chunk+2w) のみ実体化).
+    """patch 内 attention 用の窓マスク (chunk × (chunk+2w)、causal は chunk × (chunk+w) のみ実体化).
 
     1 patch の長さは max_patch_len (= w) 以下なので、同一 patch の kv は
-    q の前後 w バイト以内に必ず収まる。これを利用して T×T の密マスクの
+    q の前後 w バイト (causal なら前 w バイト) 以内に必ず収まる。これを利用して T×T の密マスクの
     代わりに chunk ごとの窓だけを見る (メモリ O(T·窓)、計算 ~T/窓 分の 1)。
     """
 
-    mask: torch.Tensor  # (B, n_chunk, chunk, chunk + 2w) bool。causal なら (B, n_chunk, chunk, chunk + w)
+    mask: torch.Tensor  # (B, n_chunk, chunk, chunk + 2w) bool、causal は (B, n_chunk, chunk, chunk + w)
     chunk: int
     w: int
     causal: bool = False
@@ -1258,16 +1258,16 @@ class ArborModel(nn.Module):
             # しない)、端数 (生成 prefill 等) は従来の密マスク fallback
             c, w = _WINDOW_CHUNK, cfg.max_patch_len
             if t % c == 0 and t >= c:
-                # kv 側は両側 w を pad。pad 位置は patch_id=-1 で不一致を保証
-                qpid = patch_id.view(b, t // c, c)
-                kpid = F.pad(patch_id, (w, w), value=-1).unfold(1, c + 2 * w, c)
-                same_win = qpid.unsqueeze(3) == kpid.unsqueeze(2)  # (B, n, c, c+2w)
-                # 絶対位置: q = i*c + qi, kv = i*c - w + ki なので causal ⇔ qi + w >= ki
+                # pad 位置は patch_id=-1 で不一致を保証
+                qpid = patch_id.view(b, t // c, c).unsqueeze(3)
+                kpid = F.pad(patch_id, (w, w), value=-1).unfold(1, c + 2 * w, c).unsqueeze(2)
+                enc_mask: torch.Tensor | WindowMask = WindowMask(qpid == kpid, c, w)
+                # 絶対位置: q = i*c + qi, kv = i*c - w + ki なので causal ⇔ ki <= qi + w
+                kpid_dec = F.pad(patch_id, (w, 0), value=-1).unfold(1, c + w, c).unsqueeze(2)
                 ar_q = torch.arange(c, device=x.device).unsqueeze(1)
-                ar_k = torch.arange(c + 2 * w, device=x.device).unsqueeze(0)
-                enc_mask: torch.Tensor | WindowMask = WindowMask(same_win, c, w)
+                ar_k = torch.arange(c + w, device=x.device).unsqueeze(0)
                 dec_mask: torch.Tensor | WindowMask = WindowMask(
-                    (same_win & (ar_q + w >= ar_k))[..., :c + w], c, w, causal=True
+                    (qpid == kpid_dec) & (ar_k <= ar_q + w), c, w, causal=True
                 )
             else:
                 same = patch_id.unsqueeze(2) == patch_id.unsqueeze(1)  # (B, T, T)
