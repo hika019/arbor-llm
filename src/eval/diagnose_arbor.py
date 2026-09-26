@@ -108,8 +108,8 @@ def load_checkpoint(
 
 
 def autocast_context(device: torch.device, dtype: torch.dtype):
-    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
-        return torch.autocast(device_type="cuda", dtype=dtype)
+    if dtype in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type=device.type, dtype=dtype)
     return nullcontext()
 
 

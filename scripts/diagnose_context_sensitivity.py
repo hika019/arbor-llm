@@ -35,7 +35,7 @@ def patch_layout(text: str, patch_size: int) -> str:
 def next_logits(model: torch.nn.Module, prompt: str, device: torch.device) -> torch.Tensor:
     ids = byte_ids(prompt)
     x = torch.tensor([ids], dtype=torch.long, device=device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         logits = model(x).logits[0, -1].float()
     logits[:BYTE_OFFSET] = float("-inf")
     return logits[:260].cpu()
@@ -54,7 +54,7 @@ def continuation_bpb(
         return float("nan")
     input_ids = p_ids + c_ids[:-1]
     x = torch.tensor([input_ids], dtype=torch.long, device=device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         logits = model(x).logits[0].float()
     positions = torch.arange(len(p_ids) - 1, len(p_ids) - 1 + len(c_ids), device=device)
     labels = torch.tensor(c_ids, dtype=torch.long, device=device)

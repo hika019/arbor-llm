@@ -44,7 +44,7 @@ def score_completion(
     x = torch.tensor([full[:-1]], dtype=torch.long, device=device)
     labels = torch.tensor(full[1:], dtype=torch.long, device=device)
 
-    use_autocast = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
+    use_autocast = dtype in (torch.bfloat16, torch.float16)
     ctx = torch.autocast(device_type=device.type, dtype=dtype) if use_autocast else torch.no_grad()
     with ctx:
         logits = model(x).logits[0].float()

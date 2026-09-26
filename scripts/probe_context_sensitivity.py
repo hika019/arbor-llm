@@ -30,7 +30,7 @@ def ids(s: str) -> list[int]:
 @torch.inference_mode()
 def logits_for(model, text: str, device, dtype):
     x = torch.tensor([ids(text)], dtype=torch.long, device=device)
-    ctx = torch.autocast(device_type=device.type, dtype=dtype) if device.type == "cuda" else torch.no_grad()
+    ctx = torch.autocast(device_type=device.type, dtype=dtype) if dtype in (torch.bfloat16, torch.float16) else torch.no_grad()
     with ctx:
         logits = model(x).logits[0, -1].float()
     logits = logits[:VOCAB_SIZE].clone()

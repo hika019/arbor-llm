@@ -36,8 +36,8 @@ class _ResumeState:
 
 # pyarrow の parquet デコードスレッド数。datasets streaming は 1 プロセス内で全 source を
 # 同時に開くので、既定 (CPU 数 = 20) だと source ごとにスレッド分の作業バッファが居座る。
-# 2 で 5000 rows/5s 出るので学習 (数十 rows/s) には十分。
-_ARROW_THREADS = 2
+# 2 で 5000 rows/5s 出るので学習 (数十 rows/s) には十分。環境変数 ARBOR_ARROW_THREADS で上書き。
+_ARROW_THREADS = int(os.environ.get("ARBOR_ARROW_THREADS", "2"))
 # parquet source の読み出し単位 (行)。row group 丸ごと読みを避けて host RAM を抑える
 _PARQUET_BATCH_ROWS = 256
 

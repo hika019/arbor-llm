@@ -861,15 +861,12 @@ def resolve_bitlinear_compute_mode(speed_cfg: dict) -> str:
 
 
 def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
-    """単一 config を device の実行制約へ、意味を変えずに適合させる。
-
-    MPS では 1B/8K の activation memory を抑えるため checkpointing と
-    micro-batch=1 を使い、grad_accum を同率で増やして effective batch を保つ。
-    optimizer、state_precision、モデル形状、データ混合は変更しない。
-    """
+    """config を device の実行制約に照らして検証し、表記を正規化した copy を返す。"""
     resolved = copy.deepcopy(cfg)
     model_cfg = resolved.setdefault("model", {})
     speed_cfg = resolved.setdefault("speed", {})
+    if "autocast" in speed_cfg:
+        raise ValueError("speed.autocast は廃止。config から削除する")
     attn_impl = str(model_cfg.get("global_attn_impl", "sdpa")).lower()
     if attn_impl not in {"sdpa", "flex"}:
         raise ValueError(
@@ -1027,31 +1024,6 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             "unknown speed.bitlinear_ternary_wgrad_backend: "
             f"{ternary_wgrad_backend!r} (choices: int8 | fp8 | auto)"
         )
-    if device.type != "mps":
-        return resolved
-
-    if not model_cfg.get("gradient_checkpointing", False):
-        model_cfg["gradient_checkpointing"] = True
-        print("[train] MPS: gradient_checkpointing=ON (model shape/precision unchanged)")
-
-    micro_batch = int(speed_cfg.get("micro_batch_size", 1))
-    schedule = GradAccumSchedule.from_speed_cfg(speed_cfg)
-    if micro_batch > 1:
-        speed_cfg["micro_batch_size"] = 1
-        scaled = schedule.scaled(micro_batch)
-        speed_cfg["grad_accum_steps"] = (
-            scaled.final_accum if scaled.is_constant else [list(pt) for pt in scaled.points]
-        )
-        print(
-            "[train] MPS: micro_batch_size=1 grad_accum_steps={} "
-            "(effective batch preserved: {} sequences)".format(
-                speed_cfg["grad_accum_steps"], micro_batch * schedule.final_accum
-            )
-        )
-
-    validation_cfg = resolved.get("validation")
-    if isinstance(validation_cfg, dict):
-        validation_cfg["micro_batch_size"] = 1
     return resolved
 
 
@@ -1096,16 +1068,6 @@ def resolve_param_dtype(name: str | None, compute_dtype: torch.dtype) -> torch.d
             f"speed.param_dtype={name} は speed.precision と同じか fp32 のみ (計算より低精度では保持しない)"
         )
     return param_dtype
-
-
-def resolve_autocast(speed: dict, default: bool) -> bool:
-    """autocast の明示 override を検証する。文字列等を bool 化しない。"""
-    if "autocast" not in speed:
-        return default
-    value = speed["autocast"]
-    if not isinstance(value, bool):
-        raise TypeError(f"speed.autocast must be bool, got {type(value).__name__}")
-    return value
 
 
 def byte_kind_loss_stats(
@@ -1442,18 +1404,10 @@ def main() -> int:
         from src.model.arbor import build_arbor as build_model
     else:
         raise ValueError(f"unknown model.arch: {arch}")
-    compute_dtype, precision_autocast = resolve_precision(
+    compute_dtype, use_autocast = resolve_precision(
         cfg.get("speed", {}).get("precision", "bf16")
     )
-    # autocast は結果に影響する compute 設定だが、MPS では autocast を挟むと
-    # 実測で遅くなるため、既定は CUDA のみ ON。明示 speed.autocast で上書き可能。
-    default_autocast = precision_autocast and device.type == "cuda"
-    use_autocast = resolve_autocast(cfg.get("speed", {}), default_autocast)
-    if use_autocast and compute_dtype == torch.float32:
-        raise ValueError("speed.autocast=true と speed.precision=fp32 は併用できません")
     param_dtype = resolve_param_dtype(cfg.get("speed", {}).get("param_dtype"), compute_dtype)
-    if param_dtype != compute_dtype and not use_autocast:
-        raise ValueError("speed.param_dtype を計算 dtype と変えるには autocast が必要 (CUDA で speed.autocast を切らないこと)")
     print(f"[train] arch={arch} precision={compute_dtype} param_dtype={param_dtype} autocast={use_autocast}")
     print("[train] building model...")
     timing_mark("before_model_build", device)

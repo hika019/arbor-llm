@@ -104,7 +104,7 @@ def _score_fixed(
     x = x.to(device, non_blocking=True)
     labels = labels.to(device, non_blocking=True)
 
-    use_autocast = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
+    use_autocast = dtype in (torch.bfloat16, torch.float16)
     ctx = torch.autocast(device_type=device.type, dtype=dtype) if use_autocast else torch.no_grad()
     with ctx:
         logits = model(x).logits

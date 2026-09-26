@@ -5,8 +5,8 @@ safetensors>=0.4.3
 datasets==4.8.5
 zstandard>=0.22
 pyarrow==25.0.1
-nvidia-cuda-nvcc==13.0.*
-nvidia-cuda-cccl==13.0.*
+nvidia-cuda-nvcc==13.0.*; sys_platform != "darwin"
+nvidia-cuda-cccl==13.0.*; sys_platform != "darwin"
 ninja>=1.11
 transformers>=4.45
 accelerate>=0.33

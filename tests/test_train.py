@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from src.train.train import resolve_precision
-from src.train.train import resolve_autocast
 from src.train.train import resolve_entropy_lm_reference
 from src.train.train import adapt_config_for_device
 from src.train.train import resolve_bitlinear_compute_mode
@@ -139,50 +138,21 @@ def test_resolve_precision_bf8_is_explicit_error_not_silent():
         resolve_precision("bf8")
 
 
-def test_resolve_autocast_requires_real_bool():
-    assert resolve_autocast({}, True) is True
-    assert resolve_autocast({"autocast": False}, True) is False
-    with pytest.raises(TypeError, match="speed.autocast"):
-        resolve_autocast({"autocast": "false"}, True)
+@pytest.mark.parametrize("value", [True, False])
+def test_speed_autocast_is_removed(value):
+    with pytest.raises(ValueError, match="speed.autocast は廃止"):
+        adapt_config_for_device({"speed": {"autocast": value}}, torch.device("cpu"))
 
 
-def test_mps_adaptation_preserves_model_optimizer_and_effective_batch():
-    cfg = {
-        "model": {
-            "bitnet": True,
-            "patching_mode": "static",
-            "hidden_size": 2048,
-            "gradient_checkpointing": False,
-        },
-        "optim": {
-            "optimizer": "adamw",
-            "state_precision": "int8",
-            "lr": 1e-3,
-        },
-        "speed": {"micro_batch_size": 2, "grad_accum_steps": 32},
-        "validation": {"micro_batch_size": 2},
-    }
-
-    resolved = adapt_config_for_device(cfg, torch.device("mps"))
-
-    assert resolved["model"]["bitnet"] is True
-    assert resolved["model"]["patching_mode"] == "static"
-    assert resolved["model"]["hidden_size"] == 2048
-    assert resolved["model"]["gradient_checkpointing"] is True
-    assert resolved["optim"] == cfg["optim"]
-    assert resolved["speed"]["micro_batch_size"] == 1
-    assert resolved["speed"]["grad_accum_steps"] == 64
-    assert resolved["validation"]["micro_batch_size"] == 1
-    assert cfg["model"]["gradient_checkpointing"] is False
-
-
-def test_cuda_adaptation_does_not_change_config():
+@pytest.mark.parametrize("device", ["cuda", "mps", "cpu"])
+def test_adaptation_does_not_change_config(device):
     cfg = {
         "model": {"gradient_checkpointing": False},
         "optim": {"optimizer": "adamw", "state_precision": "fp32"},
-        "speed": {"micro_batch_size": 2, "grad_accum_steps": 32},
+        "speed": {"micro_batch_size": 2, "grad_accum_steps": [[0, 8], [1000, 32]]},
+        "validation": {"micro_batch_size": 2},
     }
-    assert adapt_config_for_device(cfg, torch.device("cuda")) == cfg
+    assert adapt_config_for_device(cfg, torch.device(device)) == cfg
 
 
 def test_attention_auto_is_rejected_instead_of_falling_back():

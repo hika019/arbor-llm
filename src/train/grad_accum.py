@@ -103,13 +103,6 @@ class GradAccumSchedule:
 
         return fraction
 
-    def scaled(self, factor: int) -> "GradAccumSchedule":
-        """全区間の accum を factor 倍する (MPS の micro_batch→accum 振替用)."""
-        return GradAccumSchedule(
-            tuple((step, accum * factor) for step, accum in self.points),
-            self.lr_scaling,
-        )
-
     def describe(self) -> str:
         if self.is_constant:
             return f"constant accum={self.final_accum}"

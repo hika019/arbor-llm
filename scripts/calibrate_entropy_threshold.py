@@ -131,8 +131,7 @@ def main() -> int:
     with torch.inference_mode():
         for batch_index in range(args.batches):
             ids = next(iterator)["input_ids"].to(device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                enabled=device.type == "cuda"):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 ent = lm.next_byte_entropy(ids).float()
             ids_list.append(ids)
             ent_list.append(ent)
