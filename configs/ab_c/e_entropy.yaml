@@ -1,7 +1,7 @@
 # 構造 A/B (1B・20k step、ゼロから・同じデータ順): E = B + entropy patching (小型 LM 83M、予算 512 patch = static16 と同じ global 計算量)。entropy_threshold は小型 LM 学習後に scripts/calibrate_entropy_threshold.py で校正すること
 # 生成元: configs/arbor.yaml (本走) の total_steps / checkpoint + 上記の model 差分だけを変えたもの
 # 実行: python -m src.train.train --config configs/ab_c/e_entropy.yaml
-# data: 本走の混合 + ReazonSpeech 書き起こし 3% (fineweb2_ja 46.5% → 43.5%)。scripts/extract_reazonspeech_text.py で抽出済みであること
+# data: 本走の混合 + ReazonSpeech 書き起こし 3%、code 9% → 6%・math 6% → 4% (fineweb2_ja 46.5% → 48.5%)。scripts/extract_reazonspeech_text.py で抽出済みであること
 run_name: abc_e_entropy
 seed: 42
 entropy_lm_config: ../entropy_lm.yaml
@@ -41,7 +41,7 @@ data:
     path: HuggingFaceFW/fineweb-2
     name: jpn_Jpan
     revision: main
-    weight_bytes: 0.435
+    weight_bytes: 0.485
     text_filter:
       preset: ja_web_v1
   - id: wikipedia_ja
@@ -76,13 +76,13 @@ data:
     path: HuggingFaceTB/finemath
     name: finemath-4plus
     revision: main
-    weight_bytes: 0.06
+    weight_bytes: 0.04
     text_filter:
       preset: en_web_quality_v1
   - id: opc_code_web
     path: OpenCoder-LLM/opc-fineweb-code-corpus
     revision: main
-    weight_bytes: 0.09
+    weight_bytes: 0.06
     text_filter:
       preset: en_web_quality_v1
   streaming: true
