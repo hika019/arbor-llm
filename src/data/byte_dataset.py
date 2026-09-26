@@ -74,7 +74,7 @@ def _load_hf_streaming(path: str, name: str | None, split: str | None, spec: dic
         # 大きい web source 1 つで ~1GB が常駐し、28 source 混合の ByteLM 学習で host RSS が
         # 21GB に達して止めた (2026-09-26)。使う列だけを小さい batch で読む。
         builder.config.batch_size = int(spec.get("parquet_batch_rows", _PARQUET_BATCH_ROWS))
-        columns = [spec.get("text_column", "text")]
+        columns = [spec.get("conversation_column") or spec.get("text_column", "text")]
         if spec.get("min_score") is not None:
             columns.append(spec.get("score_column", "score"))
         builder.config.columns = columns
@@ -386,10 +386,20 @@ class ByteStreamDataset(IterableDataset):
             if self.verbose:
                 print(f"[data] source {s.get('id') or s.get('path')}: opened ({time.perf_counter() - t0:.1f}s)",
                       flush=True)
-            col = s.get("text_column", self.text_column)
-            if col != "text":
-                ds = ds.rename_column(col, "text")
-            keep = ["text"]
+            conv_col = s.get("conversation_column")
+            if conv_col:
+                # 会話リスト ([{role, content}, ...]) の列を持つ source (例: llm-jp/magpie-sft-v1.0) は
+                # 発話本文を空行でつないだ 1 文書にする (事前学習用。役割タグは付けない)
+                ds = ds.map(
+                    lambda row: {"text": "\n\n".join(
+                        str(m.get("content") or m.get("value") or "") for m in (row[conv_col] or [])
+                    )},
+                    remove_columns=[conv_col],
+                )
+                col = "text"
+            else:
+                col = s.get("text_column", self.text_column)
+            keep = [col]
             # min_score 指定の source は数値スコア列を残し next_doc_bytes で足切りする
             # (例: fineweb-2-edu-japanese は edu score でノイズ web を落として初めて
             #  「教育フィルタ版」として機能する。無指定なら従来どおり text のみ)。
@@ -397,7 +407,11 @@ class ByteStreamDataset(IterableDataset):
                 sc_col = s.get("score_column", "score")
                 if sc_col != "text":
                     keep.append(sc_col)
+            # 先に列を絞ってから改名する (例: oasst2-135k-ja は原文 "text" と訳文 "text_ja" の
+            # 両方を持ち、text_ja → text の改名が既存の text 列と衝突する)
             ds = ds.select_columns(keep)
+            if col != "text":
+                ds = ds.rename_column(col, "text")
             skip_samples = int(s.get("skip_samples", self.skip_samples))
             if skip_samples:
                 ds = ds.skip(skip_samples)

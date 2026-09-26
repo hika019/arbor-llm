@@ -1,6 +1,7 @@
 # 構造 A/B (1B・20k step、ゼロから・同じデータ順): C' = A の patch 内 decoder を 2 → 4 層 (「decoder が少ない」の切り分け)
 # 生成元: configs/arbor.yaml (本走) の total_steps / checkpoint + 上記の model 差分だけを変えたもの
 # 実行: python -m src.train.train --config configs/ab_c/c_dec4.yaml
+# data: 本走の混合 + ReazonSpeech 書き起こし 3% (fineweb2_ja 46.5% → 43.5%)。scripts/extract_reazonspeech_text.py で抽出済みであること
 run_name: abc_c_dec4
 seed: 42
 entropy_lm_config: entropy_lm.yaml
@@ -38,7 +39,7 @@ data:
     path: HuggingFaceFW/fineweb-2
     name: jpn_Jpan
     revision: main
-    weight_bytes: 0.465
+    weight_bytes: 0.435
     text_filter:
       preset: ja_web_v1
   - id: wikipedia_ja
@@ -57,6 +58,10 @@ data:
     revision: main
     weight_bytes: 0.005
     max_epochs: 5
+  - id: reazonspeech_text
+    path: parquet
+    data_files: /home/hi/datasets/reazonspeech_text/*/*.parquet
+    weight_bytes: 0.03
   - id: fineweb_edu_en
     path: HuggingFaceFW/fineweb-edu
     revision: main

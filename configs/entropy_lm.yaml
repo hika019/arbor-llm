@@ -46,7 +46,7 @@ data:
     # ---- 日本語 0.55 ----
     - path: "HuggingFaceFW/fineweb-2"   # 現代 web
       name: "jpn_Jpan"
-      weight: 0.28
+      weight: 0.29
     - path: "range3/cc100-ja"           # web 口語 (ブログ調)
       weight: 0.055
     - path: "globis-university/aozorabunko-clean"  # 青空文庫: 書籍・古典・旧文体
@@ -57,12 +57,24 @@ data:
     - path: "y2lan/japan-law"           # 法令 (条文体。8.75k 件と小さいが循環)
       text_column: "body"
       weight: 0.035
-    - path: "shidowake/chatbot-arena-ja_dedup_subset-5k"  # 日本語チャット/崩れた入力
-      weight: 0.045
-    - path: "sirgecko/dataset_japanesechatbot2"  # 日本語チャット文
+    # 日本語チャット: 人間が自然に書いた大きな公開データはほぼ無いので、実ユーザー入力 (arena、21MB)
+    # を少量 + 翻訳 (oasst2) / 合成 (magpie) で量を確保する。sirgecko の 2 つ (0.4MB / 0.2MB) は
+    # 混合比 2% で学習全体 ~1000 周になるため除外した (2026-09-26)。
+    - path: "shidowake/chatbot-arena-ja_dedup_subset-5k"  # 実ユーザーの崩れた入力 (21MB、~6 周)
+      weight: 0.01
+    - path: "kunishou/oasst2-135k-ja"   # OpenAssistant 会話の日本語訳 (185MB、1 行 1 メッセージ)
+      text_column: "text_ja"            # "text" 列は翻訳前の原文
       weight: 0.02
-    - path: "sirgecko/dataset_japanesechatbot_sentence"  # 日本語短文チャット
+    - path: "llm-jp/magpie-sft-v1.0"    # 合成の日本語対話 (252MB)。発話を空行でつないで 1 文書
+      conversation_column: "conversations"
       weight: 0.02
+    # 話し言葉: ReazonSpeech (TV 放送) の書き起こし 1,922 万発話 ~1.5GB を
+    # scripts/extract_reazonspeech_text.py でローカルに抜き出したもの (30 発話 = 1 文書)。
+    # 著作権法 30 条の 4 の情報解析目的に限る (再配布不可)。
+    - path: "parquet"
+      data_files: "/home/hi/datasets/reazonspeech_text/*/*.parquet"
+      id: "reazonspeech_text"
+      weight: 0.025
     # ---- 英語 0.10 ----
     - path: "HuggingFaceFW/fineweb-edu" # edu (高品質土台)
       weight: 0.06
