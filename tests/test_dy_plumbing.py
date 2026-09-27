@@ -99,7 +99,7 @@ def test_ste_backward_is_bitwise_identical_with_fused_dy_plumbing():
     finally:
         set_bitlinear_fused_dy_plumbing(True)
         set_bitlinear_ternary_backend("dot_current")
-        set_bitlinear_ternary_wgrad_backend("int8")
+        set_bitlinear_ternary_wgrad_backend("int8_block")
     assert bitlinear._fused_dy_plumbing is True
 
 

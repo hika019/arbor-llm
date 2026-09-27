@@ -86,7 +86,7 @@ def main() -> None:
     ap.add_argument(
         "--ternary-wgrad-backend",
         default=None,
-        choices=["int8", "fp8", "auto"],
+        choices=["int8_block", "fp8"],
         help="packed ternary dW backend。既定は config "
         "speed.bitlinear_ternary_wgrad_backend",
     )

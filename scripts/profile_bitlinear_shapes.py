@@ -364,7 +364,7 @@ def main():
         default="dot_current",
         choices=["dot_current", "kmajor_current", "kmajor_single_dot", "dot"],
     )
-    ap.add_argument("--wgrad-backend", default="fp8", choices=["int8", "fp8", "auto"])
+    ap.add_argument("--wgrad-backend", default="int8_block", choices=["int8_block", "fp8"])
     ap.add_argument(
         "--execution-path",
         default="legacy_raw",

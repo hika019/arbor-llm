@@ -271,9 +271,12 @@ def prepare_cudagraph_gradient_buffers(
     allocated_bytes = 0
     fused = 0
     if fused_grad_accum:
-        from src.model.fp8_wgrad_lt import _load_extension
+        from src.model.bitlinear import _ternary_wgrad_backend
 
-        _load_extension()  # build 失敗はここで例外 (暗黙フォールバックしない)
+        if _ternary_wgrad_backend != "int8_block":
+            from src.model.fp8_wgrad_lt import _load_extension
+
+            _load_extension()  # build 失敗はここで例外 (暗黙フォールバックしない)
         groups = [m for m in model.modules() if isinstance(m, BitLinearGroup)]
         grouped: set[int] = set()
         for group in groups:
@@ -1014,15 +1017,12 @@ def adapt_config_for_device(cfg: dict, device: torch.device) -> dict:
             "speed.bitlinear_ternary_tuning_iters must be >0"
         )
     ternary_wgrad_backend = str(
-        speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8")
+        speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8_block")
     ).lower().replace("-", "_")
-    if ternary_wgrad_backend in {"hybrid", "shape_auto"}:
-        ternary_wgrad_backend = "auto"
-        speed_cfg["bitlinear_ternary_wgrad_backend"] = "auto"
-    if ternary_wgrad_backend not in {"int8", "fp8", "auto"}:
+    if ternary_wgrad_backend not in {"int8_block", "fp8"}:
         raise ValueError(
             "unknown speed.bitlinear_ternary_wgrad_backend: "
-            f"{ternary_wgrad_backend!r} (choices: int8 | fp8 | auto)"
+            f"{ternary_wgrad_backend!r} (choices: int8_block | fp8)"
         )
     return resolved
 
@@ -1247,7 +1247,7 @@ def configure_training_bitnet(base_model, device, cfg):
         ),
     )
     ternary_wgrad_backend = set_bitlinear_ternary_wgrad_backend(
-        str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8"))
+        str(speed_cfg.get("bitlinear_ternary_wgrad_backend", "int8_block"))
     )
     fp8_info = set_bitlinear_fp8_mode(base_model, fp8_mode)
     bitnet_cache_info = configure_bitlinear_training_cache(

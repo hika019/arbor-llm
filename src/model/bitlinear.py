@@ -35,7 +35,8 @@ ternary 重みは optimizer step 後に INT8 {-1,0,+1} と FP8 の両レイア�
                dot_current backend。kmajor_single_dotは[K/4,N]からpacked byteを
                一度だけloadし、4 weightをdense INT8 fragmentへinterleaveして
                tl.dotを1回呼ぶ本命A/B。4-way grouped decodeは比較専用。
-               dW は A8 INT8 dense GEMM。
+               dW は既定で token block scale の INT8 GEMM (int8_block、sm80+)、
+               bitlinear_ternary_wgrad_backend: fp8 で FP8 GEMM (sm89+)。
                shadow weight は BF16 のまま保持し、optimizer step 後だけcache更新。
 
 推論パス (任意): `freeze_for_inference()` を呼ぶと dequantize 済み ternary 重みを
@@ -470,43 +471,111 @@ if triton is not None:
         )
 
     @triton.jit
-    def _int8_wgrad_kernel(
-        g_ptr, x_ptr, sg_ptr, sx_ptr, out_ptr,
-        m: tl.constexpr, n: tl.constexpr, k: tl.constexpr,
+    def _dy_quant_mblock_dual_kernel(
+        g_ptr, col_scale_ptr, inv_scale_ptr, inv_sx_ptr, q_ptr, qt_ptr, block_scale_ptr,
+        m, n, stride_m,
+        WRITE_ROWS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        """dY の tile を 1 回 load し、dX 用 INT8 行 (WRITE_ROWS 時) と dW 用 token block INT8 転置を書く.
+
+        dW = Σ_m dY[m,n]·X[m,k] は token 方向の総和なので per-token scale は GEMM の外に
+        出せない。A8 の per-token scale inv_sx を dY 側へ畳み込み (X は保存済み INT8 を
+        そのまま使える)、token block (BLOCK_M 行) ごとに列 scale を持たせる。
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m[:, None] < m) & (offs_n[None, :] < n)
+        x = tl.load(
+            g_ptr + offs_m[:, None] * stride_m + offs_n[None, :],
+            mask=mask, other=0.0,
+        ).to(tl.float32)
+        if WRITE_ROWS:
+            col_scale = tl.load(
+                col_scale_ptr + offs_n, mask=offs_n < n, other=0.0
+            ).to(tl.float32)
+            inv_scale = tl.load(inv_scale_ptr + offs_m, mask=offs_m < m, other=1.0)
+            scaled = (x * col_scale[None, :]) / inv_scale[:, None]
+            nearest = tl.floor(scaled + 0.5)
+            is_tie = (nearest - scaled) == 0.5
+            is_odd = (nearest - 2.0 * tl.floor(nearest * 0.5)) != 0.0
+            q = tl.where(is_tie & is_odd, nearest - 1.0, nearest)
+            q = tl.maximum(-128.0, tl.minimum(127.0, q)).to(tl.int8)
+            tl.store(q_ptr + offs_m[:, None] * n + offs_n[None, :], q, mask=mask)
+        sx = tl.load(inv_sx_ptr + offs_m, mask=offs_m < m, other=0.0)
+        g = x * sx[:, None]
+        block_scale = tl.maximum(tl.max(tl.abs(g), axis=0) / 127.0, 1.0e-30)  # = _DY_SCALE_FLOOR
+        scaled_t = g / block_scale[None, :]
+        nearest_t = tl.floor(scaled_t + 0.5)
+        is_tie_t = (nearest_t - scaled_t) == 0.5
+        is_odd_t = (nearest_t - 2.0 * tl.floor(nearest_t * 0.5)) != 0.0
+        qt = tl.where(is_tie_t & is_odd_t, nearest_t - 1.0, nearest_t)
+        qt = tl.maximum(-128.0, tl.minimum(127.0, qt)).to(tl.int8)
+        tl.store(
+            qt_ptr + offs_n[:, None] * m + offs_m[None, :],
+            tl.trans(qt),
+            mask=(offs_n[:, None] < n) & (offs_m[None, :] < m),
+        )
+        tl.store(block_scale_ptr + pid_m * n + offs_n, block_scale, mask=offs_n < n)
+
+    @triton.jit
+    def _int8_transpose_kernel(
+        x_ptr, out_ptr, rows, cols,
+        BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr,
+    ):
+        pid_r = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        tile = tl.load(
+            x_ptr + offs_r[:, None] * cols + offs_c[None, :],
+            mask=(offs_r[:, None] < rows) & (offs_c[None, :] < cols), other=0,
+        )
+        tl.store(
+            out_ptr + offs_c[:, None] * rows + offs_r[None, :],
+            tl.trans(tile),
+            mask=(offs_c[:, None] < cols) & (offs_r[None, :] < rows),
+        )
+
+    @triton.jit
+    def _int8_mblock_wgrad_kernel(
+        gt_ptr, xt_ptr, scale_ptr, out_ptr,
+        m, n, k,
+        ACCUMULATE: tl.constexpr,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr,
     ):
-        """tensorwise INT8 dY^T @ X。dY transposeをmaterializeしない."""
+        """dW[n,k] = Σ_mb scale[mb,n] · Σ_{m∈mb} q[n,m]·x[k,m] (INT32 → token block ごとに FP32 累積).
+
+        gt: [N, M] int8、xt: [K, M] int8 (どちらも総和方向 M が連続)。BLOCK_M は
+        量子化の token block と同じ。ACCUMULATE で out (param.grad) へ足し込む。
+        """
         pid_n = tl.program_id(0)
         pid_k = tl.program_id(1)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
         offs_m = tl.arange(0, BLOCK_M)
-        acc = tl.zeros((BLOCK_N, BLOCK_K), tl.int32)
-
-        for m0 in range(0, m, BLOCK_M):
-            m_idx = m0 + offs_m
-            g = tl.load(
-                g_ptr + m_idx[None, :] * n + offs_n[:, None],
-                mask=(m_idx[None, :] < m) & (offs_n[:, None] < n),
+        acc = tl.zeros((BLOCK_N, BLOCK_K), tl.float32)
+        for mb in range(0, tl.cdiv(m, BLOCK_M)):
+            m_idx = mb * BLOCK_M + offs_m
+            a = tl.load(
+                gt_ptr + offs_n[:, None] * m + m_idx[None, :],
+                mask=(offs_n[:, None] < n) & (m_idx[None, :] < m),
                 other=0,
             )
-            x = tl.load(
-                x_ptr + m_idx[:, None] * k + offs_k[None, :],
-                mask=(m_idx[:, None] < m) & (offs_k[None, :] < k),
+            b = tl.load(
+                xt_ptr + offs_k[:, None] * m + m_idx[None, :],
+                mask=(offs_k[:, None] < k) & (m_idx[None, :] < m),
                 other=0,
             )
-            acc += tl.dot(g, x, out_dtype=tl.int32)
-
-        scale = (
-            tl.load(sg_ptr).to(tl.float32)
-            * tl.load(sx_ptr).to(tl.float32)
-        )
-        value = acc.to(tl.float32) * scale
-        tl.store(
-            out_ptr + offs_n[:, None] * k + offs_k[None, :],
-            value,
-            mask=(offs_n[:, None] < n) & (offs_k[None, :] < k),
-        )
+            part = tl.dot(a, tl.trans(b), out_dtype=tl.int32)
+            s = tl.load(scale_ptr + mb * n + offs_n, mask=offs_n < n, other=0.0)
+            acc += part.to(tl.float32) * s[:, None]
+        out_ptrs = out_ptr + offs_n[:, None] * k + offs_k[None, :]
+        out_mask = (offs_n[:, None] < n) & (offs_k[None, :] < k)
+        if ACCUMULATE:
+            acc += tl.load(out_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
 
     @triton.jit
     def _fp8_cast_transpose_kernel(
@@ -591,14 +660,6 @@ def _legacy_packed_launch_spec(
     if m >= 32 and n >= 64:
         return 32, 64, 32, 4, 3
     return 16, 32, 32, 4, 3
-
-
-def _wgrad_tile(m: int, n: int, k: int) -> tuple[int, int, int, int]:
-    if n >= 64 and k >= 64 and m >= 1024:
-        return 64, 64, 64, 8
-    if n >= 64 and k >= 64 and m >= 256:
-        return 64, 64, 32, 4
-    return 32, 32, 32, 4
 
 
 def _launch_packed_linear(
@@ -1081,37 +1142,94 @@ def _quantize_dy_dual(
     return q, inv_scale, t_f8, fp8_scale
 
 
-def _quantize_int8_tensorwise(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """dense low-bit wgrad用のtensorwise symmetric INT8 quantization."""
-    scale = (x.detach().abs().amax().float() / 127.0).clamp_min(1e-12)
-    q = (x / scale).round().clamp(-128, 127).to(torch.int8)
-    return q.contiguous(), scale
+_MBLOCK = 128  # int8_block dW の token block (量子化 scale の単位 = GEMM の BLOCK_M)
 
 
-def _lowbit_wgrad(
-    grad_output: torch.Tensor,
-    x_q: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Q(dY)^T Q(X) によるlow-bit shadow-weight gradient."""
-    if triton is None or not grad_output.is_cuda:
-        raise RuntimeError("low-bit wgrad には CUDA + Triton が必要です")
-    g_int8, sg = _quantize_int8_tensorwise(grad_output)
-    x_int8, sx = _quantize_int8_tensorwise(x_q)
-    m, n = g_int8.shape
-    k = x_int8.size(1)
-    out = torch.empty((n, k), device=grad_output.device, dtype=out_dtype)
-    block_n, block_k, block_m, num_warps = _wgrad_tile(m, n, k)
-    grid = (triton.cdiv(n, block_n), triton.cdiv(k, block_k))
-    _int8_wgrad_kernel[grid](
-        g_int8, x_int8, sg, sx, out,
-        m, n, k,
-        BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m,
-        num_warps=num_warps,
+def _quantize_dy_mblock_dual(
+    dy: torch.Tensor,
+    col_scale: torch.Tensor | None,
+    inv_sx: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """dY から dX 用 INT8 行 (col_scale が None なら省略) と dW 用 token block INT8 転置を作る.
+
+    戻り値: (INT8 [M,N], その per-row scale [M], block INT8 転置 [N,M], block scale [M/128,N])。
+    INT8 行は `_quantize_a8_rows_scaled` と bit 一致する。
+    """
+    if triton is None or not dy.is_cuda:
+        raise RuntimeError("int8_block wgrad には CUDA + Triton が必要です")
+    x2 = dy.contiguous()
+    m, n = x2.shape
+    n_mblocks = triton.cdiv(m, _MBLOCK)
+    qt = torch.empty((n, m), device=dy.device, dtype=torch.int8)
+    block_scale = torch.empty((n_mblocks, n), device=dy.device, dtype=torch.float32)
+    write_rows = col_scale is not None
+    if write_rows:
+        scale = col_scale.contiguous()
+        if scale.numel() != n:
+            raise ValueError(f"col_scale must have N={n} values")
+        # 行 amax は torch op にして inductor に dY の producer と融合させる (_quantize_dy_dual と同じ)
+        inv_scale = ((x2.float() * scale).abs().amax(dim=1) / 127.0).clamp_min(_DY_SCALE_FLOOR)
+        q = torch.empty_like(x2, dtype=torch.int8)
+    else:
+        scale = inv_scale = q = None
+    _dy_quant_mblock_dual_kernel[(n_mblocks, triton.cdiv(n, 64))](
+        x2, scale, inv_scale, inv_sx, q, qt, block_scale,
+        m, n, x2.stride(0),
+        WRITE_ROWS=write_rows, BLOCK_M=_MBLOCK, BLOCK_N=64,
+        num_warps=4,
+    )
+    return q, inv_scale, qt, block_scale
+
+
+def _int8_transpose(x: torch.Tensor) -> torch.Tensor:
+    rows, cols = x.shape
+    out = torch.empty((cols, rows), device=x.device, dtype=x.dtype)
+    _int8_transpose_kernel[(triton.cdiv(rows, 64), triton.cdiv(cols, 64))](
+        x, out, rows, cols, BLOCK_R=64, BLOCK_C=64, num_warps=4,
     )
     return out
+
+
+def _int8_mblock_wgrad_from_quant(
+    qt: torch.Tensor,
+    block_scale: torch.Tensor,
+    x_int8: torch.Tensor,
+    out_dtype: torch.dtype,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """token block scale の INT8 dW。out を渡すとそこへ足し込む (fused grad accum)."""
+    n, m = qt.shape
+    k = x_int8.size(1)
+    xt = _int8_transpose(x_int8.contiguous())
+    accumulate = out is not None
+    if out is None:
+        out = torch.empty((n, k), device=qt.device, dtype=out_dtype)
+    block_n, block_k, num_warps, num_stages = _int8_mblock_wgrad_tile(n, k)
+    _int8_mblock_wgrad_kernel[(triton.cdiv(n, block_n), triton.cdiv(k, block_k))](
+        qt, xt, block_scale, out,
+        m, n, k,
+        ACCUMULATE=accumulate,
+        BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=_MBLOCK,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out
+
+
+def _int8_mblock_wgrad(
+    grad_output: torch.Tensor,
+    x_int8: torch.Tensor,
+    inv_sx: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    _, _, qt, block_scale = _quantize_dy_mblock_dual(grad_output, None, inv_sx)
+    return _int8_mblock_wgrad_from_quant(qt, block_scale, x_int8, grad_output.dtype, out)
+
+
+def _int8_mblock_wgrad_tile(n: int, k: int) -> tuple[int, int, int, int]:
+    # RTX 4090 の tile 掃引 (logs/bench_cfg/wgrad/tile_sweep.py) で上位だった構成
+    if n * k <= 768 * 768:
+        return 64, 64, 4, 3
+    return 64, 128, 8, 3
 
 
 def _int8_linear(
@@ -1233,7 +1351,7 @@ _DY_SCALE_FLOOR = 1.0e-30
 _FP8_MODES = ("off", "bwd", "full", "int8", "ternary")
 _INT8_BACKENDS = ("auto", "int_mm", "triton")
 _TERNARY_BACKENDS = ("dot", "dot_current", "kmajor_current", "kmajor_single_dot")
-_TERNARY_WGRAD_BACKENDS = ("int8", "fp8", "auto")
+_TERNARY_WGRAD_BACKENDS = ("int8_block", "fp8")
 _TERNARY_EXECUTION_PATHS = (
     "custom_op",
     "raw",
@@ -1243,7 +1361,7 @@ _TERNARY_EXECUTION_PATHS = (
 )
 _int8_backend = "auto"
 _ternary_backend = "dot_current"
-_ternary_wgrad_backend = "int8"
+_ternary_wgrad_backend = "int8_block"
 # dY plumbing: True で `_quantize_dy_dual` (2 pass) を使う。False は分離実装
 # (INT8 行量子化 + FP8 転置 + 全体 amax の 3 pass) で、A/B と回帰テスト用。
 _fused_dy_plumbing = True
@@ -1483,8 +1601,6 @@ def set_bitlinear_ternary_wgrad_backend(backend: str) -> str:
     """packed ternary dW backendを選ぶ (process-global, compile前に設定)."""
     global _ternary_wgrad_backend
     normalized = str(backend).lower().replace("-", "_")
-    if normalized in {"hybrid", "shape_auto"}:
-        normalized = "auto"
     if normalized not in _TERNARY_WGRAD_BACKENDS:
         raise ValueError(
             f"unknown bitlinear ternary wgrad backend: {backend!r} "
@@ -1678,65 +1794,23 @@ def _fp8_wgrad_accumulate_from_a8_pretransposed(
     fp8_wgrad_lt(x_km, sx, gt_f8, sg, grad_accum, True)
 
 
-def _ternary_wgrad_uses_fp8(m: int, k: int, n: int) -> bool:
-    return _ternary_wgrad_backend == "fp8" or (
-        _ternary_wgrad_backend == "auto"
-        and n >= k
-        and fp8_gemm_supported()
-        and _fp8_dims_ok(m, k, n)
-    )
-
-
-def _ternary_wgrad(
-    grad_output: torch.Tensor,
-    x_q: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    """configured backendでpacked ternary trainingのshadow-weight dWを計算."""
-    m, n = grad_output.shape
-    k = x_q.size(1)
-    dims_ok = _fp8_dims_ok(m, k, n)
-    use_fp8 = _ternary_wgrad_uses_fp8(m, k, n)
-    if use_fp8:
-        if not fp8_gemm_supported():
-            raise RuntimeError(
-                "bitlinear ternary wgrad backend=fp8 には "
-                "compute capability 8.9 以上の CUDA GPU が必要です"
-            )
-        if not dims_ok:
-            raise RuntimeError(
-                "bitlinear ternary wgrad backend=fp8 requires "
-                f"M/K/N multiples of 16, got M={m} K={k} N={n}"
-            )
-        return _fp8_wgrad(grad_output, x_q, out_dtype)
-    return _lowbit_wgrad(grad_output, x_q, out_dtype)
-
-
 def _ternary_wgrad_from_a8(
     grad_output: torch.Tensor,
     x_int8: torch.Tensor,
     inv_sx: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """configured packed-ternary dW using saved A8 activation when FP8 is selected."""
+    """設定された backend で packed ternary の shadow-weight dW を保存済み A8 活性から計算する."""
+    if _ternary_wgrad_backend == "int8_block":
+        return _int8_mblock_wgrad(grad_output, x_int8, inv_sx).to(out_dtype)
     m, n = grad_output.shape
     k = x_int8.size(1)
-    dims_ok = _fp8_dims_ok(m, k, n)
-    use_fp8 = _ternary_wgrad_uses_fp8(m, k, n)
-    if use_fp8:
-        if not fp8_gemm_supported():
-            raise RuntimeError(
-                "bitlinear ternary wgrad backend=fp8 には "
-                "compute capability 8.9 以上の CUDA GPU が必要です"
-            )
-        if not dims_ok:
-            raise RuntimeError(
-                "bitlinear ternary wgrad backend=fp8 requires "
-                f"M/K/N multiples of 16, got M={m} K={k} N={n}"
-            )
-        return _fp8_wgrad_from_a8(grad_output, x_int8, inv_sx, out_dtype)
-    x_q = x_int8.to(out_dtype) * inv_sx.to(out_dtype).unsqueeze(1)
-    return _lowbit_wgrad(grad_output, x_q, out_dtype)
+    if not _fp8_dims_ok(m, k, n):
+        raise RuntimeError(
+            "bitlinear ternary wgrad backend=fp8 requires "
+            f"M/K/N multiples of 16, got M={m} K={k} N={n}"
+        )
+    return _fp8_wgrad_from_a8(grad_output, x_int8, inv_sx, out_dtype)
 
 
 class _Fp8BitLinearSTE(torch.autograd.Function):
@@ -1922,13 +1996,19 @@ class TernaryBitLinearSTE(torch.autograd.Function):
         k = ctx.input_shape[-1]
         # dX 用 INT8 と dW 用 FP8 転置を dY の 2 pass で同時に作る。dW が FP8
         # backend でない場合は転置出力が要らないので分離実装のまま。
+        int8_block = any(needs_w) and _ternary_wgrad_backend == "int8_block"
         fuse_dy = (
             _fused_dy_plumbing
             and any(needs_w)
-            and _ternary_wgrad_uses_fp8(g2.size(0), k, n)
+            and _ternary_wgrad_backend == "fp8"
+            and _fp8_dims_ok(g2.size(0), k, n)
         )
         gt_f8 = sg = None
-        if fuse_dy:
+        if int8_block:
+            g_int8, inv_sg, qt, block_scale = _quantize_dy_mblock_dual(
+                g2, row_scale if ctx.needs_input_grad[0] else None, inv_sx
+            )
+        elif fuse_dy:
             g_int8, inv_sg, gt_f8, sg = _quantize_dy_dual(g2, row_scale)
         elif ctx.needs_input_grad[0]:
             g_int8, inv_sg = _quantize_a8_rows_scaled(g2, row_scale)
@@ -1950,7 +2030,15 @@ class TernaryBitLinearSTE(torch.autograd.Function):
                 backend=ctx.backend,
             ).reshape(ctx.input_shape)
 
-        if any(needs_w) and grad_accum is not None and fuse_dy and all(needs_w):
+        if int8_block:
+            if grad_accum is not None and all(needs_w):
+                _int8_mblock_wgrad_from_quant(qt, block_scale, x_int8, g2.dtype, out=grad_accum)
+                grad_weights = tuple(None for _ in ctx.out_sizes)
+            else:
+                grad_w = _int8_mblock_wgrad_from_quant(qt, block_scale, x_int8, g2.dtype)
+                raw = grad_w.split(ctx.out_sizes, dim=0)
+                grad_weights = tuple(v if need else None for v, need in zip(raw, needs_w))
+        elif any(needs_w) and grad_accum is not None and fuse_dy and all(needs_w):
             # dW を param.grad (の連結 buffer) へ直接累積し、autograd には None を
             # 返して AccumulateGrad の bf16 add を省く。
             _fp8_wgrad_accumulate_from_a8_pretransposed(

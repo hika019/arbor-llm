@@ -25,7 +25,6 @@ from src.model.bitlinear import (
     _cast_a8_dequant_fp8_transposed,
     _cast_fp8_tensorwise_transposed,
     _legacy_packed_launch_spec,
-    _wgrad_tile,
 )
 
 
@@ -331,40 +330,11 @@ def test_ternary_backend_aliases_and_unknown_backend():
         set_bitlinear_ternary_backend("multiply_free")
 
 
-def test_ternary_wgrad_backend_aliases_and_unknown_backend():
-    assert set_bitlinear_ternary_wgrad_backend("hybrid") == "auto"
-    assert set_bitlinear_ternary_wgrad_backend("shape-auto") == "auto"
-    assert set_bitlinear_ternary_wgrad_backend("int8") == "int8"
-    with pytest.raises(ValueError, match="ternary wgrad backend"):
-        set_bitlinear_ternary_wgrad_backend("bf16")
-
-
-def test_ternary_wgrad_auto_selects_backend_by_shape(monkeypatch):
-    import src.model.bitlinear as bitlinear
-
-    monkeypatch.setattr(bitlinear, "fp8_gemm_supported", lambda: True)
-    monkeypatch.setattr(
-        bitlinear,
-        "_fp8_wgrad",
-        lambda grad, x, dtype: torch.full((grad.size(1), x.size(1)), 8.0),
-    )
-    monkeypatch.setattr(
-        bitlinear,
-        "_lowbit_wgrad",
-        lambda grad, x, dtype: torch.full((grad.size(1), x.size(1)), 1.0),
-    )
-    set_bitlinear_ternary_wgrad_backend("auto")
-    try:
-        fp8_result = bitlinear._ternary_wgrad(
-            torch.empty(16, 32), torch.empty(16, 16), torch.float32
-        )
-        int8_result = bitlinear._ternary_wgrad(
-            torch.empty(16, 16), torch.empty(16, 32), torch.float32
-        )
-    finally:
-        set_bitlinear_ternary_wgrad_backend("int8")
-    assert torch.all(fp8_result == 8)
-    assert torch.all(int8_result == 1)
+def test_ternary_wgrad_backend_names_and_unknown_backend():
+    assert set_bitlinear_ternary_wgrad_backend("int8-block") == "int8_block"
+    for removed in ("int8", "auto", "hybrid", "bf16"):
+        with pytest.raises(ValueError, match="ternary wgrad backend"):
+            set_bitlinear_ternary_wgrad_backend(removed)
 
 
 def test_a8_dequant_fp8_transposed_matches_materialized_xq_cpu():
@@ -391,11 +361,6 @@ def test_a8_dequant_fp8_transposed_matches_materialized_xq_cpu():
     _, expected_scale = _cast_fp8_tensorwise_transposed(x_q)
     assert actual_scale >= expected_scale
     torch.testing.assert_close(actual.float() * actual_scale, x_q.t(), atol=0.0, rtol=0.0625)
-
-
-def test_lowbit_wgrad_tile_presets_cover_small_and_arbor_shapes():
-    assert _wgrad_tile(7, 17, 33) == (32, 32, 32, 4)
-    assert _wgrad_tile(1024, 2048, 2048) == (64, 64, 64, 8)
 
 
 @pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
@@ -509,11 +474,14 @@ def test_packed_ternary_forward_dgrad_and_wgrad_cuda(ternary_backend):
     set_bitlinear_ternary_backend("dot")
 
 
-@pytest.mark.skipif(not fp8_gemm_supported(), reason="sm89+ CUDA required")
-def test_packed_ternary_auto_fp8_wgrad_cuda():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("wgrad_backend", ["int8_block", "fp8"])
+def test_packed_ternary_wgrad_backends_cuda(wgrad_backend):
+    if wgrad_backend == "fp8" and not fp8_gemm_supported():
+        pytest.skip("sm89+ CUDA required")
     torch.manual_seed(3)
     set_bitlinear_ternary_backend("dot_current")
-    set_bitlinear_ternary_wgrad_backend("auto")
+    set_bitlinear_ternary_wgrad_backend(wgrad_backend)
     try:
         ref = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16)
         packed = BitLinear(32, 64).to(device="cuda", dtype=torch.bfloat16)
@@ -544,7 +512,7 @@ def test_packed_ternary_auto_fp8_wgrad_cuda():
             dim=0,
         ) > 0.98
     finally:
-        set_bitlinear_ternary_wgrad_backend("int8")
+        set_bitlinear_ternary_wgrad_backend("int8_block")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -859,13 +827,16 @@ def _fused_grad_accum_available() -> bool:
     return fp8_wgrad_lt_available()
 
 
-@pytest.mark.skipif(not _fused_grad_accum_available(), reason="sm89+ CUDA and cuBLASLt extension required")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("wgrad_backend", ["int8_block", "fp8"])
 @pytest.mark.parametrize("compiled", [False, True])
-def test_fused_grad_accumulation_matches_accumulate_grad(compiled, monkeypatch):
-    """cuBLASLt beta=1 の dW 直接累積が AccumulateGrad 経路と一致すること (Group + 単体)."""
+def test_fused_grad_accumulation_matches_accumulate_grad(compiled, wgrad_backend, monkeypatch):
+    """dW の直接累積 (int8_block は Triton epilogue、fp8 は cuBLASLt beta=1) が AccumulateGrad 経路と一致すること (Group + 単体)."""
+    if wgrad_backend == "fp8" and not _fused_grad_accum_available():
+        pytest.skip("sm89+ CUDA and cuBLASLt extension required")
     torch.manual_seed(5)
     set_bitlinear_ternary_backend("kmajor_single_dot")
-    set_bitlinear_ternary_wgrad_backend("fp8")
+    set_bitlinear_ternary_wgrad_backend(wgrad_backend)
     try:
         def build():
             q = BitLinear(64, 32).to(device="cuda", dtype=torch.bfloat16)
@@ -908,13 +879,18 @@ def test_fused_grad_accumulation_matches_accumulate_grad(compiled, monkeypatch):
         import src.model.bitlinear as bl
 
         calls = []
-        orig = bl._fp8_wgrad_accumulate_from_a8_pretransposed
+        fused_fn = (
+            "_int8_mblock_wgrad_from_quant" if wgrad_backend == "int8_block"
+            else "_fp8_wgrad_accumulate_from_a8_pretransposed"
+        )
+        orig = getattr(bl, fused_fn)
 
         def counted(*args, **kwargs):
-            calls.append(1)
+            if wgrad_backend == "fp8" or kwargs.get("out") is not None:
+                calls.append(1)
             return orig(*args, **kwargs)
 
-        monkeypatch.setattr(bl, "_fp8_wgrad_accumulate_from_a8_pretransposed", counted)
+        monkeypatch.setattr(bl, fused_fn, counted)
         for _ in range(3):
             x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
             run_ref(x).float().square().mean().backward()
@@ -932,4 +908,4 @@ def test_fused_grad_accumulation_matches_accumulate_grad(compiled, monkeypatch):
         assert fused.q.weight.grad.data_ptr() == gbuf.data_ptr()
     finally:
         set_bitlinear_ternary_backend("dot")
-        set_bitlinear_ternary_wgrad_backend("auto")
+        set_bitlinear_ternary_wgrad_backend("int8_block")

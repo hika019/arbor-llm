@@ -202,7 +202,7 @@ speed:
   bitlinear_ternary_tuning_warmup: 10
   bitlinear_ternary_tuning_iters: 30
   bitlinear_ternary_tuning_verbose: false
-  bitlinear_ternary_wgrad_backend: fp8 # choices: int8 | fp8 | auto。autoはN>=KでFP8、それ以外はINT8。
+  bitlinear_ternary_wgrad_backend: int8_block # choices: int8_block (token block scale の INT8、sm80+) | fp8 (tensorwise e4m3、sm89+)
   bitnet_weight_cache: full     # int8/ternary は全 BitLinear の low-bit cache が必須
   bitnet_weight_cache_gib: 3.25 # INT8 ternary + FP8(N×K/K×N)両layout用
   bitnet_weight_cache_min_numel: 0

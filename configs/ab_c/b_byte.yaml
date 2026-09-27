@@ -133,7 +133,7 @@ speed:
   bitlinear_ternary_tuning_warmup: 10
   bitlinear_ternary_tuning_iters: 30
   bitlinear_ternary_tuning_verbose: false
-  bitlinear_ternary_wgrad_backend: fp8
+  bitlinear_ternary_wgrad_backend: int8_block # choices: int8_block (token block scale の INT8、sm80+) | fp8 (tensorwise e4m3、sm89+)
   bitnet_weight_cache: full
   bitnet_weight_cache_gib: 3.25
   bitnet_weight_cache_min_numel: 0

@@ -23,22 +23,21 @@ import src.model.bitlinear as bitlinear_mod
 from src.model.bitlinear import (
     _FP8_E4M3,
     _FP8_MAX,
-    _int8_wgrad_kernel,
     _int8_linear,
     _cast_a8_dequant_fp8_transposed,
     _cast_fp8_tensorwise,
     _cast_fp8_tensorwise_transposed,
     _fp8_wgrad_from_a8,
-    _lowbit_wgrad,
+    _int8_mblock_wgrad,
+    _int8_mblock_wgrad_from_quant,
     _packed_linear,
     _packed_linear_custom_op,
     _packed_linear_execute,
     _quantize_a8_rows,
     _quantize_a8_rows_scaled,
-    _quantize_int8_tensorwise,
+    _quantize_dy_mblock_dual,
     _scaled_mm_tensorwise,
     _ternary_backend_flags,
-    _wgrad_tile,
     configure_bitlinear_ternary_tuning,
     fp8_gemm_supported,
     pack_ternary_weight,
@@ -175,37 +174,6 @@ def _print_dense_efficiency(
         )
 
 
-def _wgrad_gemm_from_quantized(
-    g_int8: torch.Tensor,
-    sg: torch.Tensor,
-    x_int8: torch.Tensor,
-    sx: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    if triton is None:
-        raise RuntimeError("Triton is required")
-    m, n = g_int8.shape
-    k = x_int8.size(1)
-    out = torch.empty((n, k), device=g_int8.device, dtype=out_dtype)
-    block_n, block_k, block_m, num_warps = _wgrad_tile(m, n, k)
-    grid = (triton.cdiv(n, block_n), triton.cdiv(k, block_k))
-    _int8_wgrad_kernel[grid](
-        g_int8,
-        x_int8,
-        sg,
-        sx,
-        out,
-        m,
-        n,
-        k,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        BLOCK_M=block_m,
-        num_warps=num_warps,
-    )
-    return out
-
-
 def _int8_fp8_dx(
     grad: torch.Tensor,
     row_scale: torch.Tensor,
@@ -320,9 +288,8 @@ def _ternary_wgrad(
     inv_sx: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Replicate the full TernaryBitLinearSTE.backward dW path."""
-    x_q = x_int8.to(out_dtype) * inv_sx.to(out_dtype).unsqueeze(1)
-    return _lowbit_wgrad(grad, x_q, out_dtype)
+    """Replicate the full TernaryBitLinearSTE.backward dW path (int8_block)."""
+    return _int8_mblock_wgrad(grad, x_int8, inv_sx).to(out_dtype)
 
 
 def _print_results(
@@ -603,13 +570,12 @@ def _bench_shape(
 
     if include_wgrad:
         grad = torch.randn((m, n), device="cuda", dtype=dtype)
-        x_q = x_int8.to(dtype) * inv_sx.to(dtype).unsqueeze(1)
         result = _measure(
-            lambda: _lowbit_wgrad(grad, x_q, dtype),
+            lambda: _int8_mblock_wgrad(grad, x_int8, inv_sx),
             warmup=warmup,
             iters=iters,
         )
-        print(f"  {'lowbit_wgrad':22s} {result['median']:8.3f} ms  "
+        print(f"  {'int8_block_wgrad':22s} {result['median']:8.3f} ms  "
               f"p10={result['p10']:8.3f}  p90={result['p90']:8.3f}")
 
     if breakdown:
@@ -618,8 +584,7 @@ def _bench_shape(
         g_int8, inv_sg = _quantize_a8_rows_scaled(grad, row_scale)
         one = row_scale.new_ones(())
         x_q = x_int8.to(dtype) * inv_sx.to(dtype).unsqueeze(1)
-        wg_int8, wg_sg = _quantize_int8_tensorwise(grad)
-        wx_int8, wx_sx = _quantize_int8_tensorwise(x_q)
+        _, _, wg_qt, wg_scale = _quantize_dy_mblock_dual(grad, None, inv_sx)
         breakdown_kernels = {
             "a8_quant_fwd": lambda: _quantize_a8_rows(x),
             "fwd_int8_int_mm": lambda: int8_linear_backend("int_mm"),
@@ -721,18 +686,10 @@ def _bench_shape(
             "x_reconstruct": lambda: (
                 x_int8.to(dtype) * inv_sx.to(dtype).unsqueeze(1)
             ),
-            "wgrad_quant": lambda: (
-                _quantize_int8_tensorwise(grad),
-                _quantize_int8_tensorwise(x_q),
+            "wgrad_quant": lambda: _quantize_dy_mblock_dual(grad, None, inv_sx),
+            "wgrad_gemm": lambda: _int8_mblock_wgrad_from_quant(
+                wg_qt, wg_scale, x_int8, dtype
             ),
-            "wgrad_gemm": lambda: _wgrad_gemm_from_quantized(
-                wg_int8,
-                wg_sg,
-                wx_int8,
-                wx_sx,
-                dtype,
-            ),
-            "wgrad_core": lambda: _lowbit_wgrad(grad, x_q, dtype),
             "ternary_wgrad_total": lambda: _ternary_wgrad(
                 grad,
                 x_int8,

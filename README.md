@@ -275,10 +275,11 @@ micro-batchを1にしてgrad accumulationを増やすことで実効batchを維�
   `raw_plan = auto + cache`である。
   `dot_current` は旧vectorized decode後に `tl.dot` でINT8 Tensor Coreを使う。
   `kmajor_current` はlayout単独比較、`dot` は4-way grouped decode比較用。dWは
-  `speed.bitlinear_ternary_wgrad_backend: int8|fp8|auto` で選択できる。
-  `int8` は `Q(dY)^T Q(X)` のdense INT8 GEMM、`fp8` はtensorwise FP8 GEMM、
-  `auto` は現在の代表shape測定に基づき `N>=K` でFP8、それ以外でINT8を使う。
-  現行1B/8k構成ではpacked ternaryと`fp8` dWを既定にする。
+  `speed.bitlinear_ternary_wgrad_backend: int8_block|fp8` で選択できる (既定 `int8_block`)。
+  `int8_block` は A8 の per-token scale を dY 側へ畳み込み、token 128 個 × 出力 channel
+  ごとの scale で INT8 化して INT32 → FP32 で block ごとに累積する (sm80+)。`fp8` は
+  tensorwise e4m3 の cuBLASLt GEMM (sm89+)。dW は token 方向の総和なので scale 1 個の
+  INT8 は小さい channel の勾配が 0 に潰れる (小型 Arbor 1500 step で loss +0.28、削除済み)。
 - `model.global_attn_impl: flex` は CUDA + `torch.compile` 必須。条件を満たさない
   場合はエラーになり、SDPAへ暗黙フォールバックしない。
 - `optim.state_precision: fp32` が既定。実データ1000-stepでloss 1.89まで安定して低下。
