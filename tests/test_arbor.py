@@ -30,7 +30,7 @@ def tiny_cfg(mode: str) -> dict:
     cfg = dict(TINY, patching_mode=mode)
     if mode != "static":
         cfg["patch_pooling"] = "max"  # 動的モードは concat 不可 (既定 concat は static 用)
-    if mode == "entropy":
+    if mode in ("entropy", "entropy_char"):
         cfg["entropy_model"] = TINY_ENTROPY_LM
     return cfg
 
@@ -68,7 +68,7 @@ def test_unknown_patch_pooling_is_error():
 
 def test_concat_patch_pooling_is_rejected_in_dynamic_modes():
     """concat は patch 長固定 (static) 専用。動的モードで黙って max に化けないこと."""
-    for mode in ("utf8", "space", "entropy"):
+    for mode in ("utf8", "space", "entropy", "entropy_char"):
         cfg = ArborConfig.from_dict(dict(tiny_cfg(mode), patch_pooling="concat"))
         with pytest.raises(ValueError, match="concat"):
             ArborModel(cfg)
@@ -103,7 +103,7 @@ def test_dynamic_mean_patch_pooling_forward_and_grad():
     assert torch.isfinite(m.patch_proj.weight.grad).all()
 
 
-@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
 def test_causality(mode, pos):
     """位置 pos のバイトを変えても、位置 < pos の logits は変わらないこと.
@@ -186,7 +186,7 @@ def test_document_isolation_with_padding_to_patch_boundary():
     )
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
 def test_window_path_matches_dense(mode, monkeypatch):
     """T が chunk の倍数のときの窓 attention 経路が密マスク経路と一致すること.
 
@@ -210,7 +210,7 @@ def test_window_path_matches_dense(mode, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
 def test_dynamic_forward_shape_and_grads(mode):
     torch.manual_seed(0)
     m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode)))
@@ -226,7 +226,7 @@ def test_dynamic_forward_shape_and_grads(mode):
     assert not missing, f"勾配が届いていない: {missing[:5]}"
     bad = [n for n, p in trainable if p.grad is not None and not torch.isfinite(p.grad).all()]
     assert not bad, f"非有限の勾配: {bad[:5]}"
-    if mode == "entropy":
+    if mode in ("entropy", "entropy_char"):
         # 凍結 ByteLM は学習されない
         assert all(not p.requires_grad for p in m.entropy_model.parameters())
 
@@ -378,7 +378,7 @@ def test_patch_starts_cuda_matches_cpu_reference():
     assert torch.equal(cuda, cpu)
 
 
-@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy", "entropy_char"])
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
     torch.manual_seed(3)
@@ -636,12 +636,13 @@ def test_patch_starts_cuda_matches_reference_with_force_and_budget(budget):
 
 
 def _tight_dynamic_cfg(mode):
-    # max_bytes=64, max_patch_len=8 → 予算の下限 8。max_patches=10 で候補の大半を予算で削らせる
-    return dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=8, max_patches=10,
-                entropy_threshold=0.0)
+    # max_bytes=64, max_patch_len=8 → 予算の下限 8 (entropy_char は単位 5 で 13)。下限の少し上に置き、
+    # 候補の大半を予算で削らせる
+    return dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=8,
+                max_patches=14 if mode == "entropy_char" else 10, entropy_threshold=0.0)
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("pos", [5, 20, 40])
 def test_causality_with_budget_and_documents(mode, pos):
     """予算ガードが効き、文書境界がある状態でも未来のバイトが過去の logits に漏れない."""
@@ -657,7 +658,7 @@ def test_causality_with_budget_and_documents(mode, pos):
     assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5)
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
 def test_generator_matches_full_forward_with_budget(mode):
     """逐次生成器の境界判定 (予算ガードが効く状態) がフルフォワードと一致すること.
 
@@ -686,7 +687,7 @@ def _byte_cfg(mode, window=None, n=2, **over):
     return cfg
 
 
-@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["static", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("window", [None, 5])
 def test_byte_layers_forward_and_grads(mode, window):
     torch.manual_seed(0)
@@ -701,7 +702,7 @@ def test_byte_layers_forward_and_grads(mode, window):
     assert not missing, missing
 
 
-@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("window", [None, 6])
 @pytest.mark.parametrize("pos", [4, 13, 29])
 def test_byte_layers_causality(mode, window, pos):
@@ -749,7 +750,7 @@ def test_byte_layers_document_isolation():
     assert torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-5), "doc1 の変更が byte 層経由で doc2 に漏れている"
 
 
-@pytest.mark.parametrize("mode", ["static", "space", "entropy"])
+@pytest.mark.parametrize("mode", ["static", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("window", [None, 5])
 def test_generator_matches_full_forward_with_byte_layers(mode, window):
     torch.manual_seed(4)
@@ -823,3 +824,72 @@ def test_bytelm_residual_stream_uses_autocast_dtype_with_fp32_params():
         m(torch.randint(4, 260, (1, 16)))
     assert next(m.parameters()).dtype is torch.float32
     assert seen == [torch.bfloat16]
+
+
+
+# ---------------------------------------------------------------- entropy_char (文字先頭だけで区切る)
+def _ja_ids(text: str) -> torch.Tensor:
+    return torch.tensor([[b + 4 for b in text.encode()]])
+
+
+def test_entropy_char_never_splits_inside_a_character():
+    """2 byte 目 (継続 byte) の予測が難しくても、区切りは必ず文字の先頭に来る."""
+    ids = _ja_ids("政府は来年度予算の概算要求を取りまとめた。一般会計の総額は過去最大となる。")
+    g = torch.Generator().manual_seed(0)
+    ent = torch.rand(ids.shape, generator=g) * 4
+    cur = ids - 4
+    cont = (cur & 0xC0) == 0x80
+    ent[cont] += 3.0  # 継続 byte の予測を難しくする (実モデルの傾向)
+    for mode in ("entropy", "entropy_char"):
+        st = compute_patch_starts(ids, mode, 1, 16, entropy_values=ent, threshold=3.0)[0]
+        mid = int((st & cont[0]).sum())
+        if mode == "entropy":
+            assert mid > 0, "対照: entropy は文字の途中で区切る"
+        else:
+            assert mid == 0
+
+
+def test_entropy_char_soft_boundary_before_max_len_and_budget():
+    from src.model.arbor import _patch_starts_reference
+
+    ids = _ja_ids("あ" * 60)
+    ent = torch.zeros(ids.shape)  # 閾値を超えない → 最長付近の文字先頭でだけ区切る
+    cur = ids - 4
+    cont = (cur & 0xC0) == 0x80
+    st = compute_patch_starts(ids, "entropy_char", 1, 16, entropy_values=ent, threshold=10.0,
+                              budget=15, horizon=180)[0]
+    pos = st.nonzero().flatten().tolist()
+    lens = [b - a for a, b in zip(pos, pos[1:] + [ids.size(1)])]
+    assert not bool((st & cont[0]).any())
+    assert max(lens) <= 16 and all(ln >= 13 for ln in lens[:-1])
+    assert len(pos) <= 15
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_entropy_char_cuda_matches_reference():
+    g = torch.Generator().manual_seed(3)
+    text = "日本語のテキストとEnglish words、数字123と記号!?を混ぜた文章です。" * 4
+    ids = _ja_ids(text)
+    ent = torch.rand(ids.shape, generator=g) * 5
+    for budget in (0, 40):
+        for info_min, info_max in ((0.0, float("inf")), (6.0, 15.0)):
+            kw = dict(entropy_values=ent, threshold=4.0, eos_token_id=2, budget=budget,
+                      horizon=ids.size(1), info_min=info_min, info_max=info_max)
+            cpu = compute_patch_starts(ids, "entropy_char", 1, 12, **kw)
+            gpu = compute_patch_starts(ids.cuda(), "entropy_char", 1, 12,
+                                       **dict(kw, entropy_values=ent.cuda())).cpu()
+            assert torch.equal(cpu, gpu)
+
+
+def test_generator_matches_full_forward_entropy_char_japanese():
+    torch.manual_seed(13)
+    cfg = dict(tiny_cfg("entropy_char"), min_patch_len=1, max_patch_len=8, max_patches=40,
+               entropy_threshold=1.0, bitnet=False, max_bytes=128)
+    m = ArborModel(ArborConfig.from_dict(cfg)).eval()
+    ids = _ja_ids("今日は天気が良いので散歩に行きました。明日も晴れるといいな。")[0][:90]
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i in range(len(ids)):
+            inc = gen.push(int(ids[i]))
+            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
+            assert torch.allclose(inc, full, atol=2e-4), f"pos={i}"

@@ -13,16 +13,26 @@ namespace {
 //     上限に収まることを常に保証するので、patch 数は budget を超えない。判定は
 //     位置と過去の境界だけで決まる (因果的)。max_len 到達の強制境界はこの不変条件から
 //     常に許される。
+//   - soft_len > 0 (entropy_char) なら、run >= soft_len の文字先頭 (char_start) も候補にして
+//     max_len 到達前に文字の境目で区切る。予算の単位 reserve は soft_len にする。
+//   - acc = 現 patch の byte の info の和 (double、参照実装と同じ順で加算)。raw は acc >= info_min
+//     のときだけ候補、acc >= info_max なら文字先頭で区切る (entropy_char 以外は 0 / +inf)。
 __global__ void patch_starts_kernel(
     const bool* __restrict__ raw,
     const bool* __restrict__ force,
+    const bool* __restrict__ char_start,
+    const float* __restrict__ info,
     bool* __restrict__ starts,
     int64_t rows,
     int64_t cols,
     int64_t min_len,
     int64_t max_len,
     int64_t budget,
-    int64_t horizon
+    int64_t horizon,
+    int64_t soft_len,
+    int64_t reserve,
+    double info_min,
+    double info_max
 ) {
     int64_t row = blockIdx.x;
     if (row >= rows || threadIdx.x != 0) {
@@ -39,19 +49,22 @@ __global__ void patch_starts_kernel(
         const int64_t hi = min(i + max_len, cols);
         const int64_t lo = i + min_len;
         int64_t next = hi;
+        double acc = (double)info[base + i];
         for (int64_t p = i + 1; p < hi; ++p) {
-            const bool cand = force[base + p] || (p >= lo && raw[base + p]);
-            if (!cand) {
-                continue;
-            }
-            if (budget > 0) {
+            const bool cs = char_start[base + p];
+            const bool cand = force[base + p] ||
+                (p >= lo && raw[base + p] && acc >= info_min) ||
+                (p >= lo && cs && (acc >= info_max || (soft_len > 0 && p - i >= soft_len)));
+            bool ok = cand;
+            if (ok && budget > 0) {
                 const int64_t rem = max(horizon - p, (int64_t)0);
-                if (count + (rem + max_len - 1) / max_len > budget) {
-                    continue;
-                }
+                ok = count + (rem + reserve - 1) / reserve <= budget;
             }
-            next = p;
-            break;
+            if (ok) {
+                next = p;
+                break;
+            }
+            acc += (double)info[base + p];
         }
         i = next;
     }
@@ -60,15 +73,20 @@ __global__ void patch_starts_kernel(
 }  // namespace
 
 torch::Tensor patch_starts_cuda(
-    torch::Tensor raw, torch::Tensor force, int64_t min_len, int64_t max_len,
-    int64_t budget, int64_t horizon
+    torch::Tensor raw, torch::Tensor force, torch::Tensor char_start, torch::Tensor info,
+    int64_t min_len, int64_t max_len, int64_t budget, int64_t horizon, int64_t soft_len,
+    int64_t reserve, double info_min, double info_max
 ) {
-    TORCH_CHECK(raw.is_cuda() && force.is_cuda(), "raw/force must be CUDA tensors");
-    TORCH_CHECK(raw.scalar_type() == torch::kBool && force.scalar_type() == torch::kBool,
-                "raw/force must be bool");
+    TORCH_CHECK(raw.is_cuda() && force.is_cuda() && char_start.is_cuda(), "inputs must be CUDA tensors");
+    TORCH_CHECK(raw.scalar_type() == torch::kBool && force.scalar_type() == torch::kBool &&
+                char_start.scalar_type() == torch::kBool, "inputs must be bool");
     TORCH_CHECK(raw.dim() == 2, "raw must be rank-2 (B, T)");
-    TORCH_CHECK(raw.sizes() == force.sizes(), "raw/force shape mismatch");
-    TORCH_CHECK(raw.is_contiguous() && force.is_contiguous(), "raw/force must be contiguous");
+    TORCH_CHECK(raw.sizes() == force.sizes() && raw.sizes() == char_start.sizes(), "shape mismatch");
+    TORCH_CHECK(raw.is_contiguous() && force.is_contiguous() && char_start.is_contiguous(),
+                "inputs must be contiguous");
+    TORCH_CHECK(reserve > 0, "reserve must be positive");
+    TORCH_CHECK(info.is_cuda() && info.scalar_type() == torch::kFloat && info.sizes() == raw.sizes() &&
+                info.is_contiguous(), "info must be a contiguous float32 CUDA tensor shaped like raw");
     TORCH_CHECK(min_len > 0, "min_len must be positive");
     TORCH_CHECK(max_len >= min_len, "max_len must be >= min_len");
 
@@ -83,13 +101,19 @@ torch::Tensor patch_starts_cuda(
     patch_starts_kernel<<<rows, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
         raw.data_ptr<bool>(),
         force.data_ptr<bool>(),
+        char_start.data_ptr<bool>(),
+        info.data_ptr<float>(),
         starts.data_ptr<bool>(),
         rows,
         cols,
         min_len,
         max_len,
         budget,
-        horizon
+        horizon,
+        soft_len,
+        reserve,
+        info_min,
+        info_max
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return starts;

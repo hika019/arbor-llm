@@ -393,7 +393,7 @@ def resolve_entropy_lm_reference(cfg: dict, arbor_config_path: Path) -> dict:
     model_cfg = resolved.get("model", {})
     if model_cfg.get("arch", "arbor") != "arbor":
         return resolved
-    if model_cfg.get("patching_mode", "static") != "entropy":
+    if model_cfg.get("patching_mode", "static") not in ("entropy", "entropy_char"):
         return resolved
 
     reference = resolved.get("entropy_lm_config")

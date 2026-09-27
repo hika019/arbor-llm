@@ -100,8 +100,9 @@ def main() -> int:
         raise SystemExit("--target-fill must be in (0, 1]")
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     model_cfg = cfg["model"]
-    if model_cfg.get("patching_mode") != "entropy":
-        raise SystemExit("the config must use model.patching_mode: entropy")
+    mode = model_cfg.get("patching_mode")
+    if mode not in ("entropy", "entropy_char"):
+        raise SystemExit("the config must use model.patching_mode: entropy | entropy_char")
 
     from src.model.arbor import compute_patch_starts
     from src.train.train import resolve_entropy_lm_reference
@@ -141,8 +142,10 @@ def main() -> int:
 
     def counts_at(threshold: float) -> torch.Tensor:
         starts = compute_patch_starts(
-            ids_all, "entropy", min_len, max_len, entropy_values=ent_all, threshold=threshold,
+            ids_all, mode, min_len, max_len, entropy_values=ent_all, threshold=threshold,
             eos_token_id=eos, budget=budget, horizon=max_bytes,
+            info_min=float(model_cfg.get("patch_info_min", 8.0)),
+            info_max=float(model_cfg.get("patch_info_max", 24.0)),
         )
         return starts.sum(1).float()
 

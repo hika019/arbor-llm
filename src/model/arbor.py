@@ -118,7 +118,7 @@ class ArborConfig:
     vocab_size: int = 260          # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
     max_bytes: int = 2048          # 学習 context (bytes)
     # ---- patching ----
-    patching_mode: str = "static"  # choices: static | utf8 | space | entropy
+    patching_mode: str = "static"  # choices: static | utf8 | space | entropy | entropy_char
     patch_size: int = 4            # static 用: 1 patch のバイト数
     # concat: patch 内 byte を連結して p*dl→dg 射影 (static 専用、情報を落とさない)。
     # mean/max: 固定 local_hidden dim pooling (static/dynamic 共通、patch_size 非依存)。
@@ -127,6 +127,10 @@ class ArborConfig:
     max_patch_len: int = 16        # 動的用: これに達したら強制的に区切る
     max_patches: int | None = None # 動的用: 固定 pad する patch 数。None なら worst-case
     entropy_threshold: float = 1.5 # entropy 用: 次バイト H (nats) がこれを超えたら区切る
+    # entropy_char 用: patch に溜まった情報量 (nats) の下限 (これ未満は閾値超えでも区切らない) と
+    # 上限 (達したら文字先頭で区切る)。ByteLM のエントロピーの尺度に依存するので校正すること
+    patch_info_min: float = 8.0
+    patch_info_max: float = 24.0
     entropy_model: dict | None = None       # entropy 用: ByteLM の構成 (inline dict)
     entropy_model_ckpt: str | None = None   # entropy 用: 初回構築時に重みを読む checkpoint dir
     attention_window: int | None = None     # ByteLM 用: causal attention を直近 N byte に制限
@@ -781,6 +785,8 @@ def build_byte_lm(model_cfg: dict[str, Any]) -> ByteLM:
 
 # ----------------------------------------------------------- patch 境界判定
 _SPACE_BYTES = (0x20, 0x09, 0x0A, 0x0D)  # space, tab, LF, CR
+ENTROPY_MODES = ("entropy", "entropy_char")  # 凍結 ByteLM のエントロピーで区切るモード
+_UTF8_MAX_CONT = 3  # UTF-8 の 1 文字の継続 byte の最大数
 
 
 def _is_utf8_char_start_byte(byte: int) -> bool:
@@ -790,6 +796,8 @@ def _is_utf8_char_start_byte(byte: int) -> bool:
 
 def _patch_starts_reference(
     raw: torch.Tensor, force: torch.Tensor, min_len: int, max_len: int, budget: int, horizon: int,
+    char_start: torch.Tensor | None = None, soft_len: int = 0, reserve: int | None = None,
+    info: torch.Tensor | None = None, info_min: float = 0.0, info_max: float = float("inf"),
 ) -> torch.Tensor:
     """境界 walk の CPU 参照実装。CUDA kernel (csrc/patch_starts.cu) と生成器
     (ArborByteGenerator._starts_new_patch) はこれと同じ規則で実装する.
@@ -802,10 +810,17 @@ def _patch_starts_reference(
       (count = それまでに開いた patch 数)。残りを max_len ずつ区切っても上限に収まる
       ことを常に保つので patch 数は budget を超えない。判定は位置と過去の境界だけで
       決まる (因果的)。horizon は系列長ではなく固定値 (max_bytes) を使うこと。
+    - soft_len > 0 (entropy_char) なら run >= soft_len の文字先頭 (char_start) も候補にし、
+      max_len 到達前に文字の境目で区切る。予算の単位 reserve (既定 max_len) は soft_len にする。
+    - acc = 現 patch の byte の info の和。raw[p] は acc >= info_min のときだけ候補、
+      acc >= info_max なら文字先頭 (run >= min_len) で区切る (entropy_char 以外は 0 / +inf)。
     """
     b, t = raw.shape
+    reserve = reserve or max_len
     starts = torch.zeros(b, t, dtype=torch.bool)
     raw_l, force_l = raw.cpu().tolist(), force.cpu().tolist()
+    cs_l = char_start.cpu().tolist() if char_start is not None else None
+    info_l = info.cpu().float().tolist() if info is not None else None
     for r in range(b):
         i = 0
         count = 0
@@ -815,13 +830,16 @@ def _patch_starts_reference(
             hi = min(i + max_len, t)
             lo = i + min_len
             nxt = hi
+            acc = info_l[r][i] if info_l is not None else 0.0
             for p in range(i + 1, hi):
-                if not (force_l[r][p] or (p >= lo and raw_l[r][p])):
-                    continue
-                if budget > 0 and count + -(-max(horizon - p, 0) // max_len) > budget:
-                    continue
-                nxt = p
-                break
+                cs = cs_l is None or cs_l[r][p]
+                cand = (force_l[r][p] or (p >= lo and raw_l[r][p] and acc >= info_min)
+                        or (p >= lo and cs and (acc >= info_max or (soft_len > 0 and p - i >= soft_len))))
+                if cand and (budget <= 0 or count + -(-max(horizon - p, 0) // reserve) <= budget):
+                    nxt = p
+                    break
+                if info_l is not None:
+                    acc += info_l[r][p]
             i = nxt
     return starts.to(raw.device)
 
@@ -832,17 +850,22 @@ def _patch_starts_reference(
 # 待ちが出ていた: 2026-09-26 プロファイル)。
 @torch.library.custom_op("arbor::patch_starts", mutates_args=())
 def _patch_starts_op(
-    raw: torch.Tensor, force: torch.Tensor, min_len: int, max_len: int, budget: int, horizon: int,
+    raw: torch.Tensor, force: torch.Tensor, char_start: torch.Tensor, info: torch.Tensor,
+    min_len: int, max_len: int, budget: int, horizon: int, soft_len: int, reserve: int,
+    info_min: float, info_max: float,
 ) -> torch.Tensor:
     if raw.is_cuda:
         from src.model.patch_starts_cuda import patch_starts_cuda
 
-        return patch_starts_cuda(raw, force, min_len, max_len, budget, horizon)
-    return _patch_starts_reference(raw, force, min_len, max_len, budget, horizon)
+        return patch_starts_cuda(raw, force, min_len, max_len, budget, horizon,
+                                 char_start, soft_len, reserve, info, info_min, info_max)
+    return _patch_starts_reference(raw, force, min_len, max_len, budget, horizon,
+                                   char_start, soft_len, reserve, info, info_min, info_max)
 
 
 @_patch_starts_op.register_fake
-def _(raw, force, min_len, max_len, budget, horizon):
+def _(raw, force, char_start, info, min_len, max_len, budget, horizon, soft_len, reserve,
+      info_min, info_max):
     return torch.empty_like(raw)
 
 
@@ -858,12 +881,21 @@ def compute_patch_starts(
     eos_token_id: int | None = None,
     budget: int = 0,
     horizon: int = 0,
+    info_min: float = 0.0,
+    info_max: float = float("inf"),
 ) -> torch.Tensor:
-    """patch 開始位置の bool tensor (B, T) を返す。判定は過去バイトのみに依存 (causal).
+    """patch 開始位置の bool tensor (B, T) を返す。判定は過去と現在のバイトのみに依存 (causal).
 
     - utf8:    現在バイトが UTF-8 文字先頭なら新 patch を開始
     - space:   直前バイトが空白系なら新 patch を開始
     - entropy: 直前位置での次バイト予測エントロピーが threshold 超なら開始
+    - entropy_char: 文字先頭だけで区切る entropy。多バイト文字は 1 byte 目 (範囲) より
+      2 byte 目 (どの文字か) の予測が難しく、entropy では文字の途中で区切られる (日本語で
+      境界の過半)。score = その文字の 1 byte 目 + (多バイトなら) 2 byte 目の予測エントロピー。
+      2 byte 目の予測は現在バイト (文字先頭) までで決まる。1 文字の情報量は文字種で大きく違う
+      (中国語 1 字 ≫ 英字 1 字) ので、patch に溜まった情報量 (byte ごとの予測エントロピーの和) が
+      info_min 未満なら score が高くても区切らず、info_max に達したら文字先頭で区切る。
+      max_len - 3 以降も文字先頭で区切る (UTF-8 は最長 4 byte なので max_len までに必ずある)。
     その後 min_len / max_len / 文書先頭 (eos_token_id の直後、min_len 無視) /
     予算ガード (budget, horizon) を適用する。規則の詳細は _patch_starts_reference。
     """
@@ -871,13 +903,20 @@ def compute_patch_starts(
         raise ValueError("min_patch_len must be positive")
     if max_len < min_len:
         raise ValueError("max_patch_len must be >= min_patch_len")
-    if budget > 0 and budget < -(-horizon // max_len):
-        raise ValueError(f"budget={budget} は ceil(horizon/max_len)={-(-horizon // max_len)} 以上が必要")
+    soft_len = max_len - _UTF8_MAX_CONT if mode == "entropy_char" else 0
+    if mode == "entropy_char" and soft_len < min_len:
+        raise ValueError(f"entropy_char は max_patch_len - {_UTF8_MAX_CONT} >= min_patch_len が必要")
+    reserve = soft_len or max_len
+    if budget > 0 and budget < -(-horizon // reserve):
+        raise ValueError(f"budget={budget} は ceil(horizon/{reserve})={-(-horizon // reserve)} 以上が必要")
 
-    b, t = input_ids.shape
+    cur = input_ids - BYTE_OFFSET
+    char_start = (cur < 0x80) | ((cur >= 0xC2) & (cur <= 0xF4))
+    info = torch.zeros(input_ids.shape, dtype=torch.float32, device=input_ids.device)
+    if mode != "entropy_char":
+        info_min, info_max = 0.0, float("inf")
     if mode == "utf8":
-        cur = input_ids - BYTE_OFFSET
-        raw = ((cur < 0x80) | ((cur >= 0xC2) & (cur <= 0xF4))).to(torch.bool)
+        raw = char_start.clone()
         raw[:, 0] = False
     elif mode == "space":
         prev = input_ids[:, :-1] - BYTE_OFFSET
@@ -885,14 +924,21 @@ def compute_patch_starts(
         for sb in _SPACE_BYTES:
             is_space |= prev == sb
         raw = F.pad(is_space, (1, 0), value=False)
-    elif mode == "entropy":
+    elif mode in ENTROPY_MODES:
         if entropy_values is None:
             if entropy_model is None:
-                raise ValueError("patching_mode=entropy には entropy_model が必要")
+                raise ValueError(f"patching_mode={mode} には entropy_model が必要")
             ent = entropy_model.next_byte_entropy(input_ids)  # (B, T), no_grad in ByteLM
         else:
             ent = entropy_values
-        raw = F.pad(ent[:, :-1] > threshold, (1, 0), value=False)
+        if mode == "entropy":
+            raw = F.pad(ent[:, :-1] > threshold, (1, 0), value=False)
+        else:
+            multi_lead = (cur >= 0xC2) & (cur <= 0xF4)
+            info = F.pad(ent[:, :-1].float(), (1, 0), value=0.0)
+            score = info + torch.where(multi_lead, ent.float(), torch.zeros_like(info))
+            raw = char_start & (score > threshold)
+            raw[:, 0] = False
     else:
         raise ValueError(f"unknown dynamic patching mode: {mode}")
 
@@ -901,7 +947,9 @@ def compute_patch_starts(
     else:
         force = F.pad(input_ids[:, :-1] == eos_token_id, (1, 0), value=False)
     return torch.ops.arbor.patch_starts(
-        raw.contiguous(), force.contiguous(), int(min_len), int(max_len), int(budget), int(horizon)
+        raw.contiguous(), force.contiguous(), char_start.contiguous(), info.contiguous(),
+        int(min_len), int(max_len), int(budget), int(horizon), int(soft_len), int(reserve),
+        float(info_min), float(info_max),
     )
 
 
@@ -935,7 +983,7 @@ class _LayerKVCache:
 class ArborModel(nn.Module):
     def __init__(self, cfg: ArborConfig):
         super().__init__()
-        if cfg.patching_mode not in ("static", "utf8", "space", "entropy"):
+        if cfg.patching_mode not in ("static", "utf8", "space", *ENTROPY_MODES):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
         if cfg.patch_pooling not in ("concat", "mean", "max"):
             raise ValueError(
@@ -963,12 +1011,15 @@ class ArborModel(nn.Module):
         if self.dynamic:
             worst_case_patches = math.ceil(cfg.max_bytes / cfg.min_patch_len)
             self.max_patches = cfg.max_patches or worst_case_patches
-            # 予算ガードが成立する下限: 残り全部を max_patch_len で区切った patch 数
-            min_budget = math.ceil(cfg.max_bytes / cfg.max_patch_len)
+            # 予算ガードが成立する下限: 残り全部を最長 (entropy_char は max_patch_len - 3) で区切った patch 数
+            unit = cfg.max_patch_len - (_UTF8_MAX_CONT if cfg.patching_mode == "entropy_char" else 0)
+            if unit < cfg.min_patch_len:
+                raise ValueError(f"entropy_char は max_patch_len - {_UTF8_MAX_CONT} >= min_patch_len が必要")
+            min_budget = math.ceil(cfg.max_bytes / unit)
             if self.max_patches < min_budget or self.max_patches > worst_case_patches:
                 raise ValueError(
                     f"max_patches must be in [{min_budget}, {worst_case_patches}] "
-                    f"(= [ceil(max_bytes/max_patch_len), ceil(max_bytes/min_patch_len)]), "
+                    f"(= [ceil(max_bytes/{unit}), ceil(max_bytes/min_patch_len)]), "
                     f"got {self.max_patches}"
                 )
         else:
@@ -1055,10 +1106,10 @@ class ArborModel(nn.Module):
         )
 
         # entropy 用の凍結 ByteLM (checkpoint に同梱される)
-        if cfg.patching_mode == "entropy":
+        if cfg.patching_mode in ENTROPY_MODES:
             if not cfg.entropy_model:
                 raise ValueError(
-                    "patching_mode=entropy には model.entropy_model (ByteLM 構成) が必要"
+                    f"patching_mode={cfg.patching_mode} には model.entropy_model (ByteLM 構成) が必要"
                 )
             em_cfg = dict(cfg.entropy_model)
             em_cfg.setdefault("max_bytes", cfg.max_bytes)
@@ -1221,6 +1272,7 @@ class ArborModel(nn.Module):
             input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
             self.entropy_model, cfg.entropy_threshold, entropy_values,
             eos_token_id=cfg.eos_token_id, budget=self.max_patches, horizon=cfg.max_bytes,
+            info_min=cfg.patch_info_min, info_max=cfg.patch_info_max,
         )
 
     def _forward_dynamic(self, input_ids: torch.Tensor) -> ArborOutput:
@@ -1250,9 +1302,9 @@ class ArborModel(nn.Module):
             return result
 
         entropy_values = None
-        if cfg.patching_mode == "entropy":
+        if cfg.patching_mode in ENTROPY_MODES:
             if self.entropy_model is None:
-                raise ValueError("patching_mode=entropy には entropy_model が必要")
+                raise ValueError(f"patching_mode={cfg.patching_mode} には entropy_model が必要")
             # 凍結 ByteLM も境界 walk (custom_op arbor::patch_starts) も compile の 1 graph に乗る
             entropy_values = timed_section(
                 "bytelm_ms",
@@ -1376,9 +1428,9 @@ class ArborModel(nn.Module):
             return result
 
         entropy_values = None
-        if cfg.patching_mode == "entropy":
+        if cfg.patching_mode in ENTROPY_MODES:
             if self.entropy_model is None:
-                raise ValueError("patching_mode=entropy には entropy_model が必要")
+                raise ValueError(f"patching_mode={cfg.patching_mode} には entropy_model が必要")
             entropy_values = timed_section(
                 "bytelm_ms",
                 lambda: self.entropy_model.next_byte_entropy(input_ids),
@@ -1523,9 +1575,10 @@ class ArborByteGenerator:
         self.n_global = 0
         self.g_caches = [_LayerKVCache() for _ in self.m.global_layers]
         self.h_cur: torch.Tensor | None = None
-        if self.cfg.patching_mode == "entropy":
+        if self.cfg.patching_mode in ENTROPY_MODES:
             self.lm_caches = [_LayerKVCache() for _ in self.m.entropy_model.layers]
             self.prev_entropy = 0.0
+            self.patch_info = 0.0  # 現 patch の byte の予測エントロピーの和 (entropy_char)
         # byte 層: 全 byte の KV cache を持ち、新しい byte の分だけ増分計算する。
         # 出力 (decoder 入力) は現 patch 分だけ保持して patch 内 decoder に渡す
         self.byte_caches = [_LayerKVCache() for _ in self.m.byte_layers]
@@ -1552,12 +1605,23 @@ class ArborByteGenerator:
 
     def _append_byte(self, byte_id: int) -> None:
         """1 byte 進める (patch 確定・ByteLM・byte 層の状態更新)。logits は計算しない."""
-        if self._starts_new_patch(byte_id):
+        mode = self.cfg.patching_mode
+        if mode == "entropy_char":
+            # 境界判定にこの byte を読んだ後のエントロピー (多バイト文字の 2 byte 目の予測) も使う
+            e_prev = self.prev_entropy
+            self._advance_entropy_lm(byte_id, pos=len(self.byte_ids))
+            new_patch = self._starts_new_patch(byte_id, e_prev=e_prev, e_cur=self.prev_entropy)
+            if new_patch:
+                self.patch_info = 0.0
+            self.patch_info += e_prev
+        else:
+            new_patch = self._starts_new_patch(byte_id)
+        if new_patch:
             self._commit_patch()
         self.cur_patch.append(byte_id)
         self.byte_ids.append(byte_id)
-        if self.cfg.patching_mode == "entropy":
-            self._advance_entropy_lm(byte_id)
+        if mode == "entropy":
+            self._advance_entropy_lm(byte_id, pos=len(self.byte_ids) - 1)
         # decoder 入力 = byte_emb + 現 patch の global 文脈 (+ byte 層)。h_cur は patch 確定後の値
         pos = len(self.byte_ids) - 1
         d = self.m.byte_emb(torch.tensor([[byte_id]], dtype=torch.long, device=self.device)) + self.h_cur
@@ -1569,7 +1633,9 @@ class ArborByteGenerator:
         self.cur_dec_in.append(d)
 
     # ----------------------------------------------------------- internal
-    def _starts_new_patch(self, next_byte_id: int | None = None) -> bool:
+    def _starts_new_patch(
+        self, next_byte_id: int | None = None, e_prev: float = 0.0, e_cur: float = 0.0,
+    ) -> bool:
         """次に push されるバイトが新しい patch を始めるか (_patch_starts_reference と同じ規則)."""
         run = len(self.cur_patch)
         if run == 0:
@@ -1587,6 +1653,15 @@ class ArborByteGenerator:
             candidate = next_byte_id is not None and _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
         elif cfg.patching_mode == "space":
             candidate = (self.byte_ids[-1] - BYTE_OFFSET) in _SPACE_BYTES
+        elif cfg.patching_mode == "entropy_char":
+            byte = next_byte_id - BYTE_OFFSET
+            char_start = _is_utf8_char_start_byte(byte)
+            score = e_prev + (e_cur if 0xC2 <= byte <= 0xF4 else 0.0)
+            candidate = char_start and (
+                (score > cfg.entropy_threshold and self.patch_info >= cfg.patch_info_min)
+                or self.patch_info >= cfg.patch_info_max
+                or run >= cfg.max_patch_len - _UTF8_MAX_CONT
+            )
         else:
             candidate = self.prev_entropy > cfg.entropy_threshold
         if not candidate:
@@ -1594,7 +1669,8 @@ class ArborByteGenerator:
         # 予算ガード: これまでに開いた patch 数 (= n_global、BOS 分を除き現 patch を含む) と
         # 次バイトの位置 len(byte_ids) だけで決まる
         remaining = max(cfg.max_bytes - len(self.byte_ids), 0)
-        return self.n_global + -(-remaining // cfg.max_patch_len) <= self.m.max_patches
+        reserve = cfg.max_patch_len - (_UTF8_MAX_CONT if cfg.patching_mode == "entropy_char" else 0)
+        return self.n_global + -(-remaining // reserve) <= self.m.max_patches
 
     def _push_global(self, g_in: torch.Tensor) -> None:
         g = g_in.to(self.dtype)
@@ -1628,9 +1704,8 @@ class ArborByteGenerator:
             d = layer(d, pos_offset=pos)  # causal (<= max_patch_len トークン)
         return self.m.head(self.m.head_norm(d[:, -1]))[0]  # (vocab,)
 
-    def _advance_entropy_lm(self, byte_id: int) -> None:
+    def _advance_entropy_lm(self, byte_id: int, pos: int) -> None:
         lm = self.m.entropy_model
-        pos = len(self.byte_ids) - 1
         x = lm.embed(torch.tensor([[byte_id]], dtype=torch.long, device=self.device))
         x = x.to(self.dtype)
         for layer, cache in zip(lm.layers, self.lm_caches):
@@ -1658,7 +1733,7 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
     cfg = ArborConfig.from_dict(model_cfg)
     model = ArborModel(cfg)
 
-    if cfg.patching_mode == "entropy" and cfg.entropy_model_ckpt:
+    if cfg.patching_mode in ENTROPY_MODES and cfg.entropy_model_ckpt:
         from pathlib import Path
 
         from safetensors.torch import load_file as safe_load
