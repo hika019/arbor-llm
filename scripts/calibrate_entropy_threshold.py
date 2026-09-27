@@ -49,11 +49,14 @@ def resolve_weights(checkpoint: Path) -> Path:
     return path
 
 
-def load_entropy_model(entropy_cfg: dict, max_bytes: int, checkpoint: Path, device: torch.device):
-    from src.model.arbor import ByteLM
+def load_entropy_model(
+    entropy_cfg: dict, max_bytes: int, checkpoint: Path, device: torch.device, char_rest: bool = False,
+):
+    from src.model.arbor import CHAR_REST_HEAD_FILE, ByteLM
 
     entropy_cfg = dict(entropy_cfg)
     entropy_cfg.setdefault("max_bytes", max_bytes)
+    entropy_cfg["char_rest_head"] = char_rest
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = ByteLM(entropy_cfg).to(device=device, dtype=dtype).eval()
     state = safe_load(str(resolve_weights(checkpoint)), device="cpu")
@@ -63,6 +66,11 @@ def load_entropy_model(entropy_cfg: dict, max_bytes: int, checkpoint: Path, devi
         if key.startswith("entropy_model."):
             key = key.removeprefix("entropy_model.")
         normalized[key] = value
+    if char_rest and not any(k.startswith("char_rest.") for k in normalized):
+        head_file = resolve_weights(checkpoint).parent / CHAR_REST_HEAD_FILE
+        if not head_file.is_file():
+            raise FileNotFoundError(f"entropy_char_rest=true だが {head_file} が無い (scripts/train_char_rest_head.py)")
+        normalized.update({f"char_rest.{k}": v for k, v in safe_load(str(head_file), device="cpu").items()})
     model.load_state_dict(normalized, strict=True)
     return model
 
@@ -120,7 +128,8 @@ def main() -> int:
     eos = int(model_cfg.get("eos_token_id", 2))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lm = load_entropy_model(model_cfg["entropy_model"], max_bytes, checkpoint, device)
+    char_rest = bool(model_cfg.get("entropy_char_rest", False))
+    lm = load_entropy_model(model_cfg["entropy_model"], max_bytes, checkpoint, device, char_rest)
 
     from src.data.byte_dataset import build_byte_dataloader
 
@@ -128,27 +137,32 @@ def main() -> int:
     data_cfg["micro_batch_size"] = args.batch_size
     data_cfg["num_workers"] = 0
     iterator = iter(build_byte_dataloader(data_cfg, split="train"))
-    ids_list, ent_list = [], []
+    ids_list, ent_list, rest_list = [], [], []
     with torch.inference_mode():
         for batch_index in range(args.batches):
             ids = next(iterator)["input_ids"].to(device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                ent = lm.next_byte_entropy(ids).float()
+                ent, rest = lm.boundary_entropy(ids)
             ids_list.append(ids)
-            ent_list.append(ent)
+            ent_list.append(ent.float())
+            if rest is not None:
+                rest_list.append(rest.float())
             print(f"[calibrate] batch={batch_index + 1}/{args.batches} "
                   f"entropy=[{float(ent.min()):.3f}, {float(ent.max()):.3f}]", flush=True)
     ids_all, ent_all = torch.cat(ids_list), torch.cat(ent_list)
+    rest_all = torch.cat(rest_list) if rest_list else None
 
     def counts_at(threshold: float) -> torch.Tensor:
         starts = compute_patch_starts(
-            ids_all, mode, min_len, max_len, entropy_values=ent_all, threshold=threshold,
-            eos_token_id=eos, budget=budget, horizon=max_bytes,
+            ids_all, mode, min_len, max_len, entropy_values=ent_all, rest_values=rest_all,
+            threshold=threshold, eos_token_id=eos, budget=budget, horizon=max_bytes,
         )
         return starts.sum(1).float()
 
     # entropy_char の閾値は文字の H (最大 2 byte 分) の 1 つ前の文字からの上昇幅
     span = float(ent_all.max()) * (2 if mode == "entropy_char" else 1) + 1e-5
+    if rest_all is not None:
+        span += float(rest_all.max())
     lo = -span if mode == "entropy_char" else float(ent_all.min()) - 1e-5
     threshold = search_threshold(counts_at, args.target_fill * budget, lo, span, args.binary_search_steps)
     counts = counts_at(threshold)
@@ -164,6 +178,7 @@ def main() -> int:
         "fill_mean": float(counts.mean()) / budget,
         "bytes_per_patch_mean": tokens / float(counts.mean()),
         "budget_exhausted_ratio": float((counts >= budget).float().mean()),
+        "entropy_char_rest": char_rest,
         "min_patch_len": min_len,
         "max_patch_len": max_len,
     }

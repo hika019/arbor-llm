@@ -23,7 +23,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.model.arbor import BYTE_OFFSET, build_byte_lm, compute_patch_starts  # noqa: E402
+from src.model.arbor import BYTE_OFFSET, CHAR_REST_HEAD_FILE, build_byte_lm, compute_patch_starts  # noqa: E402
 
 DEFAULT_TEXTS = [
     "政府は27日、来年度予算の概算要求を取りまとめた。一般会計の総額は過去最大の115兆円程度となる見通しで、"
@@ -63,14 +63,19 @@ def main() -> int:
     p.add_argument("--min-patch-len", default=1, type=int)
     p.add_argument("--max-patch-len", default=32, type=int)
     p.add_argument("--text", action="append", default=None, help="複数指定可")
+    p.add_argument("--char-rest", action="store_true",
+                   help="entropy_char の H に char_rest head (3 byte 目以降の推定) を足す")
     args = p.parse_args()
 
     from safetensors.torch import load_file
 
     ckpt = (args.ckpt_dir / args.ckpt).resolve()
     cfg = yaml.safe_load((ckpt / "config.yaml").read_text())["model"]
+    cfg["char_rest_head"] = args.char_rest
     model = build_byte_lm(cfg)
     state = {k.removeprefix("_orig_mod."): v for k, v in load_file(str(ckpt / "model.safetensors")).items()}
+    if args.char_rest:
+        state.update({f"char_rest.{k}": v for k, v in load_file(str(ckpt / CHAR_REST_HEAD_FILE)).items()})
     model.load_state_dict(state, strict=True)
     model = model.float().eval()
 
@@ -79,11 +84,11 @@ def main() -> int:
     with torch.no_grad():
         for text in texts:
             ids = torch.tensor([[b + BYTE_OFFSET for b in text.encode("utf-8")]])
-            samples.append((text, ids, model.next_byte_entropy(ids)))
+            samples.append((text, ids, model.boundary_entropy(ids)))
 
     def starts_for(mode: str, thr: float, ids, ent) -> torch.Tensor:
         return compute_patch_starts(ids, mode, args.min_patch_len, args.max_patch_len,
-                                    entropy_values=ent, threshold=thr)[0]
+                                    entropy_values=ent[0], rest_values=ent[1], threshold=thr)[0]
 
     def threshold_for(mode: str) -> float:
         fixed = args.entropy_threshold if mode == "entropy" else args.entropy_char_threshold

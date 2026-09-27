@@ -351,13 +351,13 @@ def test_entropy_model_runs_without_grad_during_boundary_scoring(monkeypatch):
     torch.manual_seed(0)
     m = ArborModel(ArborConfig.from_dict(tiny_cfg("entropy")))
     grad_states = []
-    orig_forward = m.entropy_model.forward
+    orig_hidden = m.entropy_model._hidden
 
-    def wrapped_forward(input_ids):
+    def wrapped_hidden(input_ids):
         grad_states.append(torch.is_grad_enabled())
-        return orig_forward(input_ids)
+        return orig_hidden(input_ids)
 
-    monkeypatch.setattr(m.entropy_model, "forward", wrapped_forward)
+    monkeypatch.setattr(m.entropy_model, "_hidden", wrapped_hidden)
     x = torch.randint(4, 260, (2, 30))
     out = m(x)
     assert out.logits.requires_grad
@@ -906,6 +906,74 @@ def test_generator_matches_full_forward_entropy_char_japanese():
                entropy_threshold=1.0, bitnet=False, max_bytes=128)
     m = ArborModel(ArborConfig.from_dict(cfg)).eval()
     ids = _ja_ids("今日は天気が良いので散歩に行きました。明日も晴れるといいな。")[0][:90]
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for i in range(len(ids)):
+            inc = gen.push(int(ids[i]))
+            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
+            assert torch.allclose(inc, full, atol=2e-4), f"pos={i}"
+
+
+# ---------------------------------------------------------------- entropy_char_rest (3 byte 目以降の推定)
+def _rest_cfg(**over):
+    cfg = dict(_tight_dynamic_cfg("entropy_char"), entropy_char_rest=True)
+    cfg.update(over)
+    return cfg
+
+
+def _randomize_rest_head(m):
+    for layer in (m.entropy_model.char_rest[0], m.entropy_model.char_rest[-1]):
+        torch.nn.init.normal_(layer.weight, std=1.0)
+        torch.nn.init.constant_(layer.bias, 0.5)
+
+
+def _utf8_heavy_ids(n, seed):
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.randint(4, 260, (n,), generator=g)
+    ids[::4] = 0xE3 + 4  # 3 byte 文字の 1 byte 目を多めに混ぜる
+    ids[1::9] = 0xF0 + 4
+    ids[ids == 2] = 5
+    return ids
+
+
+def test_char_rest_head_changes_boundaries_only_at_3_4_byte_leads():
+    ids = torch.tensor([[0x41, 0xE3, 0x81, 0xAF, 0x42, 0xC3, 0xA9, 0xF0, 0x9F, 0x98, 0x80]]) + 4
+    ent = torch.zeros(ids.shape)
+    rest = torch.full(ids.shape, 5.0)
+    base = compute_patch_starts(ids, "entropy_char", 1, 32, entropy_values=ent, threshold=1.0)
+    with_rest = compute_patch_starts(ids, "entropy_char", 1, 32, entropy_values=ent,
+                                     rest_values=rest, threshold=1.0)
+    assert not base[0, 1:].any()
+    # rest は 3 byte (E3) と 4 byte (F0) の 1 byte 目だけに足され、2 byte (C3)・ASCII には効かない
+    assert with_rest[0].nonzero().flatten().tolist() == [0, 1, 7]
+
+
+def test_char_rest_requires_entropy_char_mode():
+    with pytest.raises(ValueError, match="entropy_char_rest"):
+        ArborModel(ArborConfig.from_dict(dict(tiny_cfg("entropy"), entropy_char_rest=True)))
+
+
+@pytest.mark.parametrize("pos", [5, 20, 40])
+def test_char_rest_causality(pos):
+    torch.manual_seed(13)
+    m = ArborModel(ArborConfig.from_dict(_rest_cfg())).eval()
+    _randomize_rest_head(m)
+    a = _utf8_heavy_ids(60, 3).unsqueeze(0)
+    b = a.clone()
+    b[0, pos] = (a[0, pos] - 4 + 1) % 256 + 4
+    with torch.inference_mode():
+        la, lb = m(a).logits, m(b).logits
+    assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5)
+
+
+def test_char_rest_generator_matches_full_forward():
+    torch.manual_seed(14)
+    m = ArborModel(ArborConfig.from_dict(_rest_cfg(bitnet=False))).eval()
+    _randomize_rest_head(m)
+    ids = _utf8_heavy_ids(50, 4)
+    with torch.inference_mode():
+        _, rest = m.entropy_model.boundary_entropy(ids.unsqueeze(0))
+    assert rest is not None and rest.std() > 0.1  # head が実際に区切りへ効く状態で比べる
     gen = ArborByteGenerator(m)
     with torch.inference_mode():
         for i in range(len(ids)):

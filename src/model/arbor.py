@@ -131,6 +131,12 @@ class ArborConfig:
     entropy_threshold: float = 1.5
     entropy_model: dict | None = None       # entropy 用: ByteLM の構成 (inline dict)
     entropy_model_ckpt: str | None = None   # entropy 用: 初回構築時に重みを読む checkpoint dir
+    # entropy_char: 3〜4 byte 文字の H に「3 byte 目以降の予測エントロピー」の推定を足す。
+    # 区切りは byte p+1 を予測する時点で決める必要があり、3 byte 目以降のエントロピーは
+    # まだ計算できない (ひらがな・絵文字はどの文字かが主に 3〜4 byte 目で決まる)。ByteLM に
+    # 1 byte 目までの hidden からその和を回帰する head を足して補う。重みは
+    # <entropy_model_ckpt>/char_rest_head.safetensors (scripts/train_char_rest_head.py)
+    entropy_char_rest: bool = False
     attention_window: int | None = None     # ByteLM 用: causal attention を直近 N byte に制限
     # ---- local (byte 階層) ----
     local_hidden_size: int = 512
@@ -726,8 +732,18 @@ class ByteLM(nn.Module):
         nn.init.trunc_normal_(self.head.weight, std=0.02, a=-0.06, b=0.06)
         self.gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
         _scale_residual_projections([self.layers])
+        # 多バイト文字の 1 byte 目の位置で、その文字の 3 byte 目以降の予測エントロピーの和を
+        # 回帰する (ArborConfig.entropy_char_rest)。本体は凍結したまま head だけを学習する。
+        # Linear 1 本より 2 層の方が回帰の R² が 0.54 → 0.65 と良い (中間 1024 でも 0.66)
+        self.char_rest = (
+            nn.Sequential(nn.Linear(h, 256), nn.GELU(), nn.Linear(256, 1))
+            if cfg.get("char_rest_head", False) else None
+        )
 
     def forward(self, input_ids: torch.Tensor) -> ArborOutput:
+        return ArborOutput(logits=self.head(self.norm(self._hidden(input_ids))))
+
+    def _hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed(input_ids)
         if torch.is_autocast_enabled(x.device.type):
             # fp32 parameter でも残差の流れは計算 dtype にする (fp32 のままだと正規化・残差加算の読み書きが倍)
@@ -740,7 +756,7 @@ class ByteLM(nn.Module):
                 x = checkpoint(layer, x, attn_mask, use_reentrant=False)
             else:
                 x = layer(x, attn_mask)
-        return ArborOutput(logits=self.head(self.norm(x)))
+        return x
 
     def _attention_mask(self, input_ids: torch.Tensor) -> "torch.Tensor | WindowMask | object | None":
         if self.attention_window is None:
@@ -778,9 +794,24 @@ class ByteLM(nn.Module):
 
         戻り値の [.., t] は p(x_{t+1} | x_{<=t}) のエントロピー。
         """
-        logits = self.forward(input_ids).logits.float()
-        logp = F.log_softmax(logits, dim=-1)
-        return -(logp.exp() * logp).sum(-1)
+        return self.boundary_entropy(input_ids)[0]
+
+    @torch.no_grad()
+    def boundary_entropy(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """(次バイトのエントロピー, char_rest head の予測) を 1 回の forward で返す.
+
+        head の [.., t] は x_t が 3〜4 byte 文字の 1 byte 目のとき、その文字の 3 byte 目以降の
+        予測エントロピーの和の推定 (それ以外の位置の値は使わない)。head が無ければ None。
+        """
+        x = self.norm(self._hidden(input_ids))
+        logp = F.log_softmax(self.head(x).float(), dim=-1)
+        ent = -(logp.exp() * logp).sum(-1)
+        return ent, self.char_rest_from_hidden(x)
+
+    def char_rest_from_hidden(self, normed_hidden: torch.Tensor) -> torch.Tensor | None:
+        if self.char_rest is None:
+            return None
+        return F.softplus(self.char_rest(normed_hidden.float()).squeeze(-1))
 
 
 def build_byte_lm(model_cfg: dict[str, Any]) -> ByteLM:
@@ -792,7 +823,8 @@ def build_byte_lm(model_cfg: dict[str, Any]) -> ByteLM:
 
 # ----------------------------------------------------------- patch 境界判定
 _SPACE_BYTES = (0x20, 0x09, 0x0A, 0x0D)  # space, tab, LF, CR
-ENTROPY_MODES = ("entropy", "entropy_char")  # 凍結 ByteLM のエントロピーで区切るモード
+ENTROPY_MODES = ("entropy", "entropy_char")
+CHAR_REST_HEAD_FILE = "char_rest_head.safetensors"  # ByteLM の step dir に置く char_rest head の重み  # 凍結 ByteLM のエントロピーで区切るモード
 _UTF8_MAX_CONT = 3  # UTF-8 の 1 文字の継続 byte の最大数
 
 
@@ -875,6 +907,7 @@ def compute_patch_starts(
     threshold: float = 1.5,
     entropy_values: torch.Tensor | None = None,
     *,
+    rest_values: torch.Tensor | None = None,
     eos_token_id: int | None = None,
     budget: int = 0,
     horizon: int = 0,
@@ -891,7 +924,8 @@ def compute_patch_starts(
       (2 byte 目の予測は文字先頭までで決まる)、1 つ前の文字の H より threshold を超えて
       上がった文字の先頭で区切る。絶対値の閾値と違い文字種ごとの H の水準差 (漢字 ≫ 英字) に
       左右されない。max_len - 3 以降も文字先頭で区切る (UTF-8 は最長 4 byte なので max_len
-      までに必ずある)。
+      までに必ずある)。rest_values (ByteLM の char_rest head) があれば 3〜4 byte 文字の H に
+      3 byte 目以降の予測エントロピーの推定を足す。
     その後 min_len / max_len / 文書先頭 (eos_token_id の直後、min_len 無視) /
     予算ガード (budget, horizon) を適用する。規則の詳細は _patch_starts_reference。
     """
@@ -921,7 +955,7 @@ def compute_patch_starts(
         if entropy_values is None:
             if entropy_model is None:
                 raise ValueError(f"patching_mode={mode} には entropy_model が必要")
-            ent = entropy_model.next_byte_entropy(input_ids)  # (B, T), no_grad in ByteLM
+            ent, rest_values = entropy_model.boundary_entropy(input_ids)  # (B, T), no_grad
         else:
             ent = entropy_values
         if mode == "entropy":
@@ -930,6 +964,8 @@ def compute_patch_starts(
             ent = ent.float()
             multi_lead = (cur >= 0xC2) & (cur <= 0xF4)
             h = F.pad(ent[:, :-1], (1, 0), value=0.0) + torch.where(multi_lead, ent, 0.0)
+            if rest_values is not None:
+                h = h + torch.where((cur >= 0xE0) & (cur <= 0xF4), rest_values.float(), 0.0)
             pos = torch.arange(input_ids.shape[1], device=input_ids.device).expand_as(char_start)
             last_cs = torch.where(char_start, pos, -1).cummax(dim=1).values
             prev_cs = F.pad(last_cs[:, :-1], (1, 0), value=-1)  # 1 つ前の文字先頭
@@ -1108,6 +1144,10 @@ class ArborModel(nn.Module):
                 )
             em_cfg = dict(cfg.entropy_model)
             em_cfg.setdefault("max_bytes", cfg.max_bytes)
+            if cfg.entropy_char_rest:
+                if cfg.patching_mode != "entropy_char":
+                    raise ValueError("entropy_char_rest は patching_mode=entropy_char 専用")
+                em_cfg["char_rest_head"] = True
             self.entropy_model = ByteLM(em_cfg)
             self.entropy_model.requires_grad_(False)
         else:
@@ -1259,13 +1299,15 @@ class ArborModel(nn.Module):
         return ArborOutput(logits=logits, patch_count=patch_count, max_patch_count=max_patch_count)
 
     def _patch_starts(
-        self, input_ids: torch.Tensor, entropy_values: torch.Tensor | None
+        self, input_ids: torch.Tensor,
+        entropy_values: tuple[torch.Tensor, torch.Tensor | None] | None,
     ) -> torch.Tensor:
         """動的モードの境界。文書先頭で必ず区切り、patch 数は予算ガードで max_patches 以下."""
         cfg = self.cfg
+        ent, rest = entropy_values if entropy_values is not None else (None, None)
         return compute_patch_starts(
             input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
-            self.entropy_model, cfg.entropy_threshold, entropy_values,
+            self.entropy_model, cfg.entropy_threshold, ent, rest_values=rest,
             eos_token_id=cfg.eos_token_id, budget=self.max_patches, horizon=cfg.max_bytes,
         )
 
@@ -1302,7 +1344,7 @@ class ArborModel(nn.Module):
             # 凍結 ByteLM も境界 walk (custom_op arbor::patch_starts) も compile の 1 graph に乗る
             entropy_values = timed_section(
                 "bytelm_ms",
-                lambda: self.entropy_model.next_byte_entropy(input_ids),
+                lambda: self.entropy_model.boundary_entropy(input_ids),
             )
 
         def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
@@ -1427,7 +1469,7 @@ class ArborModel(nn.Module):
                 raise ValueError(f"patching_mode={cfg.patching_mode} には entropy_model が必要")
             entropy_values = timed_section(
                 "bytelm_ms",
-                lambda: self.entropy_model.next_byte_entropy(input_ids),
+                lambda: self.entropy_model.boundary_entropy(input_ids),
             )
 
         def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
@@ -1572,6 +1614,7 @@ class ArborByteGenerator:
         if self.cfg.patching_mode in ENTROPY_MODES:
             self.lm_caches = [_LayerKVCache() for _ in self.m.entropy_model.layers]
             self.prev_entropy = 0.0
+            self.prev_rest = 0.0  # char_rest head の予測 (直前に読んだ byte の位置)
             self.prev_char_h: float | None = None  # 1 つ前の文字の H (entropy_char)
         # byte 層: 全 byte の KV cache を持ち、新しい byte の分だけ増分計算する。
         # 出力 (decoder 入力) は現 patch 分だけ保持して patch 内 decoder に渡す
@@ -1608,6 +1651,8 @@ class ArborByteGenerator:
             rise = False
             if _is_utf8_char_start_byte(byte):
                 h = e_prev + (self.prev_entropy if 0xC2 <= byte <= 0xF4 else 0.0)
+                if self.cfg.entropy_char_rest and 0xE0 <= byte <= 0xF4:
+                    h += self.prev_rest
                 rise = self.prev_char_h is not None and h - self.prev_char_h > self.cfg.entropy_threshold
                 self.prev_char_h = h
             new_patch = self._starts_new_patch(byte_id, rise=rise)
@@ -1705,8 +1750,12 @@ class ArborByteGenerator:
             if lm.attention_window is not None:
                 cache.trim(max(0, lm.attention_window - 1))
             x = layer(x, kv_cache=cache, pos_offset=pos)
-        logp = F.log_softmax(lm.head(lm.norm(x)).float()[0, -1], dim=-1)
+        xn = lm.norm(x)
+        logp = F.log_softmax(lm.head(xn).float()[0, -1], dim=-1)
         self.prev_entropy = float(-(logp.exp() * logp).sum())
+        rest = lm.char_rest_from_hidden(xn)
+        if rest is not None:
+            self.prev_rest = float(rest[0, -1])
 
     def _rebuild(self, keep: int) -> None:
         tail = self.byte_ids[-keep:]
@@ -1739,6 +1788,14 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
             print(f"[arbor] loading entropy_model weights from {weights_file} ({size_mb:.1f}MiB)...")
             state = safe_load(str(weights_file), device="cpu")
             state = {key.removeprefix("_orig_mod."): v for key, v in state.items()}
+            if cfg.entropy_char_rest:
+                head_file = ckpt / CHAR_REST_HEAD_FILE
+                if not head_file.exists():
+                    raise FileNotFoundError(
+                        f"entropy_char_rest=true だが {head_file} が無い (この ByteLM step 用の head を "
+                        "scripts/train_char_rest_head.py で学習すること)"
+                    )
+                state.update({f"char_rest.{k}": v for k, v in safe_load(str(head_file), device="cpu").items()})
             model.entropy_model.load_state_dict(state, strict=True)
             print(
                 f"[arbor] entropy_model weights loaded from {ckpt} "
