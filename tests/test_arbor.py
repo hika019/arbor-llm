@@ -197,7 +197,8 @@ def test_window_path_matches_dense(mode, monkeypatch):
 
     torch.manual_seed(2)
     t = 2 * arbor_mod._WINDOW_CHUNK
-    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg(mode), max_bytes=t))).eval()
+    # BitNet の int8 活性化量子化は 1e-7 の加算順の差でも丸めが反転して 1e-4 の差になるので FP で比べる
+    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg(mode), max_bytes=t, bitnet=False))).eval()
     x = torch.randint(4, 260, (2, t))
     x[0, ::5] = 0x20 + 4  # space 境界を発生させる
     with torch.inference_mode():

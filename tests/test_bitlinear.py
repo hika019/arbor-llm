@@ -1,6 +1,8 @@
 """BitLinear (BitNet b1.58 公式レシピ) のテスト (CPU)."""
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -552,6 +554,7 @@ def test_packed_ternary_group_supports_distinct_weight_scales_cuda():
     b = BitLinear(32, 32).to(device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         b.weight.mul_(3.0)
+    a_ref, b_ref = copy.deepcopy(a).float(), copy.deepcopy(b).float()
     group = BitLinearGroup((a, b), kind="test").to(
         device="cuda", dtype=torch.bfloat16
     )
@@ -559,7 +562,8 @@ def test_packed_ternary_group_supports_distinct_weight_scales_cuda():
     group.enable_training_weight_cache(True)
 
     x = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
-    expected = torch.cat((a(x), b(x)), dim=-1)
+    # 参照は fp32 で計算する (bf16 の参照は逆量子化後の丸めで kernel より誤差が大きい)
+    expected = torch.cat((a_ref(x.float()), b_ref(x.float())), dim=-1)
     actual = group(x)
     torch.testing.assert_close(
         actual.float(), expected.float(), atol=5e-3, rtol=5e-3
