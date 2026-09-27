@@ -813,3 +813,13 @@ def test_arbor_blocks_keep_bitnet_subln_relu2():
     m = ArborModel(ArborConfig.from_dict(TINY))
     for blk in (m.global_layers[0], m.decoder_layers[0]):
         assert blk.attn.attn_sub_norm is not None and blk.ffn.activation == "relu2"
+
+
+def test_bytelm_residual_stream_uses_autocast_dtype_with_fp32_params():
+    m = ByteLM(dict(TINY_ENTROPY_LM, max_bytes=32))
+    seen = []
+    m.layers[0].register_forward_hook(lambda mod, args, out: seen.append(args[0].dtype))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        m(torch.randint(4, 260, (1, 16)))
+    assert next(m.parameters()).dtype is torch.float32
+    assert seen == [torch.bfloat16]

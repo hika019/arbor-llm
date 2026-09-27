@@ -718,6 +718,9 @@ class ByteLM(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> ArborOutput:
         x = self.embed(input_ids)
+        if torch.is_autocast_enabled(x.device.type):
+            # fp32 parameter でも残差の流れは計算 dtype にする (fp32 のままだと正規化・残差加算の読み書きが倍)
+            x = x.to(torch.get_autocast_dtype(x.device.type))
         attn_mask = self._attention_mask(input_ids)
         for layer in self.layers:
             if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
