@@ -1,8 +1,8 @@
-# 構造 A/B (1B・20k step、ゼロから・同じデータ順): E = B + entropy_char patching (小型 LM 83M、予算 512 patch = static16 と同じ global 計算量)。entropy_threshold は小型 LM 学習後に scripts/calibrate_entropy_threshold.py で校正すること
+# 構造 A/B (1B・20k step、ゼロから・同じデータ順): E16 = B + entropy_char (平均 ~18 byte、予算 512 patch = A と同じ global 計算量)。区切る場所だけの効果を見る。entropy_threshold は仮 (ByteLM 途中の値)。学習前に最終 ByteLM で scripts/calibrate_entropy_threshold.py --write で校正すること
 # 生成元: configs/arbor.yaml (本走) の total_steps / checkpoint + 上記の model 差分だけを変えたもの
-# 実行: python -m src.train.train --config configs/ab_c/e_entropy.yaml
+# 実行: python -m src.train.train --config configs/ab_c/e16_char.yaml
 # data: 本走の混合 + ReazonSpeech 書き起こし 3%、code 9% → 6%・math 6% → 4% (fineweb2_ja 46.5% → 48.5%)。ReazonSpeech は未作成なら学習開始時に自動で用意 (prepare)
-run_name: abc_e_entropy
+run_name: abc_e16_char
 seed: 42
 entropy_lm_config: ../entropy_lm.yaml
 model:
@@ -184,7 +184,7 @@ validation:
       split: train
       skip_samples: 20000
 checkpoint:
-  dir: ./checkpoints/abc_e_entropy
+  dir: ./checkpoints/abc_e16_char
   save_every_steps: 2000
   keep_last_k: 2
   keep_every_n_steps: 10000
