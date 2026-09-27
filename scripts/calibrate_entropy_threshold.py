@@ -144,15 +144,13 @@ def main() -> int:
         starts = compute_patch_starts(
             ids_all, mode, min_len, max_len, entropy_values=ent_all, threshold=threshold,
             eos_token_id=eos, budget=budget, horizon=max_bytes,
-            info_min=float(model_cfg.get("patch_info_min", 8.0)),
-            info_max=float(model_cfg.get("patch_info_max", 24.0)),
         )
         return starts.sum(1).float()
 
-    threshold = search_threshold(
-        counts_at, args.target_fill * budget,
-        float(ent_all.min()) - 1e-5, float(ent_all.max()) + 1e-5, args.binary_search_steps,
-    )
+    # entropy_char の閾値は文字の H (最大 2 byte 分) の 1 つ前の文字からの上昇幅
+    span = float(ent_all.max()) * (2 if mode == "entropy_char" else 1) + 1e-5
+    lo = -span if mode == "entropy_char" else float(ent_all.min()) - 1e-5
+    threshold = search_threshold(counts_at, args.target_fill * budget, lo, span, args.binary_search_steps)
     counts = counts_at(threshold)
     tokens = ids_all.size(1)
     result = {

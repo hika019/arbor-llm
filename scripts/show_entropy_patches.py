@@ -3,10 +3,10 @@
 使い方:
     python scripts/show_entropy_patches.py                          # 内蔵サンプル文
     python scripts/show_entropy_patches.py --text "任意のテキスト"
-    python scripts/show_entropy_patches.py --ckpt step_0000054000 --target-avg-len 16
+    python scripts/show_entropy_patches.py --ckpt step_0000054000 --target-avg-len 6
 
-同じエントロピーから entropy (ByteLM の値そのまま) と entropy_char (文字先頭だけで区切り、
-patch の情報量の下限・上限で言語間の偏りを抑える) の 2 通りの境界を並べて出す。2 つは判定値の尺度が違うので、閾値はモードごとに
+同じエントロピーから entropy (ByteLM の値そのまま) と entropy_char (文字単位のエントロピーが
+1 つ前の文字より上がった文字の先頭で区切る) の 2 通りの境界を並べて出す。2 つは判定値の尺度が違うので、閾値はモードごとに
 全サンプルの平均 patch 長が --target-avg-len になるよう二分探索する。数文だけでは偏るので、
 学習で使う値は scripts/calibrate_entropy_threshold.py で実データから決め、ここでは
 --entropy-threshold / --entropy-char-threshold で固定して見るのが正確。
@@ -57,10 +57,9 @@ def main() -> int:
     p.add_argument("--ckpt", default="latest", help="'latest' | 'best' | step dir 名")
     p.add_argument("--ckpt-dir", default="./checkpoints/entropy_lm", type=Path)
     p.add_argument("--entropy-threshold", default=None, type=float, help="entropy の固定閾値 (nats)")
-    p.add_argument("--entropy-char-threshold", default=None, type=float, help="entropy_char の固定閾値 (nats)")
-    p.add_argument("--target-avg-len", default=16.0, type=float, help="閾値を合わせる平均 patch 長 (byte)")
-    p.add_argument("--patch-info-min", default=8.0, type=float, help="entropy_char の情報量の下限 (nats)")
-    p.add_argument("--patch-info-max", default=24.0, type=float, help="entropy_char の情報量の上限 (nats)")
+    p.add_argument("--entropy-char-threshold", default=None, type=float,
+                   help="entropy_char の固定閾値 (1 つ前の文字からの上昇幅、nats)")
+    p.add_argument("--target-avg-len", default=6.0, type=float, help="閾値を合わせる平均 patch 長 (byte)")
     p.add_argument("--min-patch-len", default=1, type=int)
     p.add_argument("--max-patch-len", default=32, type=int)
     p.add_argument("--text", action="append", default=None, help="複数指定可")
@@ -84,15 +83,14 @@ def main() -> int:
 
     def starts_for(mode: str, thr: float, ids, ent) -> torch.Tensor:
         return compute_patch_starts(ids, mode, args.min_patch_len, args.max_patch_len,
-                                    entropy_values=ent, threshold=thr,
-                                    info_min=args.patch_info_min, info_max=args.patch_info_max)[0]
+                                    entropy_values=ent, threshold=thr)[0]
 
     def threshold_for(mode: str) -> float:
         fixed = args.entropy_threshold if mode == "entropy" else args.entropy_char_threshold
         if fixed is not None:
             return fixed
         total = sum(ids.numel() for _, ids, _ in samples)
-        lo, hi = 0.0, 20.0
+        lo, hi = -20.0, 20.0
         for _ in range(30):
             mid = (lo + hi) / 2
             n = sum(int(starts_for(mode, mid, ids, ent).sum()) for _, ids, ent in samples)

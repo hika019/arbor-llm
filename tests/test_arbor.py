@@ -849,6 +849,24 @@ def test_entropy_char_never_splits_inside_a_character():
             assert mid == 0
 
 
+def test_entropy_char_cuts_where_char_entropy_rises():
+    text = "来年度予算のabc、数字123と😀を含む。"
+    ids = _ja_ids(text)
+    g = torch.Generator().manual_seed(1)
+    ent = torch.rand(ids.shape, generator=g) * 5
+    e = ent[0].tolist()
+    expected, prev_h, pos = [0], None, 0
+    for ch in text:
+        n = len(ch.encode())
+        h = (e[pos - 1] if pos > 0 else 0.0) + (e[pos] if n > 1 else 0.0)
+        if prev_h is not None and h - prev_h > 1.0:
+            expected.append(pos)
+        prev_h, pos = h, pos + n
+    st = compute_patch_starts(ids, "entropy_char", 1, 1000, entropy_values=ent, threshold=1.0)[0]
+    assert st.nonzero().flatten().tolist() == expected
+    assert len(expected) > 3
+
+
 def test_entropy_char_soft_boundary_before_max_len_and_budget():
     from src.model.arbor import _patch_starts_reference
 
@@ -872,9 +890,9 @@ def test_entropy_char_cuda_matches_reference():
     ids = _ja_ids(text)
     ent = torch.rand(ids.shape, generator=g) * 5
     for budget in (0, 40):
-        for info_min, info_max in ((0.0, float("inf")), (6.0, 15.0)):
-            kw = dict(entropy_values=ent, threshold=4.0, eos_token_id=2, budget=budget,
-                      horizon=ids.size(1), info_min=info_min, info_max=info_max)
+        for threshold in (0.0, 1.5):
+            kw = dict(entropy_values=ent, threshold=threshold, eos_token_id=2, budget=budget,
+                      horizon=ids.size(1))
             cpu = compute_patch_starts(ids, "entropy_char", 1, 12, **kw)
             gpu = compute_patch_starts(ids.cuda(), "entropy_char", 1, 12,
                                        **dict(kw, entropy_values=ent.cuda())).cpu()

@@ -28,7 +28,7 @@ _ARBOR_FIELDS = (
     "num_hidden_layers",
     "local_hidden_size", "local_num_heads", "local_num_kv_heads",
     "local_intermediate_size", "num_local_encoder_layers", "num_local_decoder_layers",
-    "num_byte_layers", "byte_attn_window", "local_bitnet", "max_patches", "patch_info_min", "patch_info_max",
+    "num_byte_layers", "byte_attn_window", "local_bitnet", "max_patches",
     "rope_theta", "rope_theta_global", "rope_theta_local", "norm_eps", "bitnet",
 )
 
@@ -42,7 +42,6 @@ _ARBOR_DEFAULTS = dict(
     local_intermediate_size=2048, num_local_encoder_layers=2,
     num_local_decoder_layers=4,
     num_byte_layers=0, byte_attn_window=None, local_bitnet=None, max_patches=None,
-    patch_info_min=8.0, patch_info_max=24.0,
     rope_theta=500000.0, rope_theta_global=None, rope_theta_local=None,
     norm_eps=1e-5, bitnet=True,
 )
