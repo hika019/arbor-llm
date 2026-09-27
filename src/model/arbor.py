@@ -400,9 +400,10 @@ class FeedForward(nn.Module):
 # flash-linear-attention の chunk_simple_gla (head ごとスカラー減衰の chunk scan、Triton) を
 # torch.library.custom_op で包む。fla の autograd.Function をそのまま呼ぶと dynamo が層ごとに graph
 # break して周囲の融合が壊れ、torch 実装より遅くなる (実測 69 vs 58 ms)。custom_op なら不透明な
-# 1 op として compile に乗る。登録は import 時に済ませる: forward 内で遅延登録すると custom_op の
+# 1 op として compile に乗る。登録は SSDMixer の構築時に済ませる: forward 内で遅延登録すると custom_op の
 # infer_schema が dynamo の skip 対象で graph break し、1B では CUDA graph が 1,600 個/step に割れて
-# forward が 2 倍遅くなった (2026-09-19 プロファイル)。
+# forward が 2 倍遅くなった (2026-09-19 プロファイル)。import 時にしないのは、fla の import が
+# Triton 経由で CUDA を初期化し、SSD を使わない処理 (CPU 実行を含む) でも VRAM を取るため。
 def _import_fla_without_package_init() -> None:
     """fla の親パッケージ __init__ を実行せずに fla.ops.simple_gla.chunk を読めるようにする.
 
@@ -484,7 +485,13 @@ def _register_fla_scan_op() -> bool:
     return True
 
 
-_FLA_SCAN_OP_AVAILABLE = _register_fla_scan_op()
+_FLA_SCAN_OP_AVAILABLE: bool | None = None
+
+
+def _ensure_fla_scan_op() -> None:
+    global _FLA_SCAN_OP_AVAILABLE
+    if _FLA_SCAN_OP_AVAILABLE is None:
+        _FLA_SCAN_OP_AVAILABLE = _register_fla_scan_op()
 
 
 def _fla_chunk_simple_gla(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_a: torch.Tensor) -> torch.Tensor:
@@ -518,6 +525,8 @@ class SSDMixer(nn.Module):
         if backend not in ("auto", "fla", "torch"):
             raise ValueError(f"unknown ssd_backend: {backend!r} (choices: auto | fla | torch)")
         self.backend = backend
+        if backend == "fla" or (backend == "auto" and torch.cuda.is_available()):
+            _ensure_fla_scan_op()
         if dim % n_heads != 0 or n_heads % n_kv_heads != 0:
             raise ValueError(f"invalid head config: {dim=} {n_heads=} {n_kv_heads=}")
         self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
