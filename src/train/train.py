@@ -2324,9 +2324,11 @@ def main() -> int:
                 best_improved_tensor = best_improved_tensor | is_best_tensor
                 best_loss_tensor = torch.minimum(best_loss_tensor, ema_loss_tensor)
 
+            # save の判定と break を同じ値で行う。この後に来た signal は次の step で save する
+            stop_now = stop.requested
             should_save = not benchmark_mode and (
                 global_step % save_every == 0
-                or stop.requested
+                or stop_now
                 or global_step >= total_steps
             )
             benchmark_done = benchmark_mode and global_step >= total_steps
@@ -2499,7 +2501,7 @@ def main() -> int:
             # best はトラッキングのみ。実保存は定期 / 中断 / 最終 step に限定する.
             # 毎 step ベスト更新で save するとディスクを食いつぶすので分離.
             if should_save:
-                stop_save = stop.requested
+                stop_save = stop_now
                 validation_results: dict[str, float] | None = None
                 is_best = (
                     bool(best_improved_tensor.cpu())
@@ -2624,7 +2626,7 @@ def main() -> int:
                 if probes_enabled:
                     probes_at_checkpoint(saved_dir, global_step)
 
-            if stop.requested:
+            if stop_now:
                 print("[train] stop requested, exiting cleanly.")
                 break
             if args.dry_run:
