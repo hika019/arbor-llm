@@ -122,7 +122,9 @@ class ArborConfig:
     patch_size: int = 4            # static 用: 1 patch のバイト数
     # concat: patch 内 byte を連結して p*dl→dg 射影 (static 専用、情報を落とさない)。
     # mean/max: 固定 local_hidden dim pooling (static/dynamic 共通、patch_size 非依存)。
-    patch_pooling: str = "concat"  # choices: concat | mean | max
+    # xattn: patch ごとの query が patch 内 byte へ cross-attention (BLT 方式、static/dynamic 共通)
+    patch_pooling: str = "concat"  # choices: concat | mean | max | xattn
+    patch_xattn_queries: int = 4   # xattn: patch あたりの query 数。出力は queries*dl を dg へ射影
     min_patch_len: int = 2         # 動的用: これ未満では区切らない
     max_patch_len: int = 16        # 動的用: これに達したら強制的に区切る
     max_patches: int | None = None # 動的用: 固定 pad する patch 数。None なら worst-case
@@ -693,6 +695,48 @@ def _scale_residual_projections(layer_lists: list[nn.ModuleList]) -> None:
                 block.ffn.down.weight.mul_(scale)
 
 
+class PatchCrossAttnPool(nn.Module):
+    """patch ごとに num_queries 個の query が patch 内 byte へ cross-attention し、連結して返す.
+
+    query は学習済みベクトル + patch 内 mean (BLT の pooling 初期化)。mean は byte の並びを
+    落とすので、kv 側に patch 内位置の埋め込みを足して順序を読めるようにする。
+    """
+
+    def __init__(self, dim: int, num_heads: int, num_queries: int, max_len: int, eps: float):
+        super().__init__()
+        if dim % num_heads:
+            raise ValueError(f"local_hidden_size {dim} は local_num_heads {num_heads} で割り切れる必要がある")
+        if num_queries < 1:
+            raise ValueError(f"patch_xattn_queries must be >= 1, got {num_queries}")
+        self.num_heads, self.num_queries = num_heads, num_queries
+        self.query = nn.Parameter(torch.empty(num_queries, dim))
+        self.pos = nn.Parameter(torch.empty(max_len, dim))
+        self.q_norm = RMSNorm(dim, eps)
+        self.kv_norm = RMSNorm(dim, eps)
+        self.wq, self.wk, self.wv, self.wo = (nn.Linear(dim, dim, bias=False) for _ in range(4))
+        for w in (self.query, self.pos, self.wq.weight, self.wk.weight, self.wv.weight, self.wo.weight):
+            nn.init.trunc_normal_(w, std=0.02, a=-0.06, b=0.06)
+
+    def forward(self, h: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
+        """h: (N, L, dim)、valid: (N, L) bool (None は全位置有効)。各行の位置 0 は有効であること."""
+        n, length, dim = h.shape
+        if valid is None:
+            mean = h.mean(dim=1)
+        else:
+            keep = valid.unsqueeze(-1).to(h.dtype)
+            mean = (h * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
+        q_in = self.query.to(h.dtype) + mean.unsqueeze(1)             # (N, Q, dim)
+        kv = self.kv_norm(h + self.pos[:length].to(h.dtype))
+        hd = dim // self.num_heads
+        q = self.wq(self.q_norm(q_in)).view(n, self.num_queries, self.num_heads, hd).transpose(1, 2)
+        k = self.wk(kv).view(n, length, self.num_heads, hd).transpose(1, 2)
+        v = self.wv(kv).view(n, length, self.num_heads, hd).transpose(1, 2)
+        mask = None if valid is None else valid[:, None, None, :]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        out = out.transpose(1, 2).reshape(n, self.num_queries, dim)
+        return (q_in + self.wo(out)).flatten(1)
+
+
 # ---------------------------------------------------------------- byte LM
 class ByteLM(nn.Module):
     """entropy patching の境界判定に使う小型 causal バイト LM.
@@ -1017,10 +1061,10 @@ class ArborModel(nn.Module):
         super().__init__()
         if cfg.patching_mode not in ("static", "utf8", "space", *ENTROPY_MODES):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
-        if cfg.patch_pooling not in ("concat", "mean", "max"):
+        if cfg.patch_pooling not in ("concat", "mean", "max", "xattn"):
             raise ValueError(
                 f"unknown patch_pooling: {cfg.patch_pooling!r} "
-                "(choices: concat | mean | max)"
+                "(choices: concat | mean | max | xattn)"
             )
         if cfg.patch_pooling == "concat" and cfg.patching_mode != "static":
             raise ValueError(
@@ -1083,7 +1127,15 @@ class ArborModel(nn.Module):
             for _ in range(cfg.num_local_encoder_layers)
         )
         # concat は patch 長固定 (static) 前提の p*dl 入力。mean/max は dl 固定。
-        patch_input_dim = p * dl if cfg.patch_pooling == "concat" else dl
+        if cfg.patch_pooling == "xattn":
+            self.patch_pool: PatchCrossAttnPool | None = PatchCrossAttnPool(
+                dl, cfg.local_num_heads, cfg.patch_xattn_queries,
+                cfg.max_patch_len if self.dynamic else p, cfg.norm_eps,
+            )
+            patch_input_dim = cfg.patch_xattn_queries * dl
+        else:
+            self.patch_pool = None
+            patch_input_dim = p * dl if cfg.patch_pooling == "concat" else dl
         self.patch_proj = nn.Linear(patch_input_dim, dg, bias=False)
         nn.init.trunc_normal_(self.patch_proj.weight, std=0.02, a=-0.06, b=0.06)
         # 右シフトの先頭 patch。ゼロ初期化禁止: 厳密ゼロ行は全層で 0 のまま伝播し、
@@ -1273,6 +1325,8 @@ class ArborModel(nn.Module):
             pooled = h_patch.flatten(2)
         elif self.cfg.patch_pooling == "mean":
             pooled = h_patch.mean(dim=2)
+        elif self.patch_pool is not None:
+            pooled = self.patch_pool(h.view(b * k, p, -1)).view(b, k, -1)
         else:
             pooled = h_patch.amax(dim=2)
         patches = self.patch_proj(pooled)                  # (B, K, dg)
@@ -1311,6 +1365,21 @@ class ArborModel(nn.Module):
             self.entropy_model, cfg.entropy_threshold, ent, rest_values=rest,
             eos_token_id=cfg.eos_token_id, budget=self.max_patches, horizon=cfg.max_bytes,
         )
+
+    def _xattn_pool_dynamic(self, h: torch.Tensor, patch_id: torch.Tensor, k: int) -> torch.Tensor:
+        """flat な byte (B, T, dl) を (B*K, max_patch_len, dl) の枠に詰めて xattn pooling."""
+        b, t, dl = h.shape
+        width = self.cfg.max_patch_len
+        ar = torch.arange(t, device=h.device).expand(b, t)
+        start = torch.full((b, k), t, dtype=torch.long, device=h.device)
+        start.scatter_reduce_(1, patch_id, ar, reduce="amin", include_self=True)
+        slot = patch_id * width + (ar - start.gather(1, patch_id))
+        buf = h.new_zeros((b, k * width, dl)).scatter(1, slot.unsqueeze(-1).expand(-1, -1, dl), h)
+        counts = torch.zeros((b, k), dtype=torch.long, device=h.device)
+        counts.scatter_add_(1, patch_id, torch.ones_like(patch_id))
+        # byte の無い pad patch も位置 0 だけ有効にする (全マスクの SDPA は NaN)
+        valid = torch.arange(width, device=h.device) < counts.clamp_min(1).unsqueeze(-1)
+        return self.patch_pool(buf.view(b * k, width, dl), valid.view(b * k, width)).view(b, k, -1)
 
     def _forward_dynamic(self, input_ids: torch.Tensor) -> ArborOutput:
         cfg = self.cfg
@@ -1388,10 +1457,12 @@ class ArborModel(nn.Module):
             for layer in self.encoder_layers:
                 h = self._maybe_ckpt(layer, h, enc_mask)
 
-            # patchごとの固定dim pooling (mean | max。concat は __init__ で弾く)。
+            # patchごとの pooling (mean | max | xattn。concat は __init__ で弾く)。
             # pad patchは0埋めでdecoderからgatherされないため勾配は流れない。
             idx = patch_id.unsqueeze(-1).expand(-1, -1, h.size(-1))
-            if cfg.patch_pooling == "mean":
+            if self.patch_pool is not None:
+                pooled = self._xattn_pool_dynamic(h, patch_id, k)
+            elif cfg.patch_pooling == "mean":
                 pooled = h.new_zeros((b, k, h.size(-1)))
                 pooled.scatter_add_(1, idx, h)
                 counts = h.new_zeros((b, k, 1))
@@ -1569,7 +1640,7 @@ class ArborModel(nn.Module):
             "local_decoder": sum(count(m) for m in self.decoder_layers),
             "local_byte": sum(count(m) for m in self.byte_layers),
             "embedding_head": count(self.byte_emb) + count(self.head)
-            + count(self.patch_proj) + count(self.global_to_local),
+            + count(self.patch_pool) + count(self.patch_proj) + count(self.global_to_local),
             "entropy_model": count(self.entropy_model),
         }
 
@@ -1729,6 +1800,8 @@ class ArborByteGenerator:
             patch_emb = self.m.patch_proj(x.reshape(1, -1))  # (1, p*dl) -> (1, dg)
         elif pooling == "mean":
             patch_emb = self.m.patch_proj(x.mean(dim=1))
+        elif pooling == "xattn":
+            patch_emb = self.m.patch_proj(self.m.patch_pool(x))
         else:
             patch_emb = self.m.patch_proj(x.amax(dim=1))
         self._push_global(patch_emb.view(1, 1, -1))

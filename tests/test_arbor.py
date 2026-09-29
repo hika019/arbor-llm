@@ -426,6 +426,37 @@ def test_generator_matches_full_forward_with_mean_pooling():
             assert torch.allclose(inc, full, atol=2e-4)
 
 
+@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy_char"])
+def test_xattn_pooling_causal_and_matches_generator(mode):
+    torch.manual_seed(6)
+    cfg = dict(tiny_cfg(mode), patch_pooling="xattn", patch_xattn_queries=3, bitnet=False)
+    m = ArborModel(ArborConfig.from_dict(cfg)).eval()
+    assert m.patch_proj.in_features == 3 * TINY["local_hidden_size"]
+    ids = torch.randint(4, 260, (26,))
+    ids[::5] = 0x20 + 4
+    changed = ids.clone()
+    changed[13] = (ids[13] - 4 + 1) % 256 + 4
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        la, lb = m(ids.unsqueeze(0)).logits, m(changed.unsqueeze(0)).logits
+        assert torch.allclose(la[:, :13], lb[:, :13], atol=1e-5)
+        for i in range(len(ids)):
+            inc = gen.push(int(ids[i]))
+            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
+            assert torch.allclose(inc, full, atol=2e-4), f"pos={i}"
+
+
+def test_xattn_pooling_grad_is_finite_with_pad_patches():
+    torch.manual_seed(7)
+    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg("space"), patch_pooling="xattn")))
+    x = torch.randint(4, 260, (2, 30))
+    x[:, ::5] = 0x20 + 4
+    m(x).logits.float().square().mean().backward()
+    for name, par in m.patch_pool.named_parameters():
+        assert par.grad is not None and torch.isfinite(par.grad).all(), name
+    assert torch.isfinite(m.patch_proj.weight.grad).all()
+
+
 def test_byte_lm_forward_and_entropy():
     torch.manual_seed(0)
     lm = ByteLM(dict(TINY_ENTROPY_LM, max_bytes=64))

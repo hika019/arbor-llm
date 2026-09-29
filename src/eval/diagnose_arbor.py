@@ -256,6 +256,8 @@ def static_forward_parts(
         pooled = enc_patch.mean(dim=2)
     elif model.cfg.patch_pooling == "max":
         pooled = enc_patch.amax(dim=2)
+    elif model.cfg.patch_pooling == "xattn":
+        pooled = model.patch_pool(enc.view(b * k, p, -1)).view(b, k, -1)
     else:
         raise RuntimeError(
             f"unsupported patch_pooling={model.cfg.patch_pooling!r}"
