@@ -980,3 +980,13 @@ def test_char_rest_generator_matches_full_forward():
             inc = gen.push(int(ids[i]))
             full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
             assert torch.allclose(inc, full, atol=2e-4), f"pos={i}"
+
+
+def test_char_rest_generator_runs_in_bf16_without_autocast():
+    torch.manual_seed(15)
+    m = ArborModel(ArborConfig.from_dict(_rest_cfg(bitnet=False))).eval().to(torch.bfloat16)
+    gen = ArborByteGenerator(m)
+    with torch.inference_mode():
+        for b in _utf8_heavy_ids(12, 5).tolist():
+            gen.push(b)
+    assert gen.prev_rest != 0.0

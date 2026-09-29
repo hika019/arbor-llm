@@ -811,7 +811,8 @@ class ByteLM(nn.Module):
     def char_rest_from_hidden(self, normed_hidden: torch.Tensor) -> torch.Tensor | None:
         if self.char_rest is None:
             return None
-        return F.softplus(self.char_rest(normed_hidden.float()).squeeze(-1))
+        w_dtype = self.char_rest[0].weight.dtype
+        return F.softplus(self.char_rest(normed_hidden.to(w_dtype)).float().squeeze(-1))
 
 
 def build_byte_lm(model_cfg: dict[str, Any]) -> ByteLM:
