@@ -103,7 +103,7 @@ def test_dynamic_mean_patch_pooling_forward_and_grad():
     assert torch.isfinite(m.patch_proj.weight.grad).all()
 
 
-@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
 def test_causality(mode, pos):
     """位置 pos のバイトを変えても、位置 < pos の logits は変わらないこと.
@@ -186,7 +186,7 @@ def test_document_isolation_with_padding_to_patch_boundary():
     )
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
 def test_window_path_matches_dense(mode, monkeypatch):
     """T が chunk の倍数のときの窓 attention 経路が密マスク経路と一致すること.
 
@@ -211,7 +211,7 @@ def test_window_path_matches_dense(mode, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
 def test_dynamic_forward_shape_and_grads(mode):
     torch.manual_seed(0)
     m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode)))
@@ -379,7 +379,7 @@ def test_patch_starts_cuda_matches_cpu_reference():
     assert torch.equal(cuda, cpu)
 
 
-@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy", "entropy_char"])
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
     torch.manual_seed(3)
@@ -426,7 +426,7 @@ def test_generator_matches_full_forward_with_mean_pooling():
             assert torch.allclose(inc, full, atol=2e-4)
 
 
-@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy_char"])
+@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy_char"])
 def test_xattn_pooling_causal_and_matches_generator(mode):
     torch.manual_seed(6)
     cfg = dict(tiny_cfg(mode), patch_pooling="xattn", patch_xattn_queries=3, bitnet=False)
@@ -444,6 +444,25 @@ def test_xattn_pooling_causal_and_matches_generator(mode):
             inc = gen.push(int(ids[i]))
             full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
             assert torch.allclose(inc, full, atol=2e-4), f"pos={i}"
+
+
+@pytest.mark.parametrize("pooling", ["mean", "xattn"])
+def test_fixed_mode_matches_static_within_one_document(pooling):
+    """文書境界が無ければ fixed (動的経路) は同じ重みの static と同じ logits を返す.
+
+    local RoPE は static が patch 内位置・動的が絶対位置だが、RoPE は相対位置しか見ないので一致する。
+    """
+    torch.manual_seed(8)
+    cfg = dict(TINY, patch_pooling=pooling, bitnet=False, max_bytes=64, num_byte_layers=1)
+    static = ArborModel(ArborConfig.from_dict(dict(cfg, patching_mode="static"))).eval()
+    fixed = ArborModel(ArborConfig.from_dict(dict(
+        cfg, patching_mode="fixed", max_patch_len=TINY["patch_size"], min_patch_len=1,
+    ))).eval()
+    fixed.load_state_dict(static.state_dict())
+    x = torch.randint(4, 260, (2, 64))
+    x[x == 2] = 5
+    with torch.inference_mode():
+        assert torch.allclose(static(x).logits, fixed(x).logits, atol=1e-4)
 
 
 def test_xattn_pooling_grad_is_finite_with_pad_patches():
@@ -674,7 +693,7 @@ def _tight_dynamic_cfg(mode):
                 max_patches=14 if mode == "entropy_char" else 10, entropy_threshold=0.0)
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("pos", [5, 20, 40])
 def test_causality_with_budget_and_documents(mode, pos):
     """予算ガードが効き、文書境界がある状態でも未来のバイトが過去の logits に漏れない."""
@@ -690,7 +709,7 @@ def test_causality_with_budget_and_documents(mode, pos):
     assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5)
 
 
-@pytest.mark.parametrize("mode", ["utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
 def test_generator_matches_full_forward_with_budget(mode):
     """逐次生成器の境界判定 (予算ガードが効く状態) がフルフォワードと一致すること.
 
@@ -734,7 +753,7 @@ def test_byte_layers_forward_and_grads(mode, window):
     assert not missing, missing
 
 
-@pytest.mark.parametrize("mode", ["static", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("window", [None, 6])
 @pytest.mark.parametrize("pos", [4, 13, 29])
 def test_byte_layers_causality(mode, window, pos):

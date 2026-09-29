@@ -118,7 +118,9 @@ class ArborConfig:
     vocab_size: int = 260          # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
     max_bytes: int = 2048          # 学習 context (bytes)
     # ---- patching ----
-    patching_mode: str = "static"  # choices: static | utf8 | space | entropy | entropy_char
+    # fixed: 動的経路で max_patch_len ごと (と文書先頭) に区切る。static と同じ固定幅だが、
+    # 区切り以外 (patch の枠・pooling・文書境界・予算) を entropy 系と同一にした比較対照
+    patching_mode: str = "static"  # choices: static | fixed | utf8 | space | entropy | entropy_char
     patch_size: int = 4            # static 用: 1 patch のバイト数
     # concat: patch 内 byte を連結して p*dl→dg 射影 (static 専用、情報を落とさない)。
     # mean/max: 固定 local_hidden dim pooling (static/dynamic 共通、patch_size 非依存)。
@@ -962,6 +964,7 @@ def compute_patch_starts(
     - utf8:    現在バイトが UTF-8 文字先頭なら新 patch を開始
     - space:   直前バイトが空白系なら新 patch を開始
     - entropy: 直前位置での次バイト予測エントロピーが threshold 超なら開始
+    - fixed:   候補なし (max_len ごとと文書先頭だけで区切る)
     - entropy_char: 文字単位のエントロピー上昇で区切る (Harris の successor variety を
       エントロピーにした Jin & Tanaka-Ishii 2006 の増加基準)。多バイト文字は 1 byte 目 (範囲) より
       2 byte 目 (どの文字か) の予測が難しく、byte の entropy では文字の途中で区切られるので、
@@ -987,7 +990,9 @@ def compute_patch_starts(
 
     cur = input_ids - BYTE_OFFSET
     char_start = (cur < 0x80) | ((cur >= 0xC2) & (cur <= 0xF4))
-    if mode == "utf8":
+    if mode == "fixed":
+        raw = torch.zeros_like(char_start)
+    elif mode == "utf8":
         raw = char_start.clone()
         raw[:, 0] = False
     elif mode == "space":
@@ -1059,7 +1064,7 @@ class _LayerKVCache:
 class ArborModel(nn.Module):
     def __init__(self, cfg: ArborConfig):
         super().__init__()
-        if cfg.patching_mode not in ("static", "utf8", "space", *ENTROPY_MODES):
+        if cfg.patching_mode not in ("static", "fixed", "utf8", "space", *ENTROPY_MODES):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
         if cfg.patch_pooling not in ("concat", "mean", "max", "xattn"):
             raise ValueError(
@@ -1761,7 +1766,7 @@ class ArborByteGenerator:
             return True  # 予算ガードの不変条件により常に許される
         if self.byte_ids[-1] == cfg.eos_token_id:
             candidate = True  # 文書先頭は min_len に関係なく区切る
-        elif run < cfg.min_patch_len:
+        elif run < cfg.min_patch_len or cfg.patching_mode == "fixed":
             return False
         elif cfg.patching_mode == "utf8":
             candidate = next_byte_id is not None and _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
