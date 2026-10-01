@@ -1,4 +1,4 @@
-"""Arbor v2 モデルの形状・因果性・勾配のテスト (CPU, 3 patching モード)."""
+"""Arbor v2 モデルの形状・因果性・勾配のテスト (CPU, 全 patching モード)."""
 from __future__ import annotations
 
 import pytest
@@ -19,17 +19,17 @@ TINY = dict(
     num_hidden_layers=2,
     local_hidden_size=32, local_num_heads=2, local_num_kv_heads=2,
     local_intermediate_size=64,
-    num_local_encoder_layers=1, num_local_decoder_layers=1,
+    num_local_encoder_layers=1, num_local_decoder_layers=2,
+    cross_attn_k=2, cross_attn_heads=2, hash_ngram_vocab=97,
     rope_theta=10000.0,
 )
+ALL_MODES = ["static", "utf8", "space", "entropy", "entropy_char"]
 TINY_ENTROPY_LM = dict(hidden_size=32, num_heads=2, num_kv_heads=2,
                        intermediate_size=64, num_hidden_layers=1)
 
 
 def tiny_cfg(mode: str) -> dict:
     cfg = dict(TINY, patching_mode=mode)
-    if mode != "static":
-        cfg["patch_pooling"] = "max"  # 動的モードは concat 不可 (既定 concat は static 用)
     if mode in ("entropy", "entropy_char"):
         cfg["entropy_model"] = TINY_ENTROPY_LM
     return cfg
@@ -48,7 +48,7 @@ def test_forward_shape(model):
 
 
 def test_forward_handles_partial_patch(model):
-    # T が patch_size の倍数でなくても内部 pad で処理し、T 分の logits を返す
+    # T が patch_size の倍数でなくても T 分の logits を返す
     x = torch.randint(4, 260, (1, 10))
     out = model(x)
     assert out.logits.shape == (1, 10, 260)
@@ -60,50 +60,31 @@ def test_unknown_global_attention_impl_is_error():
         ArborModel(cfg)
 
 
-def test_unknown_patch_pooling_is_error():
-    cfg = ArborConfig.from_dict(dict(TINY, patch_pooling="attention"))
-    with pytest.raises(ValueError, match="patch_pooling"):
-        ArborModel(cfg)
+def test_removed_config_keys_are_errors():
+    for key, value in (("patch_pooling", "concat"), ("num_byte_layers", 2), ("byte_attn_window", 8)):
+        with pytest.raises(ValueError, match="廃止"):
+            ArborConfig.from_dict(dict(TINY, **{key: value}))
 
 
-def test_concat_patch_pooling_is_rejected_in_dynamic_modes():
-    """concat は patch 長固定 (static) 専用。動的モードで黙って max に化けないこと."""
-    for mode in ("utf8", "space", "entropy", "entropy_char"):
-        cfg = ArborConfig.from_dict(dict(tiny_cfg(mode), patch_pooling="concat"))
-        with pytest.raises(ValueError, match="concat"):
-            ArborModel(cfg)
-    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg("static"), patch_pooling="concat")))
-    assert m.patch_proj.in_features == TINY["patch_size"] * TINY["local_hidden_size"]
+def test_patching_modes_share_the_same_weights():
+    """区切り方だけが違い、patch 以降の重みは同じ形 (区切りを差し替えて推論できる)."""
+    ref = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).state_dict()
+    for mode in ALL_MODES[1:]:
+        cfg = dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=TINY["patch_size"])
+        state = ArborModel(ArborConfig.from_dict(cfg)).state_dict()
+        body = {k: v.shape for k, v in state.items() if not k.startswith("entropy_model.")}
+        assert body == {k: v.shape for k, v in ref.items()}, mode
 
 
-@pytest.mark.parametrize("pooling", ["mean", "max"])
-def test_fixed_dim_patch_pooling_is_patch_size_independent(pooling):
-    cfg4 = ArborConfig.from_dict(dict(TINY, patch_size=4, patch_pooling=pooling))
-    cfg8 = ArborConfig.from_dict(dict(TINY, patch_size=8, patch_pooling=pooling))
-    m4 = ArborModel(cfg4).eval()
-    m8 = ArborModel(cfg8).eval()
-    assert m4.patch_proj.in_features == TINY["local_hidden_size"]
-    assert m8.patch_proj.in_features == TINY["local_hidden_size"]
-    x = torch.randint(4, 260, (1, 32))
-    with torch.inference_mode():
-        assert m4(x).logits.shape == (1, 32, 260)
-        assert m8(x).logits.shape == (1, 32, 260)
+def test_patch_projection_only_when_k_times_local_differs_from_global():
+    assert ArborModel(ArborConfig.from_dict(TINY)).patch_proj is None  # 2 * 32 = 64
+    m = ArborModel(ArborConfig.from_dict(dict(TINY, cross_attn_k=3)))
+    assert m.patch_proj is not None and m.patch_proj.in_features == 3 * TINY["local_hidden_size"]
+    x = torch.randint(4, 260, (1, 16))
+    assert m(x).logits.shape == (1, 16, 260)
 
 
-def test_dynamic_mean_patch_pooling_forward_and_grad():
-    cfg = ArborConfig.from_dict(
-        dict(tiny_cfg("space"), patch_pooling="mean")
-    )
-    m = ArborModel(cfg)
-    x = torch.randint(4, 260, (2, 30))
-    x[:, ::5] = 0x20 + 4
-    loss = m(x).logits.float().square().mean()
-    loss.backward()
-    assert m.patch_proj.weight.grad is not None
-    assert torch.isfinite(m.patch_proj.weight.grad).all()
-
-
-@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ALL_MODES)
 @pytest.mark.parametrize("pos", [4, 7, 13])  # patch 境界 (4) と patch 内部
 def test_causality(mode, pos):
     """位置 pos のバイトを変えても、位置 < pos の logits は変わらないこと.
@@ -168,9 +149,7 @@ def test_document_isolation_with_padding_to_patch_boundary():
     packing側のpatch_align=4が生成する形を直接モデルへ通す regression test。
     """
     torch.manual_seed(7)
-    m = ArborModel(
-        ArborConfig.from_dict(dict(tiny_cfg("static"), patch_pooling="mean"))
-    ).eval()
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
     a = torch.randint(4, 260, (1, 12))
     a[0, 2] = 2  # doc A EOS
     a[0, 3] = 3  # patch boundary までの alignment PAD
@@ -186,33 +165,8 @@ def test_document_isolation_with_padding_to_patch_boundary():
     )
 
 
-@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
-def test_window_path_matches_dense(mode, monkeypatch):
-    """T が chunk の倍数のときの窓 attention 経路が密マスク経路と一致すること.
-
-    既存テストは T < _WINDOW_CHUNK で密経路しか通らないため、T=256 で
-    窓経路を踏み、_WINDOW_CHUNK を巨大化して得た密経路の logits と比較する。
-    """
-    import src.model.arbor as arbor_mod
-
-    torch.manual_seed(2)
-    t = 2 * arbor_mod._WINDOW_CHUNK
-    # BitNet の int8 活性化量子化は 1e-7 の加算順の差でも丸めが反転して 1e-4 の差になるので FP で比べる
-    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg(mode), max_bytes=t, bitnet=False))).eval()
-    x = torch.randint(4, 260, (2, t))
-    x[0, ::5] = 0x20 + 4  # space 境界を発生させる
-    with torch.inference_mode():
-        win = m(x).logits
-        monkeypatch.setattr(arbor_mod, "_WINDOW_CHUNK", 10**9)  # t >= c を破り密経路へ
-        dense = m(x).logits
-    assert torch.allclose(win, dense, atol=1e-5), (
-        f"mode={mode}: 窓経路と密マスク経路の logits が不一致 "
-        f"(max diff={(win - dense).abs().max().item():.2e})"
-    )
-
-
-@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
-def test_dynamic_forward_shape_and_grads(mode):
+@pytest.mark.parametrize("mode", ALL_MODES)
+def test_forward_shape_and_grads(mode):
     torch.manual_seed(0)
     m = ArborModel(ArborConfig.from_dict(tiny_cfg(mode)))
     x = torch.randint(4, 260, (2, 30))  # patch_size の倍数でなくてもよい
@@ -379,7 +333,7 @@ def test_patch_starts_cuda_matches_cpu_reference():
     assert torch.equal(cuda, cpu)
 
 
-@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ALL_MODES)
 def test_generator_matches_full_forward(mode):
     """KV cache 逐次生成器がフルフォワードと同じ logits を返すこと (全モード)."""
     torch.manual_seed(3)
@@ -411,69 +365,16 @@ def test_generator_context_rebuild():
     assert len(gen.byte_ids) <= 16
 
 
-def test_generator_matches_full_forward_with_mean_pooling():
-    torch.manual_seed(5)
-    cfg = ArborConfig.from_dict(
-        dict(TINY, patch_size=8, patch_pooling="mean", max_bytes=32)
-    )
-    m = ArborModel(cfg).eval()
-    ids = torch.randint(4, 260, (24,))
-    gen = ArborByteGenerator(m)
-    with torch.inference_mode():
-        for i, byte_id in enumerate(ids):
-            inc = gen.push(int(byte_id))
-            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
-            assert torch.allclose(inc, full, atol=2e-4)
-
-
-@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy_char"])
-def test_xattn_pooling_causal_and_matches_generator(mode):
-    torch.manual_seed(6)
-    cfg = dict(tiny_cfg(mode), patch_pooling="xattn", patch_xattn_queries=3, bitnet=False)
-    m = ArborModel(ArborConfig.from_dict(cfg)).eval()
-    assert m.patch_proj.in_features == 3 * TINY["local_hidden_size"]
-    ids = torch.randint(4, 260, (26,))
-    ids[::5] = 0x20 + 4
-    changed = ids.clone()
-    changed[13] = (ids[13] - 4 + 1) % 256 + 4
-    gen = ArborByteGenerator(m)
-    with torch.inference_mode():
-        la, lb = m(ids.unsqueeze(0)).logits, m(changed.unsqueeze(0)).logits
-        assert torch.allclose(la[:, :13], lb[:, :13], atol=1e-5)
-        for i in range(len(ids)):
-            inc = gen.push(int(ids[i]))
-            full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
-            assert torch.allclose(inc, full, atol=2e-4), f"pos={i}"
-
-
-@pytest.mark.parametrize("pooling", ["mean", "xattn"])
-def test_fixed_mode_matches_static_within_one_document(pooling):
-    """文書境界が無ければ fixed (動的経路) は同じ重みの static と同じ logits を返す.
-
-    local RoPE は static が patch 内位置・動的が絶対位置だが、RoPE は相対位置しか見ないので一致する。
-    """
-    torch.manual_seed(8)
-    cfg = dict(TINY, patch_pooling=pooling, bitnet=False, max_bytes=64, num_byte_layers=1)
-    static = ArborModel(ArborConfig.from_dict(dict(cfg, patching_mode="static"))).eval()
-    fixed = ArborModel(ArborConfig.from_dict(dict(
-        cfg, patching_mode="fixed", max_patch_len=TINY["patch_size"], min_patch_len=1,
-    ))).eval()
-    fixed.load_state_dict(static.state_dict())
-    x = torch.randint(4, 260, (2, 64))
-    x[x == 2] = 5
-    with torch.inference_mode():
-        assert torch.allclose(static(x).logits, fixed(x).logits, atol=1e-4)
-
-
-def test_xattn_pooling_grad_is_finite_with_pad_patches():
+def test_pad_patches_get_no_nan_gradients():
+    """byte の無い pad patch (予算に対して patch が少ない) があっても勾配は有限."""
     torch.manual_seed(7)
-    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg("space"), patch_pooling="xattn")))
+    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg("space"), min_patch_len=1, max_patch_len=8)))
+    assert m.max_patches > 30
     x = torch.randint(4, 260, (2, 30))
     x[:, ::5] = 0x20 + 4
     m(x).logits.float().square().mean().backward()
-    for name, par in m.patch_pool.named_parameters():
-        assert par.grad is not None and torch.isfinite(par.grad).all(), name
-    assert torch.isfinite(m.patch_proj.weight.grad).all()
+    bad = [n for n, par in m.named_parameters() if par.grad is not None and not torch.isfinite(par.grad).all()]
+    assert not bad, bad
 
 
 def test_byte_lm_forward_and_entropy():
@@ -486,13 +387,13 @@ def test_byte_lm_forward_and_entropy():
     assert torch.isfinite(ent).all() and (ent >= 0).all()
 
 
-def test_partial_patch_padding_does_not_leak(model):
-    """端数 patch の内部 pad が、それ以前の位置の logits に影響しないこと."""
+def test_partial_patch_does_not_leak(model):
+    """途中で切った入力 (最後の patch が端数) でも、それ以前の位置の logits は同じ."""
     torch.manual_seed(2)
     x = torch.randint(4, 260, (1, 32))
     with torch.inference_mode():
         full = model(x).logits
-        trunc = model(x[:, :10]).logits  # 内部で 12 まで pad される
+        trunc = model(x[:, :10]).logits
     assert torch.allclose(full[:, :9], trunc[:, :9], atol=1e-5)
 
 
@@ -574,47 +475,6 @@ def test_global_attn_flex_matches_sdpa():
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("compiled", [False, True])
-def test_short_seq_attention_uses_efficient_sdpa(monkeypatch, compiled):
-    """static patching の local attention (T=16) が mem-efficient SDPA を使い、flash と
-    同じ値を返すこと (#CUDA speed path)。
-
-    flash は 128 行 tile を 16 行にしか使えず 2.7 倍遅い (nsys 実測 2026-09-14)。
-    数値は厳密 attention 同士なので bf16 の加算順の差だけ。
-    """
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    from torch.profiler import ProfilerActivity, profile
-
-    import src.model.arbor as arbor_mod
-    from src.model.arbor import Attention, RotaryEmbedding
-
-    torch.manual_seed(0)
-    dim, heads, t = 64, 2, 16
-    rope = RotaryEmbedding(dim // heads, max_pos=t, theta=10000.0).cuda()
-    attn = Attention(dim, heads, heads, rope, bitnet=False, norm_eps=1e-5, causal=True).cuda().to(torch.bfloat16)
-    x = torch.randn(8, t, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-
-    fn = torch.compile(attn) if compiled else attn
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        out = fn(x)
-        out.float().sum().backward()
-        torch.cuda.synchronize()
-    names = [e.key for e in prof.key_averages()]
-    assert any("fmha_cutlass" in n for n in names), names
-    assert not any("flash_fwd" in n for n in names), names
-    grad_eff = x.grad.clone()
-    x.grad = None
-
-    # 参照: しきい値を 0 にして既定の選択 (flash) を通す
-    monkeypatch.setattr(arbor_mod, "_SHORT_SEQ_EFFICIENT_SDPA_MAX", 0)
-    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-        ref = attn(x)
-        ref.float().sum().backward()
-    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
-    assert torch.allclose(grad_eff.float(), x.grad.float(), atol=2e-2, rtol=2e-2)
-
-
 # ---------------------------------------------------------------- 境界: 文書先頭の強制区切り + 予算ガード
 def _check_patch_rules(starts, raw, force, min_len, max_len, budget, horizon):
     """_patch_starts_reference の出力が規則を満たすこと (独立な検査)."""
@@ -689,11 +549,11 @@ def test_patch_starts_cuda_matches_reference_with_force_and_budget(budget):
 def _tight_dynamic_cfg(mode):
     # max_bytes=64, max_patch_len=8 → 予算の下限 8 (entropy_char は単位 5 で 13)。下限の少し上に置き、
     # 候補の大半を予算で削らせる
-    return dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=8,
+    return dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=8, patch_size=8,
                 max_patches=14 if mode == "entropy_char" else 10, entropy_threshold=0.0)
 
 
-@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ALL_MODES)
 @pytest.mark.parametrize("pos", [5, 20, 40])
 def test_causality_with_budget_and_documents(mode, pos):
     """予算ガードが効き、文書境界がある状態でも未来のバイトが過去の logits に漏れない."""
@@ -709,12 +569,11 @@ def test_causality_with_budget_and_documents(mode, pos):
     assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5)
 
 
-@pytest.mark.parametrize("mode", ["fixed", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ALL_MODES)
 def test_generator_matches_full_forward_with_budget(mode):
     """逐次生成器の境界判定 (予算ガードが効く状態) がフルフォワードと一致すること.
 
-    EOS は入れない: 生成器は global の文書分離 (新文書は BOS しか見ない) を実装しておらず
-    (static も同じ既存の制約)、プロンプト中の EOS ではフルフォワードと一致しない。
+    EOS は入れない: 生成器は文書分離を実装しておらず、プロンプト中の EOS ではフルフォワードと一致しない。
     """
     torch.manual_seed(12)
     m = ArborModel(ArborConfig.from_dict(dict(_tight_dynamic_cfg(mode), bitnet=False))).eval()
@@ -729,36 +588,21 @@ def test_generator_matches_full_forward_with_budget(mode):
             assert torch.allclose(inc, full, atol=2e-4), f"mode={mode} pos={i}"
 
 
-# ---------------------------------------------------------------- byte 層 (全文脈 causal の byte 単位 attention)
-def _byte_cfg(mode, window=None, n=2, **over):
-    cfg = dict(tiny_cfg(mode), num_byte_layers=n, byte_attn_window=window)
+# ---------------------------------------------------------------- local の byte 層 (文書内 causal、窓)
+def _local_cfg(mode, window=None, **over):
+    cfg = dict(tiny_cfg(mode), local_attn_window=window)
     if mode != "static":
         cfg.update(min_patch_len=1, max_patch_len=8)
     cfg.update(over)
     return cfg
 
 
-@pytest.mark.parametrize("mode", ["static", "space", "entropy", "entropy_char"])
-@pytest.mark.parametrize("window", [None, 5])
-def test_byte_layers_forward_and_grads(mode, window):
-    torch.manual_seed(0)
-    m = ArborModel(ArborConfig.from_dict(_byte_cfg(mode, window)))
-    x = torch.randint(4, 260, (2, 30))
-    x[0, 10] = 2  # 文書境界
-    out = m(x)
-    assert out.logits.shape == (2, 30, 260)
-    out.logits.float().square().mean().backward()
-    missing = [n for n, p in m.named_parameters()
-               if p.requires_grad and n.startswith("byte_layers") and p.grad is None]
-    assert not missing, missing
-
-
-@pytest.mark.parametrize("mode", ["static", "fixed", "utf8", "space", "entropy", "entropy_char"])
+@pytest.mark.parametrize("mode", ALL_MODES)
 @pytest.mark.parametrize("window", [None, 6])
 @pytest.mark.parametrize("pos", [4, 13, 29])
-def test_byte_layers_causality(mode, window, pos):
+def test_local_window_causality(mode, window, pos):
     torch.manual_seed(1)
-    m = ArborModel(ArborConfig.from_dict(_byte_cfg(mode, window))).eval()
+    m = ArborModel(ArborConfig.from_dict(_local_cfg(mode, window))).eval()
     a = torch.randint(4, 260, (1, 40))
     a[0, ::5] = 0x20 + 4
     a[0, 20] = 2
@@ -770,42 +614,43 @@ def test_byte_layers_causality(mode, window, pos):
     assert not torch.allclose(la[:, pos:], lb[:, pos:], atol=1e-5)
 
 
-def test_byte_layers_see_far_past_bytes_directly():
-    """byte 層があると、同じ patch に属さない遠い byte が patch 内 decoder を経ずに効く.
+def test_local_window_limits_byte_level_reach():
+    """global を切ると、byte 同士は local の窓 (と hash n-gram) の届く範囲でしか影響しない.
 
-    global を切った (出力 0) モデルでも、byte 層経由で過去 patch の byte が後ろの logits を変える。
-    byte 層無しなら global を切ると patch を跨ぐ情報は完全に途切れる (対照)。
+    窓 None なら遠い byte も local の byte 層で直接効く。窓 4 では encoder 1 層 + decoder 2 層で
+    3 * 3 byte、hash n-gram で 7 byte 先までしか届かない。
     """
     torch.manual_seed(2)
-    x = torch.randint(4, 260, (1, 32))
+    x = torch.randint(4, 260, (1, 40))
     y = x.clone()
-    y[0, 1] = (x[0, 1] - 4 + 1) % 256 + 4  # patch 0 の byte
-    for n_byte, expect_change in ((1, True), (0, False)):
-        m = ArborModel(ArborConfig.from_dict(dict(TINY, num_byte_layers=n_byte))).eval()
+    y[0, 1] = (x[0, 1] - 4 + 1) % 256 + 4
+    reach = 1 + 3 * 3 + 7
+    for window, expect_change in ((None, True), (4, False)):
+        m = ArborModel(ArborConfig.from_dict(dict(TINY, local_attn_window=window))).eval()
         with torch.no_grad():
-            m.global_to_local.weight.zero_()  # global の寄与を消す
+            m.global_to_local.weight.zero_()
             la, lb = m(x).logits, m(y).logits
-        changed = not torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-6)
-        assert changed == expect_change, f"num_byte_layers={n_byte}"
+        changed = not torch.allclose(la[:, reach + 1:], lb[:, reach + 1:], atol=1e-6)
+        assert changed == expect_change, f"window={window}"
 
 
-def test_byte_layers_document_isolation():
+def test_local_layers_document_isolation():
     torch.manual_seed(3)
-    m = ArborModel(ArborConfig.from_dict(_byte_cfg("static"))).eval()
+    m = ArborModel(ArborConfig.from_dict(_local_cfg("static"))).eval()
     a = torch.randint(4, 260, (1, 16))
     a[0, 7] = 2
     b = a.clone()
-    b[0, 2] = (a[0, 2] - 4 + 1) % 256 + 4
+    b[0, 6] = (a[0, 6] - 4 + 1) % 256 + 4  # hash n-gram も文書をまたがないこと
     with torch.inference_mode():
         la, lb = m(a).logits, m(b).logits
-    assert torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-5), "doc1 の変更が byte 層経由で doc2 に漏れている"
+    assert torch.allclose(la[:, 8:], lb[:, 8:], atol=1e-5), "doc1 の変更が doc2 に漏れている"
 
 
 @pytest.mark.parametrize("mode", ["static", "space", "entropy", "entropy_char"])
 @pytest.mark.parametrize("window", [None, 5])
-def test_generator_matches_full_forward_with_byte_layers(mode, window):
+def test_generator_matches_full_forward_with_local_window(mode, window):
     torch.manual_seed(4)
-    m = ArborModel(ArborConfig.from_dict(_byte_cfg(mode, window, bitnet=False))).eval()
+    m = ArborModel(ArborConfig.from_dict(_local_cfg(mode, window, bitnet=False))).eval()
     ids = torch.randint(4, 260, (30,))
     ids[ids == 2] = 5
     ids[::4] = 0x20 + 4
@@ -817,31 +662,34 @@ def test_generator_matches_full_forward_with_byte_layers(mode, window):
             assert torch.allclose(inc, full, atol=2e-5), f"mode={mode} window={window} pos={i}"
 
 
-def test_generator_rebuild_with_byte_layers():
-    torch.manual_seed(5)
-    m = ArborModel(ArborConfig.from_dict(dict(TINY, max_bytes=16, num_byte_layers=1))).eval()
-    gen = ArborByteGenerator(m)
-    with torch.inference_mode():
-        for i in range(40):
-            logits = gen.push(4 + (i * 7) % 256)
-    assert torch.isfinite(logits).all() and len(gen.byte_ids) <= 16
-
-
 def test_local_bitnet_switch():
     from src.model.bitlinear import BitLinear
 
-    m = ArborModel(ArborConfig.from_dict(dict(TINY, num_byte_layers=1, local_bitnet=False)))
-    for name in ("encoder_layers", "byte_layers", "decoder_layers"):
+    m = ArborModel(ArborConfig.from_dict(dict(TINY, local_bitnet=False)))
+    for name in ("encoder_layers", "decoder_layers", "encoder_cross_attn", "decoder_cross_attn"):
         assert not any(isinstance(x, BitLinear) for x in getattr(m, name).modules()), name
     assert any(isinstance(x, BitLinear) for x in m.global_layers.modules())
 
 
+def test_cross_attention_is_bitlinear_and_not_qkv_fused():
+    """cross-attention の射影は 3 値。q と kv は入力が違うので qkv 融合の対象にしない."""
+    from src.model.bitlinear import BitLinear, install_arbor_projection_fusions
+
+    m = ArborModel(ArborConfig.from_dict(TINY))
+    for xattn in (*m.encoder_cross_attn, *m.decoder_cross_attn):
+        assert all(isinstance(getattr(xattn, n), BitLinear) for n in ("wq", "wk", "wv", "wo"))
+    info = install_arbor_projection_fusions(m)
+    n_self_attn = len(m.encoder_layers) + len(m.global_layers) + len(m.decoder_layers)
+    assert info["qkv_groups"] == n_self_attn
+    assert not any(hasattr(x, "_fast_qkv_group") for x in (*m.encoder_cross_attn, *m.decoder_cross_attn))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("window", [None, 40])
-def test_byte_layers_flex_mask_matches_dense_under_compile(window):
+def test_local_flex_mask_matches_dense_under_compile(window):
     """compile 下の flex BlockMask 経路が eager の密 mask 経路と一致すること (fp32)."""
     torch.manual_seed(6)
-    cfg = dict(TINY, max_bytes=256, num_byte_layers=2, byte_attn_window=window, bitnet=False)
+    cfg = dict(TINY, max_bytes=256, local_attn_window=window, bitnet=False)
     m = ArborModel(ArborConfig.from_dict(cfg)).cuda().eval()
     x = torch.randint(4, 260, (2, 256), device="cuda")
     x[0, 100] = 2
@@ -850,6 +698,43 @@ def test_byte_layers_flex_mask_matches_dense_under_compile(window):
         eager = m(x).logits
         compiled = torch.compile(m)(x).logits
     assert (eager - compiled).abs().max().item() < 1e-4
+
+
+# ---------------------------------------------------------------- hash n-gram 埋め込み
+def _blt_byte_group_hash(x: torch.Tensor, group_size: int, max_hash: int) -> torch.Tensor:
+    """facebookresearch/blt の byte_group_hash_function (hash 関数 0 番) の写し."""
+    prime = torch.tensor(1000000007, dtype=torch.int64)
+    powers = torch.stack([prime**i for i in range(group_size)])
+    x = torch.cat([torch.zeros(x.shape[0], group_size - 1, dtype=torch.int64), x], dim=1)
+    return torch.sum(x.unfold(1, group_size, 1) * powers, dim=-1) % max_hash
+
+
+def test_hash_ngram_ids_match_blt_reference():
+    from src.model.arbor import HashNgramEmbedding
+
+    emb = HashNgramEmbedding((3, 5, 8), vocab=50002, dim=4)
+    ids = torch.randint(4, 260, (2, 40))
+    seen = []
+    for table in emb.tables:
+        table.register_forward_hook(lambda mod, args, out: seen.append(args[0]))
+    emb(ids, torch.zeros_like(ids))
+    for n, got in zip((3, 5, 8), seen):
+        assert torch.equal(got, _blt_byte_group_hash(ids, n, 50002)), n
+
+
+def test_hash_ngram_resets_at_document_start():
+    from src.model.arbor import HashNgramEmbedding
+
+    torch.manual_seed(0)
+    emb = HashNgramEmbedding((3, 4), vocab=101, dim=8)
+    ids = torch.randint(4, 260, (1, 12))
+    doc = torch.zeros_like(ids)
+    doc[0, 6:] = 1
+    other = ids.clone()
+    other[0, 5] = (ids[0, 5] - 4 + 1) % 256 + 4  # 前の文書の最後の byte
+    a, b = emb(ids, doc), emb(other, doc)
+    assert torch.equal(a[0, 6:], b[0, 6:])
+    assert not torch.equal(a[0, 5], b[0, 5])
 
 
 def test_bytelm_is_llama_style_by_default():

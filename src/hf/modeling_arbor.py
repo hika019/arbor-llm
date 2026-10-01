@@ -21,27 +21,31 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutput
 
 _ARBOR_FIELDS = (
-    "vocab_size", "patch_size", "patch_pooling", "patch_xattn_queries", "max_bytes",
+    "vocab_size", "patch_size", "max_bytes",
     "patching_mode", "min_patch_len", "max_patch_len",
     "entropy_threshold", "entropy_model",
     "hidden_size", "num_heads", "num_kv_heads", "intermediate_size",
     "num_hidden_layers",
     "local_hidden_size", "local_num_heads", "local_num_kv_heads",
     "local_intermediate_size", "num_local_encoder_layers", "num_local_decoder_layers",
-    "num_byte_layers", "byte_attn_window", "local_bitnet", "max_patches",
+    "local_attn_window", "local_bitnet", "max_patches",
+    "cross_attn_k", "cross_attn_heads", "decoder_cross_attn_all_layers",
+    "hash_ngram_sizes", "hash_ngram_vocab",
     "rope_theta", "rope_theta_global", "rope_theta_local", "norm_eps", "bitnet",
 )
 
 _ARBOR_DEFAULTS = dict(
-    vocab_size=260, patch_size=4, patch_pooling="concat", patch_xattn_queries=4, max_bytes=2048,
+    vocab_size=260, patch_size=16, max_bytes=2048,
     patching_mode="static", min_patch_len=2, max_patch_len=16,
     entropy_threshold=1.5, entropy_model=None,
     hidden_size=2048, num_heads=16, num_kv_heads=4, intermediate_size=5632,
     num_hidden_layers=20,
     local_hidden_size=768, local_num_heads=12, local_num_kv_heads=12,
-    local_intermediate_size=2048, num_local_encoder_layers=2,
-    num_local_decoder_layers=4,
-    num_byte_layers=0, byte_attn_window=None, local_bitnet=None, max_patches=None,
+    local_intermediate_size=2048, num_local_encoder_layers=1,
+    num_local_decoder_layers=2,
+    local_attn_window=None, local_bitnet=None, max_patches=None,
+    cross_attn_k=2, cross_attn_heads=None, decoder_cross_attn_all_layers=True,
+    hash_ngram_sizes=(3, 4, 5, 6, 7, 8), hash_ngram_vocab=50000,
     rope_theta=500000.0, rope_theta_global=None, rope_theta_local=None,
     norm_eps=1e-5, bitnet=True,
 )

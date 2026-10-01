@@ -18,42 +18,41 @@ entropy_lm_config: entropy_lm.yaml
 
 model:
   vocab_size: 260               # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
-  # patching_mode: 一定 byte で区切る (entropy 不使用) なら static のまま。
-  #   static  … patch_size byte 固定で区切る (これが「一定 byte 区切り」)
-  #   utf8    … UTF-8 文字境界で区切る (min/max_patch_len 有効)
-  #   space   … 空白/改行直後で区切る (min/max_patch_len 有効)
-  #   entropy … ByteLM の予測エントロピー閾値で区切る (entropy_lm_config 必須)
-  patching_mode: static         # choices: static | utf8 | space | entropy
+  # patching_mode: patch の区切り方。区切った後の処理 (BLT の local encoder / decoder) は共通。
+  #   static       … patch_size byte ごと (と文書先頭) で区切る
+  #   utf8 / space … UTF-8 文字先頭 / 空白・改行直後を候補にする (min/max_patch_len 有効)
+  #   entropy / entropy_char … ByteLM の予測エントロピーで区切る (entropy_lm_config 必須)
+  patching_mode: static         # choices: static | utf8 | space | entropy | entropy_char
   patch_size: 16                # static 専用: 1 patch = N byte。8192/16=512 global patches
-  # patch 表現の pooling。
-  #   concat … patch 内 byte を連結して p*dl→dg 射影 (static 専用。動的モードはエラー)
-  #   mean/max … patch_size 非依存の固定 local_hidden dim projection
-  # 小型 Arbor A/B (2026-09-14, 効率化メモ §8): concat が mean に mean_bpb −0.031 (全ドメイン)。
-  # 1B では +25M FP params / +1.2% step 時間 / +0.2 GiB。
-  patch_pooling: concat         # choices: concat | mean | max
-  min_patch_len: 3              # utf8/space/entropy 専用。range: 1..max_patch_len
-  max_patch_len: 16             # utf8/space/entropy 専用。range: >=min_patch_len
-  entropy_threshold: 2.0        # entropy 専用: 次 byte H (nats)。range: >0 (小さいほど細切れ)
-  max_bytes: 8192               # 学習 context (bytes)。static では patch_size の倍数
+  min_patch_len: 3              # static 以外。range: 1..max_patch_len
+  max_patch_len: 16             # static 以外。range: >=min_patch_len
+  entropy_threshold: 2.0        # entropy 系専用 (entropy_char は文字の H の上昇幅)
+  max_bytes: 8192               # 学習 context (bytes)
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
   num_heads: 16
   num_kv_heads: 4               # GQA
   intermediate_size: 5632       # ReLU² gated FFN
   num_hidden_layers: 20
-  # ---- local (byte 階層, BitLinear) ----
+  # ---- local (byte 階層、BLT の local encoder / decoder) ----
   local_hidden_size: 768
   local_num_heads: 12
   local_num_kv_heads: 12
   local_intermediate_size: 2048
-  num_local_encoder_layers: 1   # local は全 byte 位置で計算するため層を薄くして budget を global へ
+  num_local_encoder_layers: 1   # hash n-gram があれば encoder は 1 層で足りる (BLT 論文 Table 9)
   num_local_decoder_layers: 2
+  local_attn_window: null       # encoder / decoder の byte 層の causal 窓。null = 文書内の全文脈
+  # ---- cross-attention / hash n-gram (BLT) ----
+  cross_attn_k: 2               # patch あたりの query 数。k * local_hidden_size (1536) を hidden_size へ射影
+  cross_attn_heads: 12
+  decoder_cross_attn_all_layers: true  # decoder の全層の前に cross-attention (BLT 論文 Table 7 の最良)
+  hash_ngram_sizes: [3, 4, 5, 6, 7, 8]
+  hash_ngram_vocab: 50000       # n ごとの表の行数
   # ---- 共通 ----
   # RoPE。global は max_patches (static 8k/patch16 = 512) 位置しか見ないため、
   # 128k 長文脈向けの theta=500000 は大半の次元の波長が文脈長を桁で超え、位置
   # 分解能を潰す (#1: 長距離一貫性が育たない疑い)。系列長相応の値へ下げる。
   #   A/B: 旧挙動へ戻すなら rope_theta_global を 500000.0 にする。
-  # local は patch 内 (static) / flat バイト列 (dynamic) を見るので従来値を維持。
   rope_theta: 500000.0          # 個別未指定の層のfallback (= local に適用)
   rope_theta_global: 10000.0    # #1: 512 patch 位置に見合う theta
   rope_theta_local: 500000.0    # local は従来どおり
@@ -131,7 +130,7 @@ data:
   eos_token_id: 2
   pad_token_id: 3
   shuffle_buffer: 2000
-  context_length: 8192          # bytes。patch_size の倍数にする
+  context_length: 8192          # bytes
   num_workers: 0                # 正確 resume は単一プロセス前提
   pin_memory: true
 

@@ -648,7 +648,7 @@ def test_arbor_packed_ternary_caches_all_layers_and_trains_cuda():
 
     cfg = ArborConfig.from_dict(
         dict(
-            vocab_size=260, patch_size=4, patch_pooling="mean", max_bytes=64,
+            vocab_size=260, patch_size=4, max_bytes=64,
             hidden_size=32, num_heads=4, num_kv_heads=2, intermediate_size=64,
             num_hidden_layers=1,
             local_hidden_size=16, local_num_heads=2, local_num_kv_heads=2,
@@ -686,7 +686,7 @@ def test_arbor_native_int8_caches_all_layers_and_trains_cuda():
 
     cfg = ArborConfig.from_dict(
         dict(
-            vocab_size=260, patch_size=4, patch_pooling="mean", max_bytes=64,
+            vocab_size=260, patch_size=4, max_bytes=64,
             hidden_size=32, num_heads=4, num_kv_heads=2, intermediate_size=64,
             num_hidden_layers=1,
             local_hidden_size=16, local_num_heads=2, local_num_kv_heads=2,

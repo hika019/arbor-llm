@@ -1,48 +1,31 @@
 """Arbor v2: バイトレベル階層 Transformer × BitNet b1.58 (自己完結実装).
 
-構造:
+構造 (BLT, Pagnoni et al. 2024 の local 構造。patch 以降の処理は区切り方に依存しない):
 
     bytes (B, T)
-      └ byte embedding (FP, d_local)
-      └ Local Encoder: patch 内 attention (n_enc 層)
-      └ patch 化 (下記)
-      └ Global Transformer: 1 patch 右シフト + causal (n_global 層) -> h_t
-            h_t は「patch t より前の全バイト」だけを見る
-      └ Local Decoder: 入力 = byte_emb[i] + proj(h_patch(i)) を patch 内 causal で処理
+      └ byte embedding + hash n-gram 埋め込み (n = hash_ngram_sizes)
+      └ Local Encoder: 文書内 causal の byte 層 (n_enc 層)。各層の後に patch ごとの
+          cross_attn_k 個の query が自 patch の byte へ cross-attention (初回 query は
+          patch 内 max-pool の射影)。k 個を連結したものが patch 表現
+      └ Global Transformer: 1 patch 右シフト + causal (n_global 層)。出力 j は
+          「patch j より前の全バイト」だけを見る
+      └ Local Decoder: 入力 = encoder の byte 表現。各層の前に、byte が自 patch の global
+          出力 (k 個に分けたもの) へ cross-attention し、文書内 causal の byte 層を通す
       └ head (FP): logits[i] は bytes[0..i] のみから次バイトを予測
 
-patching_mode:
-  static   固定長 patch_size バイトで機械的に区切る (MegaByte 方式)。
-           形状が完全に固定なので torch.compile がフルに効く。既定・本走用。
-  utf8     UTF-8 の文字先頭 byte だけを境界候補にする char-aware patching。
-           min/max_patch_len で長さを制限する dynamic mode。
-  space    空白・改行の直後で区切る (BLT の space patching)。日本語は句読点・
-           改行頼みで patch が長くなりがち。min/max_patch_len で長さを制限。
-  entropy  小型バイト LM (entropy_model) の次バイト予測エントロピーが
-           threshold を超えた位置で区切る (BLT 本命方式)。entropy_model は
-           凍結サブモジュールとして本体に内蔵され checkpoint にも一緒に入る。
+patching_mode (区切り方だけが違い、以降の処理は共通):
+  static        patch_size バイトごと (と文書先頭) で区切る
+  utf8          UTF-8 の文字先頭 byte を境界候補にする
+  space         空白・改行の直後で区切る (BLT の space patching)
+  entropy       凍結 ByteLM の次バイト予測エントロピーが threshold を超えた位置で区切る
+  entropy_char  文字単位のエントロピーの上昇で区切る
 
-動的モード (utf8/space/entropy) の実装方式:
-  patch 数を max_patches (既定は max_bytes / min_patch_len の worst-case) に固定 pad し、
-  encoder/decoder は flat (B,T) のまま「同一 patch 内のみ許す」block 対角
-  attention mask で処理する。これにより動的モードでも tensor 形状は固定。
-  T が _WINDOW_CHUNK の倍数のときは T×T 密マスクの代わりに窓マスク
-  (WindowMask: 1 patch ≤ max_patch_len を利用し q の前後 w バイトだけ見る)
-  で計算する。密マスクは SDPA が math 経路に落ちて T² のスコアを実体化し、
-  T=8192 では局所層だけで VRAM ~20GB / 計算 ~50× を浪費するため。
-  境界判定だけは逐次処理なので @torch.compiler.disable で compile 対象外。
-  pad された patch 行は decoder から一切 gather されないため勾配が流れず、
-  ゼロ行の RMSNorm backward 増幅問題 (next.md 参照) も起こさない。
-
-因果性:
-  - 境界判定は因果的 (utf8: 現在 byte / space: 直前バイト / entropy: causal LM)
-  - patch t の表現は global の 1 patch 右シフトにより bytes[< patch t 開始] に
-    しか影響しない。encoder が patch 内 bidirectional でも漏れない
-  - tests/test_arbor.py が全モードで「未来バイト変更が過去 logits に漏れない」
-    ことを検証する
+patch 数は max_patches に固定 pad して tensor 形状を固定する (pad patch は decoder から
+参照されないので勾配が流れない)。境界判定は causal。encoder の byte 層は causal なので
+patch 内の未来 byte を見ず、patch 表現は global の右シフトで次 patch 以降にしか届かない。
 
 BitNet b1.58 準拠 (公式レシピ): absmean ternary W / absmax int8 A / detach STE /
-SubLN / ReLU² gated FFN / bias 無し。Embedding・射影・head・Norm は FP。
+SubLN / ReLU² gated FFN / bias 無し。Embedding・hash n-gram・射影・head・Norm は FP。
 """
 from __future__ import annotations
 
@@ -58,16 +41,8 @@ import torch.nn.functional as F
 
 BYTE_OFFSET = 4  # 生バイト b は token id (b + 4)
 
-# 動的 patching の local attention を窓化する際の chunk 長 (T はこの倍数のとき窓経路)
+# ByteLM の窓付き attention (WindowMask) の chunk 長 (T はこの倍数のとき窓経路)
 _WINDOW_CHUNK = 128
-
-# 素の causal SDPA で系列長がこれ以下なら mem-efficient backend を明示する。
-# SDPA の backend 選択は固定優先度 (flash > efficient > math) で形状を見ないため、
-# static patching の local attention (T = patch_size = 16) では flash が 128 行 tile の
-# 1/8 しか使えず、efficient (64×64 tile) の 2.7 倍遅い。RTX 4090 / head_dim 64 の実測
-# (fwd+bwd, 同 token 数) で T=16: 2.69x, 64: 1.56x, 256: 1.20x, 512: 0.99x なので 256 で切る。
-_SHORT_SEQ_EFFICIENT_SDPA_MAX = 256
-
 
 def _is_block_mask(m: object) -> bool:
     """flex_attention の BlockMask かどうか (torch 未対応環境でも壊れないよう名前で判定)."""
@@ -118,18 +93,11 @@ class ArborConfig:
     vocab_size: int = 260          # 256 bytes + 特殊 4 (BOE/BOS/EOS/PAD)
     max_bytes: int = 2048          # 学習 context (bytes)
     # ---- patching ----
-    # fixed: 動的経路で max_patch_len ごと (と文書先頭) に区切る。static と同じ固定幅だが、
-    # 区切り以外 (patch の枠・pooling・文書境界・予算) を entropy 系と同一にした比較対照
-    patching_mode: str = "static"  # choices: static | fixed | utf8 | space | entropy | entropy_char
-    patch_size: int = 4            # static 用: 1 patch のバイト数
-    # concat: patch 内 byte を連結して p*dl→dg 射影 (static 専用、情報を落とさない)。
-    # mean/max: 固定 local_hidden dim pooling (static/dynamic 共通、patch_size 非依存)。
-    # xattn: patch ごとの query が patch 内 byte へ cross-attention (BLT 方式、static/dynamic 共通)
-    patch_pooling: str = "concat"  # choices: concat | mean | max | xattn
-    patch_xattn_queries: int = 4   # xattn: patch あたりの query 数。出力は queries*dl を dg へ射影
-    min_patch_len: int = 2         # 動的用: これ未満では区切らない
-    max_patch_len: int = 16        # 動的用: これに達したら強制的に区切る
-    max_patches: int | None = None # 動的用: 固定 pad する patch 数。None なら worst-case
+    patching_mode: str = "static"  # choices: static | utf8 | space | entropy | entropy_char
+    patch_size: int = 16           # static: 1 patch のバイト数 (= patch の最大長)
+    min_patch_len: int = 2         # static 以外: これ未満では区切らない (文書先頭は除く)
+    max_patch_len: int = 16        # static 以外: これに達したら強制的に区切る
+    max_patches: int | None = None # 固定 pad する patch 数。None なら static は ceil(max_bytes/patch_size)、他は worst-case
     # entropy: 次バイト H (nats) がこれを超えたら区切る。
     # entropy_char: 文字の H が 1 つ前の文字より これ を超えて上がったら区切る
     entropy_threshold: float = 1.5
@@ -142,23 +110,23 @@ class ArborConfig:
     # <entropy_model_ckpt>/char_rest_head.safetensors (scripts/train_char_rest_head.py)
     entropy_char_rest: bool = False
     attention_window: int | None = None     # ByteLM 用: causal attention を直近 N byte に制限
-    # ---- local (byte 階層) ----
-    local_hidden_size: int = 512
-    local_num_heads: int = 8
-    local_num_kv_heads: int = 8
-    local_intermediate_size: int = 1280
+    # ---- local (byte 階層、BLT の local encoder / decoder) ----
+    local_hidden_size: int = 768
+    local_num_heads: int = 12
+    local_num_kv_heads: int = 12
+    local_intermediate_size: int = 2048
     num_local_encoder_layers: int = 1
-    num_local_decoder_layers: int = 3
-    # byte 層: global の出力を足した直後、patch 内 decoder の前に置く「全文脈 causal」の
-    # byte 単位 attention 層 (文書内に閉じる)。patch 単位の global だけだと遠くの情報は
-    # patch ごとに 1 回・1 本のベクトルでしか届かず、逐語コピーの誤りが patch 内位置
-    # (= global 情報の古さ) とともに単調に増える (2026-09-26 実測)。byte 層は各 byte が
-    # 過去の byte を直接参照できるようにする。0 で無効 (従来構造)。
-    num_byte_layers: int = 0
-    byte_attn_window: int | None = None   # None = 文書内の全文脈、N = 直近 N byte
-    # local 層 (encoder / byte 層 / decoder) の Linear を BitLinear にするか。None は bitnet に従う。
-    # local は ~20M と小さく 3 値化のメモリ利得がほぼ無い一方、byte 精度を落とす可能性がある。
+    num_local_decoder_layers: int = 2
+    local_attn_window: int | None = None  # encoder / decoder の byte 層の causal 窓。None = 文書内の全文脈
+    # local 層の Linear を BitLinear にするか。None は bitnet に従う
     local_bitnet: bool | None = None
+    # ---- cross-attention (patch <-> byte) ----
+    cross_attn_k: int = 2                 # patch あたりの query 数。patch 表現は k * local_hidden_size 次元
+    cross_attn_heads: int | None = None   # None は local_num_heads
+    decoder_cross_attn_all_layers: bool = True  # False なら decoder の最初の層の前だけ
+    # ---- hash n-gram 埋め込み (直前 n byte の rolling polynomial hash を表引きして byte 埋め込みに足す) ----
+    hash_ngram_sizes: tuple[int, ...] = (3, 4, 5, 6, 7, 8)  # 空なら無効
+    hash_ngram_vocab: int = 50000         # n ごとの表の行数
     # ---- global (patch 階層) ----
     hidden_size: int = 2048
     num_heads: int = 16
@@ -183,7 +151,6 @@ class ArborConfig:
     # RoPE theta を階層別に上書きする (None なら rope_theta を使う)。
     #   global は max_patches (static 8k/patch8 = 1024) 位置しか見ないため、
     #   128k 長文脈向けの大きな theta は位置分解能を潰す (#1)。系列長相応に下げる。
-    #   local は patch 内 (static) / flat バイト列 (dynamic) を見る。
     rope_theta_global: float | None = None
     rope_theta_local: float | None = None
     norm_eps: float = 1e-5
@@ -201,8 +168,19 @@ class ArborConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArborConfig":
+        removed = sorted(set(d) & _REMOVED_CONFIG_KEYS)
+        if removed:
+            raise ValueError(f"廃止した model 設定: {removed} (local 構造は BLT 方式に一本化した)")
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        cfg = {k: v for k, v in d.items() if k in known}
+        if "hash_ngram_sizes" in cfg:
+            cfg["hash_ngram_sizes"] = tuple(cfg["hash_ngram_sizes"] or ())
+        return cls(**cfg)
+
+
+_REMOVED_CONFIG_KEYS = frozenset({
+    "patch_pooling", "patch_xattn_queries", "num_byte_layers", "byte_attn_window",
+})
 
 
 # ------------------------------------------------------------------ modules
@@ -329,7 +307,7 @@ class Attention(nn.Module):
             # なので、新規トークンが 1 個ならマスク無しで全 attend が causal と等価
             is_incremental = kv_cache.size() > 0
             k, v = kv_cache.append(k, v)
-        # 素の causal path (本走の static patching で使う経路) は native enable_gqa を使い
+        # 素の causal path (マスク無しの global) は native enable_gqa を使い
         # K/V の repeat_interleave (帯域 4 倍) を避ける。torch 2.5 の enable_gqa=True は
         # 過去に compile 併用で flash backward が壊れる報告があったため長らく避けていたが、
         # 本構成 (bf16 / SDPA flash / static shape) では 200 step soak (bench, NaN無し・
@@ -351,23 +329,15 @@ class Attention(nn.Module):
 
             out = flex_attention(q, k, v, block_mask=attn_mask, enable_gqa=n_rep > 1)
         elif isinstance(attn_mask, WindowMask):
-            # 動的 patching 用 (窓経路): T×T を実体化しない
+            # ByteLM の窓付き causal: T×T を実体化しない
             out = _windowed_sdpa(q, k, v, attn_mask)
         elif attn_mask is not None:
-            # 動的 patching 用 (密マスク fallback): causal 制約はマスク側に織り込み済み
+            # 密 bool マスク (eager / CPU): causal 制約はマスク側に織り込み済み
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         elif is_incremental:
             if t != 1:
                 raise ValueError("KV cache への追記は 1 トークンずつ行うこと")
             out = F.scaled_dot_product_attention(q, k, v)
-        elif q.is_cuda and t <= _SHORT_SEQ_EFFICIENT_SDPA_MAX and not native_gqa:
-            # 短系列 (static patching の local 層) は flash の tile が空振りするので
-            # mem-efficient backend を明示する。efficient は enable_gqa 非対応 (kernel 無し
-            # エラー) なので native GQA の場合は既定の選択に任せる。
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-
-            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal, enable_gqa=native_gqa)
         out = out.transpose(1, 2).reshape(b, t, -1)
@@ -697,46 +667,95 @@ def _scale_residual_projections(layer_lists: list[nn.ModuleList]) -> None:
                 block.ffn.down.weight.mul_(scale)
 
 
-class PatchCrossAttnPool(nn.Module):
-    """patch ごとに num_queries 個の query が patch 内 byte へ cross-attention し、連結して返す.
+class CrossAttention(nn.Module):
+    """BLT の cross-attention (q / kv それぞれ RMSNorm → 射影、RoPE・位置埋め込みなし)。残差は呼び出し側で足す.
 
-    query は学習済みベクトル + patch 内 mean (BLT の pooling 初期化)。mean は byte の並びを
-    落とすので、kv 側に patch 内位置の埋め込みを足して順序を読めるようにする。
+    射影は他の attention と同じく BitLinear + SubLN (bitnet=False なら nn.Linear)。
     """
 
-    def __init__(self, dim: int, num_heads: int, num_queries: int, max_len: int, eps: float):
+    def __init__(self, dim: int, n_heads: int, norm_eps: float, bitnet: bool,
+                 activation_precision: str, out_scale: float):
         super().__init__()
-        if dim % num_heads:
-            raise ValueError(f"local_hidden_size {dim} は local_num_heads {num_heads} で割り切れる必要がある")
-        if num_queries < 1:
-            raise ValueError(f"patch_xattn_queries must be >= 1, got {num_queries}")
-        self.num_heads, self.num_queries = num_heads, num_queries
-        self.query = nn.Parameter(torch.empty(num_queries, dim))
-        self.pos = nn.Parameter(torch.empty(max_len, dim))
-        self.q_norm = RMSNorm(dim, eps)
-        self.kv_norm = RMSNorm(dim, eps)
-        self.wq, self.wk, self.wv, self.wo = (nn.Linear(dim, dim, bias=False) for _ in range(4))
-        for w in (self.query, self.pos, self.wq.weight, self.wk.weight, self.wv.weight, self.wo.weight):
-            nn.init.trunc_normal_(w, std=0.02, a=-0.06, b=0.06)
+        if dim % n_heads:
+            raise ValueError(f"cross-attention の次元 {dim} は heads {n_heads} で割り切れる必要がある")
+        # n_heads という名前にしない: install_arbor_projection_fusions が wq/wk/wv を 1 本の GEMM に
+        # 融合する対象 (同じ入力を射影する self-attention) と誤認する。q と kv は入力が違う
+        self.heads, self.head_dim = n_heads, dim // n_heads
+        self.norm_q = RMSNorm(dim, norm_eps)
+        self.norm_kv = RMSNorm(dim, norm_eps)
+        self.wq, self.wk, self.wv, self.wo = (
+            _make_linear(dim, dim, bitnet, activation_precision) for _ in range(4)
+        )
+        self.attn_sub_norm = RMSNorm(dim, norm_eps)
+        with torch.no_grad():
+            self.wo.weight.mul_(out_scale)
 
-    def forward(self, h: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
-        """h: (N, L, dim)、valid: (N, L) bool (None は全位置有効)。各行の位置 0 は有効であること."""
-        n, length, dim = h.shape
-        if valid is None:
-            mean = h.mean(dim=1)
-        else:
-            keep = valid.unsqueeze(-1).to(h.dtype)
-            mean = (h * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
-        q_in = self.query.to(h.dtype) + mean.unsqueeze(1)             # (N, Q, dim)
-        kv = self.kv_norm(h + self.pos[:length].to(h.dtype))
-        hd = dim // self.num_heads
-        q = self.wq(self.q_norm(q_in)).view(n, self.num_queries, self.num_heads, hd).transpose(1, 2)
-        k = self.wk(kv).view(n, length, self.num_heads, hd).transpose(1, 2)
-        v = self.wv(kv).view(n, length, self.num_heads, hd).transpose(1, 2)
+    def _heads(self, x: torch.Tensor) -> torch.Tensor:
+        return x.unflatten(-1, (self.heads, self.head_dim))
+
+    def _out(self, out: torch.Tensor) -> torch.Tensor:
+        return self.wo(self.attn_sub_norm(out))
+
+    def forward(self, x: torch.Tensor, kv: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
+        """x: (N, Q, dim) が kv: (N, L, dim) へ attend する。valid: (N, L) bool (None は全位置)."""
+        q = self._heads(self.wq(self.norm_q(x))).transpose(1, 2)
+        kvn = self.norm_kv(kv)
+        k = self._heads(self.wk(kvn)).transpose(1, 2)
+        v = self._heads(self.wv(kvn)).transpose(1, 2)
         mask = None if valid is None else valid[:, None, None, :]
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        out = out.transpose(1, 2).reshape(n, self.num_queries, dim)
-        return (q_in + self.wo(out)).flatten(1)
+        return self._out(out.transpose(1, 2).flatten(2))
+
+    def forward_per_byte(self, x: torch.Tensor, kv_patch: torch.Tensor, patch_id: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, dim) の各 byte が、自 patch の kv_patch: (B, K, k, dim) の k 個へ attend する.
+
+        k/v の射影は patch 単位で行ってから byte へ gather する (byte 単位で射影すると T/K 倍の計算)。
+        """
+        b, t, _ = x.shape
+        n_patch, kq = kv_patch.shape[1], kv_patch.shape[2]
+        q = self._heads(self.wq(self.norm_q(x)))                          # (B, T, H, hd)
+        kvn = self.norm_kv(kv_patch).flatten(1, 2)                        # (B, K*k, dim)
+        idx = patch_id[:, :, None, None, None].expand(-1, -1, kq, self.heads, self.head_dim)
+        k = self._heads(self.wk(kvn)).unflatten(1, (n_patch, kq)).gather(1, idx)  # (B, T, k, H, hd)
+        v = self._heads(self.wv(kvn)).unflatten(1, (n_patch, kq)).gather(1, idx)
+        scores = torch.einsum("bthd,btjhd->bthj", q.float(), k.float()) * self.head_dim ** -0.5
+        out = torch.einsum("bthj,btjhd->bthd", scores.softmax(dim=-1).to(v.dtype), v)
+        return self._out(out.reshape(b, t, -1))
+
+
+def _wrap_int64(v: int) -> int:
+    """int64 の積が overflow して wrap した値 (BLT は prime**j を int64 tensor で計算している)."""
+    v %= 2**64
+    return v - 2**64 if v >= 2**63 else v
+
+
+class HashNgramEmbedding(nn.Module):
+    """BLT の hash n-gram 埋め込み: 直前 n byte (自身を含む) の rolling polynomial hash を表引きする.
+
+    系列先頭・文書先頭より前の byte は 0 として hash する (文書をまたいで情報が漏れない)。
+    """
+
+    _PRIME = 1000000007  # BLT の hash 関数 0 番の素数
+
+    def __init__(self, sizes: tuple[int, ...], vocab: int, dim: int):
+        super().__init__()
+        self.sizes, self.vocab = tuple(int(n) for n in sizes), int(vocab)
+        self.tables = nn.ModuleList(nn.Embedding(self.vocab, dim) for _ in self.sizes)
+        std = dim ** -0.5
+        for table in self.tables:
+            nn.init.trunc_normal_(table.weight, std=std, a=-3 * std, b=3 * std)
+
+    def forward(self, ids: torch.Tensor, doc: torch.Tensor) -> torch.Tensor:
+        """ids, doc: (B, T)。各 n の埋め込みの和 (B, T, dim) を返す."""
+        out = None
+        for n, table in zip(self.sizes, self.tables):
+            win = F.pad(ids, (n - 1, 0)).unfold(1, n, 1)                  # (B, T, n): b_{i-n+1..i}
+            win_doc = F.pad(doc, (n - 1, 0), value=-1).unfold(1, n, 1)
+            win = torch.where(win_doc == doc.unsqueeze(-1), win, 0).long()
+            powers = torch.tensor([_wrap_int64(self._PRIME ** j) for j in range(n)], device=ids.device)
+            emb = table((win * powers).sum(-1) % self.vocab)
+            out = emb if out is None else out + emb
+        return out
 
 
 # ---------------------------------------------------------------- byte LM
@@ -964,7 +983,7 @@ def compute_patch_starts(
     - utf8:    現在バイトが UTF-8 文字先頭なら新 patch を開始
     - space:   直前バイトが空白系なら新 patch を開始
     - entropy: 直前位置での次バイト予測エントロピーが threshold 超なら開始
-    - fixed:   候補なし (max_len ごとと文書先頭だけで区切る)
+    - static:  候補なし (max_len ごとと文書先頭だけで区切る)
     - entropy_char: 文字単位のエントロピー上昇で区切る (Harris の successor variety を
       エントロピーにした Jin & Tanaka-Ishii 2006 の増加基準)。多バイト文字は 1 byte 目 (範囲) より
       2 byte 目 (どの文字か) の予測が難しく、byte の entropy では文字の途中で区切られるので、
@@ -990,7 +1009,7 @@ def compute_patch_starts(
 
     cur = input_ids - BYTE_OFFSET
     char_start = (cur < 0x80) | ((cur >= 0xC2) & (cur <= 0xF4))
-    if mode == "fixed":
+    if mode == "static":
         raw = torch.zeros_like(char_start)
     elif mode == "utf8":
         raw = char_start.clone()
@@ -1064,85 +1083,86 @@ class _LayerKVCache:
 class ArborModel(nn.Module):
     def __init__(self, cfg: ArborConfig):
         super().__init__()
-        if cfg.patching_mode not in ("static", "fixed", "utf8", "space", *ENTROPY_MODES):
+        if cfg.patching_mode not in ("static", "utf8", "space", *ENTROPY_MODES):
             raise ValueError(f"unknown patching_mode: {cfg.patching_mode}")
-        if cfg.patch_pooling not in ("concat", "mean", "max", "xattn"):
-            raise ValueError(
-                f"unknown patch_pooling: {cfg.patch_pooling!r} "
-                "(choices: concat | mean | max | xattn)"
-            )
-        if cfg.patch_pooling == "concat" and cfg.patching_mode != "static":
-            raise ValueError(
-                "patch_pooling=concat は patch 長固定の static 専用 "
-                f"(patching_mode={cfg.patching_mode!r} では mean | max を使う)"
-            )
         if cfg.global_attn_impl not in ("sdpa", "flex"):
             raise ValueError(
                 f"unknown global_attn_impl: {cfg.global_attn_impl!r} "
                 "(choices: sdpa | flex; 暗黙フォールバックは禁止)"
             )
+        if cfg.cross_attn_k < 1:
+            raise ValueError(f"cross_attn_k must be >= 1, got {cfg.cross_attn_k}")
+        if cfg.local_attn_window is not None and cfg.local_attn_window <= 0:
+            raise ValueError(f"local_attn_window must be positive or None, got {cfg.local_attn_window}")
+        if cfg.num_local_encoder_layers < 1 or cfg.num_local_decoder_layers < 1:
+            raise ValueError("num_local_encoder_layers / num_local_decoder_layers は 1 以上")
         from src.model.bitlinear import check_activation_precision
 
         check_activation_precision(cfg.activation_precision)
         self.cfg = cfg
-        self.dynamic = cfg.patching_mode != "static"
         self.profile_sections = False
         self._last_profile: dict[str, float] | None = None
-        p, dl, dg = cfg.patch_size, cfg.local_hidden_size, cfg.hidden_size
-        if self.dynamic:
-            worst_case_patches = math.ceil(cfg.max_bytes / cfg.min_patch_len)
-            self.max_patches = cfg.max_patches or worst_case_patches
-            # 予算ガードが成立する下限: 残り全部を最長 (entropy_char は max_patch_len - 3) で区切った patch 数
-            unit = cfg.max_patch_len - (_UTF8_MAX_CONT if cfg.patching_mode == "entropy_char" else 0)
-            if unit < cfg.min_patch_len:
-                raise ValueError(f"entropy_char は max_patch_len - {_UTF8_MAX_CONT} >= min_patch_len が必要")
-            min_budget = math.ceil(cfg.max_bytes / unit)
-            if self.max_patches < min_budget or self.max_patches > worst_case_patches:
-                raise ValueError(
-                    f"max_patches must be in [{min_budget}, {worst_case_patches}] "
-                    f"(= [ceil(max_bytes/{unit}), ceil(max_bytes/min_patch_len)]), "
-                    f"got {self.max_patches}"
-                )
+        dl, dg, kq = cfg.local_hidden_size, cfg.hidden_size, cfg.cross_attn_k
+
+        # 区切り規則。static は候補なしで patch_size ごと (と文書先頭) に区切る
+        if cfg.patching_mode == "static":
+            self.min_patch_len, self.max_patch_len = 1, cfg.patch_size
         else:
-            self.max_patches = (cfg.max_bytes + p - 1) // p
+            self.min_patch_len, self.max_patch_len = cfg.min_patch_len, cfg.max_patch_len
+        # 予算ガードの単位: 残り全部をこの長さで区切れば上限に収まる (entropy_char は max - 3 で文字先頭)
+        self.patch_reserve = self.max_patch_len - (
+            _UTF8_MAX_CONT if cfg.patching_mode == "entropy_char" else 0
+        )
+        if self.patch_reserve < self.min_patch_len:
+            raise ValueError(f"entropy_char は max_patch_len - {_UTF8_MAX_CONT} >= min_patch_len が必要")
+        min_budget = math.ceil(cfg.max_bytes / self.patch_reserve)
+        worst_case = math.ceil(cfg.max_bytes / self.min_patch_len)
+        default = min_budget if cfg.patching_mode == "static" else worst_case
+        self.max_patches = cfg.max_patches or default
+        if not min_budget <= self.max_patches <= worst_case:
+            raise ValueError(
+                f"max_patches must be in [{min_budget}, {worst_case}] "
+                f"(= [ceil(max_bytes/{self.patch_reserve}), ceil(max_bytes/{self.min_patch_len})]), "
+                f"got {self.max_patches}"
+            )
 
         self.byte_emb = nn.Embedding(cfg.vocab_size, dl)
         nn.init.trunc_normal_(self.byte_emb.weight, std=0.02, a=-0.06, b=0.06)
+        self.hash_emb = (
+            HashNgramEmbedding(cfg.hash_ngram_sizes, cfg.hash_ngram_vocab, dl)
+            if cfg.hash_ngram_sizes else None
+        )
 
-        # 動的モードの local 層は flat (B,T) で動くので RoPE は絶対バイト位置
         theta_global = cfg.rope_theta_global if cfg.rope_theta_global is not None else cfg.rope_theta
         theta_local = cfg.rope_theta_local if cfg.rope_theta_local is not None else cfg.rope_theta
-        local_rope = RotaryEmbedding(
-            dl // cfg.local_num_heads,
-            cfg.max_bytes if self.dynamic else p,
-            theta_local,
-        )
+        local_rope = RotaryEmbedding(dl // cfg.local_num_heads, cfg.max_bytes, theta_local)
         global_rope = RotaryEmbedding(dg // cfg.num_heads, self.max_patches, theta_global)
         local_bitnet = cfg.bitnet if cfg.local_bitnet is None else bool(cfg.local_bitnet)
-        if cfg.num_byte_layers < 0:
-            raise ValueError(f"num_byte_layers must be >= 0, got {cfg.num_byte_layers}")
-        if cfg.byte_attn_window is not None and cfg.byte_attn_window <= 0:
-            raise ValueError(f"byte_attn_window must be positive or None, got {cfg.byte_attn_window}")
 
-        # Local Encoder: patch 内 bidirectional (patch 表現は次 patch 以降でしか使わない)
-        self.encoder_layers = nn.ModuleList(
-            Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
-                  cfg.local_intermediate_size, local_rope, local_bitnet, cfg.norm_eps,
-                  causal=False, activation_precision=cfg.activation_precision)
-            for _ in range(cfg.num_local_encoder_layers)
-        )
-        # concat は patch 長固定 (static) 前提の p*dl 入力。mean/max は dl 固定。
-        if cfg.patch_pooling == "xattn":
-            self.patch_pool: PatchCrossAttnPool | None = PatchCrossAttnPool(
-                dl, cfg.local_num_heads, cfg.patch_xattn_queries,
-                cfg.max_patch_len if self.dynamic else p, cfg.norm_eps,
-            )
-            patch_input_dim = cfg.patch_xattn_queries * dl
+        def local_block() -> Block:
+            return Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
+                         cfg.local_intermediate_size, local_rope, local_bitnet, cfg.norm_eps,
+                         causal=True, activation_precision=cfg.activation_precision)
+
+        n_local = cfg.num_local_encoder_layers + cfg.num_local_decoder_layers
+
+        def cross_attn() -> CrossAttention:
+            return CrossAttention(dl, cfg.cross_attn_heads or cfg.local_num_heads, cfg.norm_eps, local_bitnet,
+                                  cfg.activation_precision, out_scale=(2 * n_local) ** -0.5)
+
+        # Local Encoder: 文書内 causal の byte 層。各層の後に patch query が自 patch の byte へ cross-attention
+        self.encoder_layers = nn.ModuleList(local_block() for _ in range(cfg.num_local_encoder_layers))
+        self.encoder_cross_attn = nn.ModuleList(cross_attn() for _ in range(cfg.num_local_encoder_layers))
+        # patch 内 max-pool (dl) → k 個の query (k * dl)
+        self.patch_query_proj = nn.Linear(dl, kq * dl, bias=False)
+        std = dl ** -0.5
+        nn.init.trunc_normal_(self.patch_query_proj.weight, std=std, a=-3 * std, b=3 * std)
+        # k * dl が global 次元と違うときだけ射影する (BLT 1B は 2 * 1024 = 2048 で不要)
+        if kq * dl != dg:
+            self.patch_proj: nn.Linear | None = nn.Linear(kq * dl, dg, bias=False)
+            nn.init.trunc_normal_(self.patch_proj.weight, std=0.02, a=-0.06, b=0.06)
         else:
-            self.patch_pool = None
-            patch_input_dim = p * dl if cfg.patch_pooling == "concat" else dl
-        self.patch_proj = nn.Linear(patch_input_dim, dg, bias=False)
-        nn.init.trunc_normal_(self.patch_proj.weight, std=0.02, a=-0.06, b=0.06)
+            self.patch_proj = None
         # 右シフトの先頭 patch。ゼロ初期化禁止: 厳密ゼロ行は全層で 0 のまま伝播し、
         # RMSNorm backward の 1/sqrt(eps) 増幅が全層で複利になって勾配が overflow する
         self.global_bos = nn.Parameter(torch.empty(dg))
@@ -1169,30 +1189,20 @@ class ArborModel(nn.Module):
         )
         self.has_ssd = any(block.mixer is not None for block in self.global_layers)
         self.global_norm = RMSNorm(dg, cfg.norm_eps)
-        self.global_to_local = nn.Linear(dg, dl, bias=False)  # FP
-        nn.init.trunc_normal_(self.global_to_local.weight, std=0.02, a=-0.06, b=0.06)
+        # global 出力 (dg) → decoder の cross-attention の k 個の key/value (k * dl)
+        self.global_to_local = nn.Linear(dg, kq * dl, bias=False)
+        nn.init.trunc_normal_(self.global_to_local.weight, std=dg ** -0.5, a=-3 * dg ** -0.5, b=3 * dg ** -0.5)
 
-        # byte 層: 系列全体 (flat な byte 列) を見るので RoPE は絶対 byte 位置 (max_bytes)
-        byte_rope = RotaryEmbedding(dl // cfg.local_num_heads, cfg.max_bytes, theta_local)
-        self.byte_layers = nn.ModuleList(
-            Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
-                  cfg.local_intermediate_size, byte_rope, local_bitnet, cfg.norm_eps,
-                  causal=True, activation_precision=cfg.activation_precision)
-            for _ in range(cfg.num_byte_layers)
-        )
-        self.decoder_layers = nn.ModuleList(
-            Block(dl, cfg.local_num_heads, cfg.local_num_kv_heads,
-                  cfg.local_intermediate_size, local_rope, local_bitnet, cfg.norm_eps,
-                  causal=True, activation_precision=cfg.activation_precision)
-            for _ in range(cfg.num_local_decoder_layers)
-        )
+        # Local Decoder: 入力は encoder の byte 表現。各層の前に自 patch の global 出力へ cross-attention
+        self.decoder_layers = nn.ModuleList(local_block() for _ in range(cfg.num_local_decoder_layers))
+        n_dec_xattn = cfg.num_local_decoder_layers if cfg.decoder_cross_attn_all_layers else 1
+        self.decoder_cross_attn = nn.ModuleList(cross_attn() for _ in range(n_dec_xattn))
         self.head_norm = RMSNorm(dl, cfg.norm_eps)
         self.head = nn.Linear(dl, cfg.vocab_size, bias=False)  # FP
         nn.init.trunc_normal_(self.head.weight, std=0.02, a=-0.06, b=0.06)
 
-        _scale_residual_projections(
-            [self.encoder_layers, self.global_layers, self.byte_layers, self.decoder_layers]
-        )
+        _scale_residual_projections([self.encoder_layers, self.decoder_layers])
+        _scale_residual_projections([self.global_layers])
 
         # entropy 用の凍結 ByteLM (checkpoint に同梱される)
         if cfg.patching_mode in ENTROPY_MODES:
@@ -1211,25 +1221,52 @@ class ArborModel(nn.Module):
         else:
             self.entropy_model = None
 
-    # ------------------------------------------------------------- forward
-    def forward(self, input_ids: torch.Tensor) -> ArborOutput:
-        if self.dynamic:
-            return self._forward_dynamic(input_ids)
-        return self._forward_static(input_ids)
-
-    # ------------------------------------------------ document boundary mask
+    # ------------------------------------------------------------- pieces
     def _byte_doc_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """各バイトが属する文書番号 (B, T) を返す.
 
         packing='document' は文書を EOS 区切りで連結する。EOS の「次」の
         バイトから文書番号が 1 増える (EOS 自身は直前の文書に属す)。判定は
-        過去バイトのみに依存するので causal (未来を見ない)。生バイトは +4
-        offset されており EOS/PAD と衝突しないため == 判定で一意に取れる。
+        過去バイトのみに依存するので causal (未来を見ない)。
         """
-        prev_is_eos = F.pad(
-            input_ids == self.cfg.eos_token_id, (1, 0), value=False
-        )[:, :-1]
+        prev_is_eos = F.pad(input_ids == self.cfg.eos_token_id, (1, 0), value=False)[:, :-1]
         return prev_is_eos.to(torch.long).cumsum(dim=1)
+
+    def embed(self, input_ids: torch.Tensor, doc: torch.Tensor) -> torch.Tensor:
+        """byte 埋め込み + hash n-gram 埋め込み。BLT 論文どおり n-gram の種類数 + 1 で割る."""
+        x = self.byte_emb(input_ids)
+        if self.hash_emb is None:
+            return x
+        return (x + self.hash_emb(input_ids, doc)) / (len(self.hash_emb.sizes) + 1)
+
+    def _byte_attn_mask(self, input_ids: torch.Tensor, doc: torch.Tensor):
+        """local の byte 層の mask: causal ∧ 同一文書 (∧ 直近 local_attn_window byte).
+
+        compile 下の CUDA では flex_attention の BlockMask (窓外・文書外の block を丸ごと
+        飛ばす fused kernel)、それ以外 (eager / CPU / 評価) は同じ規則の密 bool mask。
+        文書境界も窓も無い入力では None を返し、Attention 側の素の causal (flash) を使う。
+        """
+        b, t = input_ids.shape
+        w = self.cfg.local_attn_window
+        if input_ids.is_cuda and torch.compiler.is_compiling():
+            from torch.nn.attention.flex_attention import create_block_mask
+
+            def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+                keep = (kv_idx <= q_idx) & (doc[b_idx, q_idx] == doc[b_idx, kv_idx])
+                if w is not None:
+                    keep = keep & (q_idx - kv_idx < w)
+                return keep
+
+            return create_block_mask(mask_mod, B=b, H=None, Q_LEN=t, KV_LEN=t,
+                                     device=input_ids.device)
+        if w is None and not bool((doc[:, -1] != doc[:, 0]).any()):
+            return None
+        q = torch.arange(t, device=input_ids.device).view(t, 1)
+        kv = torch.arange(t, device=input_ids.device).view(1, t)
+        allow = (kv <= q).unsqueeze(0) & (doc.unsqueeze(2) == doc.unsqueeze(1))
+        if w is not None:
+            allow = allow & (q - kv < w).unsqueeze(0)
+        return allow.unsqueeze(1)                                # (B, 1, T, T)
 
     def _global_doc_mask(self, patch_doc: torch.Tensor) -> torch.Tensor:
         """global (patch 階層) 用の block-diagonal + causal マスク (B,1,K,K).
@@ -1238,13 +1275,10 @@ class ArborModel(nn.Module):
         key 位置 j' に attend できるのは:
           - j'=0 (先頭の学習可能 BOS。文書非依存で常に許可。全マスク行を防ぐ)
           - それ以外は key s[j'] = patch j'-1 が patch j と同一文書のときだけ。
-        これにより文書 B の patch が無関係な文書 A の patch へ attend しない。
-        新しい文書の先頭 patch は BOS のみを文脈に持つ (文脈リセット)。
         """
         b, k = patch_doc.shape
         device = patch_doc.device
         causal = torch.tril(torch.ones(k, k, dtype=torch.bool, device=device))
-        # key 側 doc: s[0]=BOS(=-1 番兵), s[j']=patch j'-1 の doc
         key_doc = F.pad(patch_doc[:, :-1], (1, 0), value=-1)
         same_doc = patch_doc.unsqueeze(2) == key_doc.unsqueeze(1)  # (B,K,K)
         bos_col = torch.zeros(k, dtype=torch.bool, device=device)
@@ -1253,10 +1287,7 @@ class ArborModel(nn.Module):
         return allow.unsqueeze(1)  # (B,1,K,K)
 
     def _global_mask(self, patch_doc: torch.Tensor):
-        """cfg.global_attn_impl に応じて global 用マスクを返す (sdpa=密, flex=BlockMask).
-
-        実装はconfigの指定をそのまま使い、deviceに応じた暗黙フォールバックはしない。
-        """
+        """cfg.global_attn_impl に応じて global 用マスクを返す (sdpa=密, flex=BlockMask)."""
         impl = self.cfg.global_attn_impl
         if impl == "flex":
             return self._global_flex_block_mask(patch_doc)
@@ -1265,12 +1296,7 @@ class ArborModel(nn.Module):
         raise RuntimeError(f"unsupported global_attn_impl at runtime: {impl!r}")
 
     def _global_flex_block_mask(self, patch_doc: torch.Tensor):
-        """_global_doc_mask と同じ許可規則を flex_attention の BlockMask で表す.
-
-        密 (B,1,K,K) マスクを実体化せず、CUDA では fused kernel になる。
-        許可規則: causal (kv<=q) かつ (kv==0 の BOS or 同一文書)。key 位置 kv は
-        右シフト後の global 入力位置なので、その doc は patch_doc[kv-1] (kv>=1)。
-        """
+        """_global_doc_mask と同じ許可規則を flex_attention の BlockMask で表す."""
         from torch.nn.attention.flex_attention import create_block_mask
 
         pd = patch_doc
@@ -1287,111 +1313,87 @@ class ArborModel(nn.Module):
             mask_mod, B=pd.shape[0], H=None, Q_LEN=k, KV_LEN=k, device=pd.device
         )
 
-    @torch.compiler.disable
-    def _debug_context_contribution(
-        self,
-        byte_emb: torch.Tensor,
-        global_context: torch.Tensor,
-        decoder_input: torch.Tensor,
-    ) -> None:
-        """Print context-vs-byte RMS once when ARBOR_DEBUG_CONTEXT=1."""
-        if getattr(self, "_debug_context_printed", False):
-            return
-        self._debug_context_printed = True
-        with torch.no_grad():
-            byte_rms = byte_emb.float().pow(2).mean().sqrt()
-            global_rms = global_context.float().pow(2).mean().sqrt()
-            decoder_rms = decoder_input.float().pow(2).mean().sqrt()
-            print(
-                "[ctx] "
-                f"byte_emb_rms={byte_rms.item():.6f} "
-                f"global_context_rms={global_rms.item():.6f} "
-                f"decoder_input_rms={decoder_rms.item():.6f} "
-                f"global_byte_ratio={(global_rms / byte_rms.clamp_min(1e-8)).item():.6f}",
-                flush=True,
-            )
-
-    def _forward_static(self, input_ids: torch.Tensor) -> ArborOutput:
-        b, t = input_ids.shape
-        p = self.cfg.patch_size
-        pad = (p - t % p) % p
-        if pad:
-            # 右 pad (PAD=3)。patch 内 causal + global 右シフトにより
-            # pad が位置 < t の logits に影響することはない (生成時の端数用)
-            input_ids = F.pad(input_ids, (0, pad), value=3)
-        k = input_ids.size(1) // p
-
-        x = self.byte_emb(input_ids)                       # (B, T', dl)
-        h = x.view(b * k, p, -1)                           # patch 内 encoder
-        for layer in self.encoder_layers:
-            h = self._maybe_ckpt(layer, h)
-        h_patch = h.view(b, k, p, -1)
-        if self.cfg.patch_pooling == "concat":
-            pooled = h_patch.flatten(2)
-        elif self.cfg.patch_pooling == "mean":
-            pooled = h_patch.mean(dim=2)
-        elif self.patch_pool is not None:
-            pooled = self.patch_pool(h.view(b * k, p, -1)).view(b, k, -1)
-        else:
-            pooled = h_patch.amax(dim=2)
-        patches = self.patch_proj(pooled)                  # (B, K, dg)
-
-        # patch の doc 番号 = patch 先頭バイトの doc。global を文書内に閉じる。
-        patch_doc = self._byte_doc_ids(input_ids)[:, ::p]  # (B, K)
-        g = self._run_global(
-            patches, self._global_mask(patch_doc), patch_doc
-        )  # (B, K, dl)
-
-        # Local Decoder: byte_emb[i] + h_patch(i) を (byte 層で全文脈 →) patch 内 causal で
-        d = x.view(b, k, p, -1) + g.unsqueeze(2)
-        if os.environ.get("ARBOR_DEBUG_CONTEXT", "0") == "1":
-            self._debug_context_contribution(x, g, d)
-        if len(self.byte_layers):
-            d = self._run_byte_layers(d.view(b, k * p, -1), input_ids)
-        d = d.view(b * k, p, -1)
-        for layer in self.decoder_layers:
-            d = self._maybe_ckpt(layer, d)
-        logits = self.head(self.head_norm(d)).view(b, k * p, -1)
-        if pad:
-            logits = logits[:, :t]
-        patch_count = torch.full((), b * k, dtype=torch.float32, device=logits.device)
-        max_patch_count = torch.full((), k, dtype=torch.float32, device=logits.device)
-        return ArborOutput(logits=logits, patch_count=patch_count, max_patch_count=max_patch_count)
-
     def _patch_starts(
         self, input_ids: torch.Tensor,
         entropy_values: tuple[torch.Tensor, torch.Tensor | None] | None,
     ) -> torch.Tensor:
-        """動的モードの境界。文書先頭で必ず区切り、patch 数は予算ガードで max_patches 以下."""
+        """境界。文書先頭で必ず区切り、patch 数は予算ガードで max_patches 以下."""
         cfg = self.cfg
         ent, rest = entropy_values if entropy_values is not None else (None, None)
         return compute_patch_starts(
-            input_ids, cfg.patching_mode, cfg.min_patch_len, cfg.max_patch_len,
+            input_ids, cfg.patching_mode, self.min_patch_len, self.max_patch_len,
             self.entropy_model, cfg.entropy_threshold, ent, rest_values=rest,
             eos_token_id=cfg.eos_token_id, budget=self.max_patches, horizon=cfg.max_bytes,
         )
 
-    def _xattn_pool_dynamic(self, h: torch.Tensor, patch_id: torch.Tensor, k: int) -> torch.Tensor:
-        """flat な byte (B, T, dl) を (B*K, max_patch_len, dl) の枠に詰めて xattn pooling."""
-        b, t, dl = h.shape
-        width = self.cfg.max_patch_len
-        ar = torch.arange(t, device=h.device).expand(b, t)
-        start = torch.full((b, k), t, dtype=torch.long, device=h.device)
+    def _patch_slots(self, patch_id: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """byte を (B*K, max_patch_len) の枠に並べる添字 (B, T) と、枠の有効位置 (B*K, max_patch_len).
+
+        byte の無い pad patch も位置 0 だけ有効にする (全マスクの SDPA は NaN。値は 0 の枠)。
+        """
+        b, t = patch_id.shape
+        width = self.max_patch_len
+        ar = torch.arange(t, device=patch_id.device).expand(b, t)
+        start = torch.full((b, k), t, dtype=torch.long, device=patch_id.device)
         start.scatter_reduce_(1, patch_id, ar, reduce="amin", include_self=True)
         slot = patch_id * width + (ar - start.gather(1, patch_id))
-        buf = h.new_zeros((b, k * width, dl)).scatter(1, slot.unsqueeze(-1).expand(-1, -1, dl), h)
-        counts = torch.zeros((b, k), dtype=torch.long, device=h.device)
+        counts = torch.zeros((b, k), dtype=torch.long, device=patch_id.device)
         counts.scatter_add_(1, patch_id, torch.ones_like(patch_id))
-        # byte の無い pad patch も位置 0 だけ有効にする (全マスクの SDPA は NaN)
-        valid = torch.arange(width, device=h.device) < counts.clamp_min(1).unsqueeze(-1)
-        return self.patch_pool(buf.view(b * k, width, dl), valid.view(b * k, width)).view(b, k, -1)
+        valid = torch.arange(width, device=patch_id.device) < counts.clamp_min(1).unsqueeze(-1)
+        return slot, valid.view(b * k, width)
 
-    def _forward_dynamic(self, input_ids: torch.Tensor) -> ArborOutput:
+    def _encoder_cross_attn(
+        self, layer_idx: int, h: torch.Tensor, slot: torch.Tensor, valid: torch.Tensor,
+        k: int, queries: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """patch query (B*K, k, dl) を自 patch の byte へ cross-attention させて更新する.
+
+        queries が None (encoder の最初の層) なら patch 内 max-pool の射影で初期化する (BLT)。
+        """
+        b, t, dl = h.shape
+        width = self.max_patch_len
+        buf = h.new_zeros((b, k * width, dl)).scatter(1, slot.unsqueeze(-1).expand(-1, -1, dl), h)
+        buf = buf.view(b * k, width, dl)
+        if queries is None:
+            pooled = buf.masked_fill(~valid.unsqueeze(-1), float("-inf")).amax(dim=1)
+            queries = self.patch_query_proj(pooled).view(b * k, self.cfg.cross_attn_k, dl)
+        return queries + self.encoder_cross_attn[layer_idx](queries, buf, valid)
+
+    def _run_global(
+        self, patches: torch.Tensor, attn_mask: "torch.Tensor | None", patch_doc: torch.Tensor,
+    ) -> torch.Tensor:
+        """1 patch 右シフト + causal global。decoder の cross-attention 用に (B, K, k, dl) で返す.
+
+        新文書先頭の右シフト入力は BOS に置き換える (前文書の patch が residual に残らないように)。
+        """
+        b = patches.size(0)
+        bos = self.global_bos.to(patches.dtype).expand(b, 1, -1)
+        g = torch.cat((bos, patches[:, :-1]), dim=1)
+        new_doc = F.pad(patch_doc[:, 1:] != patch_doc[:, :-1], (1, 0), value=True)
+        g = torch.where(new_doc.unsqueeze(-1), bos, g)
+        for layer in self.global_layers:
+            g = self._maybe_ckpt(layer, g, attn_mask, seg=patch_doc)
+        out = self.global_to_local(self.global_norm(g))
+        return out.unflatten(-1, (self.cfg.cross_attn_k, self.cfg.local_hidden_size))
+
+    def _maybe_ckpt(
+        self, layer: nn.Module, x: torch.Tensor,
+        attn_mask: "torch.Tensor | None" = None,
+        seg: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.cfg.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+
+            return checkpoint(layer, x, attn_mask, None, 0, seg, use_reentrant=False)
+        return layer(x, attn_mask, seg=seg)
+
+    # ------------------------------------------------------------- forward
+    def forward(self, input_ids: torch.Tensor) -> ArborOutput:
         cfg = self.cfg
         b, t = input_ids.shape
         if t > cfg.max_bytes:
             # 予算ガードは horizon=max_bytes 前提 (これを超えると patch 数の上限保証が崩れる)
-            raise ValueError(f"動的モードの入力長 {t} が max_bytes={cfg.max_bytes} を超えている")
+            raise ValueError(f"入力長 {t} が max_bytes={cfg.max_bytes} を超えている")
         profile_sections = bool(getattr(self, "profile_sections", False))
         section_ms: dict[str, float] = {}
 
@@ -1418,94 +1420,41 @@ class ArborModel(nn.Module):
                 raise ValueError(f"patching_mode={cfg.patching_mode} には entropy_model が必要")
             # 凍結 ByteLM も境界 walk (custom_op arbor::patch_starts) も compile の 1 graph に乗る
             entropy_values = timed_section(
-                "bytelm_ms",
-                lambda: self.entropy_model.boundary_entropy(input_ids),
+                "bytelm_ms", lambda: self.entropy_model.boundary_entropy(input_ids),
             )
 
         def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
-            starts_local = self._patch_starts(input_ids, entropy_values)
-            # (B, T) 各バイトの patch 番号
-            return starts_local.long().cumsum(1) - 1, starts_local.sum(1).to(torch.float32)
+            starts = self._patch_starts(input_ids, entropy_values)
+            return starts.long().cumsum(1) - 1, starts.sum(1).to(torch.float32)
 
         patch_id, patch_counts = timed_section("patching_ms", build_patch_ids)
-        patch_count = patch_counts.sum()
-        max_patch_count = patch_counts.max()
-        # 予算ガード (_patch_starts_reference) により patch 数は max_patches を超えない
         k = self.max_patches
 
         def run_arbor_body() -> torch.Tensor:
-            x = self.byte_emb(input_ids)                   # (B, T, dl)
+            doc = self._byte_doc_ids(input_ids)                    # (B, T)
+            mask = self._byte_attn_mask(input_ids, doc)
+            slot, valid = self._patch_slots(patch_id, k)
 
-            # patch 内 attention マスク: T が chunk の倍数なら窓経路 (T×T を実体化
-            # しない)、端数 (生成 prefill 等) は従来の密マスク fallback
-            c, w = _WINDOW_CHUNK, cfg.max_patch_len
-            if t % c == 0 and t >= c:
-                # pad 位置は patch_id=-1 で不一致を保証
-                qpid = patch_id.view(b, t // c, c).unsqueeze(3)
-                kpid = F.pad(patch_id, (w, w), value=-1).unfold(1, c + 2 * w, c).unsqueeze(2)
-                enc_mask: torch.Tensor | WindowMask = WindowMask(qpid == kpid, c, w)
-                # 絶対位置: q = i*c + qi, kv = i*c - w + ki なので causal ⇔ ki <= qi + w
-                kpid_dec = F.pad(patch_id, (w, 0), value=-1).unfold(1, c + w, c).unsqueeze(2)
-                ar_q = torch.arange(c, device=x.device).unsqueeze(1)
-                ar_k = torch.arange(c + w, device=x.device).unsqueeze(0)
-                dec_mask: torch.Tensor | WindowMask = WindowMask(
-                    (qpid == kpid_dec) & (ar_k <= ar_q + w), c, w, causal=True
-                )
-            else:
-                same = patch_id.unsqueeze(2) == patch_id.unsqueeze(1)  # (B, T, T)
-                causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device))
-                enc_mask = same.unsqueeze(1)
-                dec_mask = (same & causal).unsqueeze(1)
+            h = self.embed(input_ids, doc)
+            queries = None
+            for i, layer in enumerate(self.encoder_layers):
+                h = self._maybe_ckpt(layer, h, mask)
+                queries = self._encoder_cross_attn(i, h, slot, valid, k, queries)
+            patches = queries.reshape(b, k, -1)                    # (B, K, k*dl)
+            if self.patch_proj is not None:
+                patches = self.patch_proj(patches)
 
-            # Local Encoder: patch 内 bidirectional (block 対角マスク)
-            h = x
-            for layer in self.encoder_layers:
-                h = self._maybe_ckpt(layer, h, enc_mask)
+            # patch の doc 番号 = patch 先頭バイトの doc。pad patch は番兵の大きな値のまま
+            # 残り、どの実文書とも一致しないので key/query として実文書へ漏れない
+            patch_doc = torch.full((b, k), 1 << 30, dtype=torch.long, device=input_ids.device)
+            patch_doc.scatter_reduce_(1, patch_id, doc, reduce="amin", include_self=True)
+            g = self._run_global(patches, self._global_mask(patch_doc), patch_doc)  # (B, K, k, dl)
 
-            # patchごとの pooling (mean | max | xattn。concat は __init__ で弾く)。
-            # pad patchは0埋めでdecoderからgatherされないため勾配は流れない。
-            idx = patch_id.unsqueeze(-1).expand(-1, -1, h.size(-1))
-            if self.patch_pool is not None:
-                pooled = self._xattn_pool_dynamic(h, patch_id, k)
-            elif cfg.patch_pooling == "mean":
-                pooled = h.new_zeros((b, k, h.size(-1)))
-                pooled.scatter_add_(1, idx, h)
-                counts = h.new_zeros((b, k, 1))
-                counts.scatter_add_(
-                    1,
-                    patch_id.unsqueeze(-1),
-                    h.new_ones((b, t, 1)),
-                )
-                pooled = pooled / counts.clamp_min(1.0)
-            else:
-                pooled = h.new_full((b, k, h.size(-1)), float("-inf"))
-                pooled.scatter_reduce_(1, idx, h, reduce="amax", include_self=True)
-                pooled = torch.where(
-                    torch.isinf(pooled), torch.zeros_like(pooled), pooled
-                )
-            patches = self.patch_proj(pooled)              # (B, K, dg)
-
-            # patch の doc 番号 = patch 内バイトの最小 doc (= 先頭バイトの doc)。
-            # pad patch (バイト無し) は番兵の大きな値のまま残り、どの実文書とも
-            # 一致しないので key/query として実文書へ漏れない。
-            byte_doc = self._byte_doc_ids(input_ids)       # (B, T)
-            patch_doc = torch.full((b, k), 1 << 30, dtype=torch.long, device=x.device)
-            patch_doc.scatter_reduce_(1, patch_id, byte_doc, reduce="amin", include_self=True)
-            # global を文書内に閉じる (block-diagonal + causal)。右シフト後、位置 j は
-            # patch j-1 を保持し、pad patch は必ず j > t 側に落ちる
-            g = self._run_global(
-                patches, self._global_mask(patch_doc), patch_doc
-            )  # (B, K, dl)
-            h_byte = g.gather(1, patch_id.unsqueeze(-1).expand(-1, -1, g.size(-1)))
-
-            # Local Decoder: (byte 層で全文脈 →) patch 内 causal (block 対角 ∧ 下三角)
-            d = x + h_byte
-            if os.environ.get("ARBOR_DEBUG_CONTEXT", "0") == "1":
-                self._debug_context_contribution(x, h_byte, d)
-            if len(self.byte_layers):
-                d = self._run_byte_layers(d, input_ids)
-            for layer in self.decoder_layers:
-                d = self._maybe_ckpt(layer, d, dec_mask)
+            d = h
+            for i, layer in enumerate(self.decoder_layers):
+                if i < len(self.decoder_cross_attn):
+                    d = d + self.decoder_cross_attn[i].forward_per_byte(d, g, patch_id)
+                d = self._maybe_ckpt(layer, d, mask)
             return self.head(self.head_norm(d))
 
         logits = timed_section("arbor_ms", run_arbor_body)
@@ -1513,15 +1462,13 @@ class ArborModel(nn.Module):
             self._last_profile = section_ms
         return ArborOutput(
             logits=logits,
-            patch_count=patch_count,
-            max_patch_count=max_patch_count,
+            patch_count=patch_counts.sum(),
+            max_patch_count=patch_counts.max(),
         )
 
     @torch.no_grad()
     def profile_patching_sections(self, input_ids: torch.Tensor) -> dict[str, float]:
         """Measure entropy scoring and boundary construction without running Arbor body."""
-        if not self.dynamic:
-            return {}
         cfg = self.cfg
         section_ms: dict[str, float] = {}
 
@@ -1542,16 +1489,13 @@ class ArborModel(nn.Module):
 
         entropy_values = None
         if cfg.patching_mode in ENTROPY_MODES:
-            if self.entropy_model is None:
-                raise ValueError(f"patching_mode={cfg.patching_mode} には entropy_model が必要")
             entropy_values = timed_section(
-                "bytelm_ms",
-                lambda: self.entropy_model.boundary_entropy(input_ids),
+                "bytelm_ms", lambda: self.entropy_model.boundary_entropy(input_ids),
             )
 
         def build_patch_ids() -> tuple[torch.Tensor, torch.Tensor]:
-            starts_local = self._patch_starts(input_ids, entropy_values)
-            return starts_local.long().cumsum(1) - 1, starts_local.sum(1).to(torch.float32)
+            starts = self._patch_starts(input_ids, entropy_values)
+            return starts.long().cumsum(1) - 1, starts.sum(1).to(torch.float32)
 
         patch_id, patch_counts = timed_section("patching_ms", build_patch_ids)
         section_ms["patches_per_seq"] = float(patch_counts.float().mean().cpu())
@@ -1559,105 +1503,29 @@ class ArborModel(nn.Module):
         section_ms["patch_id_max"] = float(patch_id.max().cpu() + 1)
         return section_ms
 
-    def _byte_attn_mask(self, input_ids: torch.Tensor):
-        """byte 層の mask: causal ∧ 同一文書 (∧ 直近 byte_attn_window byte).
-
-        compile 下の CUDA では flex_attention の BlockMask (窓外・文書外の block を丸ごと
-        飛ばす fused kernel)、それ以外 (eager / CPU / 評価) は同じ規則の密 bool mask。
-        文書境界も窓も無い入力では None を返し、Attention 側の素の causal (flash) を使う。
-        """
-        b, t = input_ids.shape
-        w = self.cfg.byte_attn_window
-        doc = self._byte_doc_ids(input_ids)                       # (B, T)
-        if input_ids.is_cuda and torch.compiler.is_compiling():
-            from torch.nn.attention.flex_attention import create_block_mask
-
-            def mask_mod(b_idx, h_idx, q_idx, kv_idx):
-                keep = (kv_idx <= q_idx) & (doc[b_idx, q_idx] == doc[b_idx, kv_idx])
-                if w is not None:
-                    keep = keep & (q_idx - kv_idx < w)
-                return keep
-
-            return create_block_mask(mask_mod, B=b, H=None, Q_LEN=t, KV_LEN=t,
-                                     device=input_ids.device)
-        if w is None and not bool((doc[:, -1] != doc[:, 0]).any()):
-            return None
-        q = torch.arange(t, device=input_ids.device).view(t, 1)
-        kv = torch.arange(t, device=input_ids.device).view(1, t)
-        allow = (kv <= q).unsqueeze(0) & (doc.unsqueeze(2) == doc.unsqueeze(1))
-        if w is not None:
-            allow = allow & (q - kv < w).unsqueeze(0)
-        return allow.unsqueeze(1)                                # (B, 1, T, T)
-
-    def _run_byte_layers(self, d: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        """d: (B, T, dl) の flat byte 列に byte 層 (全文脈 causal、文書内) を通す."""
-        mask = self._byte_attn_mask(input_ids)
-        for layer in self.byte_layers:
-            d = self._maybe_ckpt(layer, d, mask)
-        return d
-
-    def _run_global(
-        self,
-        patches: torch.Tensor,
-        attn_mask: "torch.Tensor | None" = None,
-        patch_doc: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """1 patch 右シフト + causal global を回し、local 次元へ射影して返す.
-
-        attn_mask を渡すと causal に加えて文書境界 (block-diagonal) を課す。
-        patch_doc を渡すと新文書先頭の右シフト入力をBOSへresetし、前文書patchが
-        residual streamへ直接残る経路も遮断する。
-        None のときは従来どおり plain causal (native GQA fast-path)。
-        """
-        b = patches.size(0)
-        bos = self.global_bos.to(patches.dtype).expand(b, 1, -1)
-        g = torch.cat((bos, patches[:, :-1]), dim=1)
-        if patch_doc is not None:
-            # attention maskだけでは、右シフト後の residual stream g[j]=patch[j-1] に
-            # 前文書のpatch表現が残る。新文書先頭では入力自体をBOSへ置換し、
-            # local→global residual経由のdocument leakも遮断する。
-            new_doc = F.pad(patch_doc[:, 1:] != patch_doc[:, :-1], (1, 0), value=True)
-            g = torch.where(new_doc.unsqueeze(-1), bos, g)
-        for layer in self.global_layers:
-            g = self._maybe_ckpt(layer, g, attn_mask, seg=patch_doc)
-        return self.global_to_local(self.global_norm(g))
-
-    def _maybe_ckpt(
-        self, layer: nn.Module, x: torch.Tensor,
-        attn_mask: "torch.Tensor | WindowMask | None" = None,
-        seg: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if self.cfg.gradient_checkpointing and self.training and torch.is_grad_enabled():
-            from torch.utils.checkpoint import checkpoint
-
-            return checkpoint(layer, x, attn_mask, None, 0, seg, use_reentrant=False)
-        return layer(x, attn_mask, seg=seg)
-
     # ------------------------------------------------------------ utility
     def num_parameters(self) -> dict[str, int]:
-        def count(mod: nn.Module | None) -> int:
-            return 0 if mod is None else sum(par.numel() for par in mod.parameters())
+        def count(*mods: nn.Module | None) -> int:
+            return sum(par.numel() for m in mods if m is not None for par in m.parameters())
 
         return {
             "total": count(self),
-            "global": sum(count(m) for m in self.global_layers),
-            "local_encoder": sum(count(m) for m in self.encoder_layers),
-            "local_decoder": sum(count(m) for m in self.decoder_layers),
-            "local_byte": sum(count(m) for m in self.byte_layers),
-            "embedding_head": count(self.byte_emb) + count(self.head)
-            + count(self.patch_pool) + count(self.patch_proj) + count(self.global_to_local),
+            "global": count(self.global_layers),
+            "local_encoder": count(self.encoder_layers, self.encoder_cross_attn, self.patch_query_proj),
+            "local_decoder": count(self.decoder_layers, self.decoder_cross_attn, self.global_to_local),
+            "hash_ngram": count(self.hash_emb),
+            "embedding_head": count(self.byte_emb, self.head, self.patch_proj),
             "entropy_model": count(self.entropy_model),
         }
 
 
 class ArborByteGenerator:
-    """2 階層 KV cache 付きの逐次バイト生成器 (batch=1).
+    """KV cache 付きの逐次バイト生成器 (batch=1).
 
-    フルフォワード方式 (1 バイトごとに全系列再計算) と論理的に同一の logits を、
-    増分計算だけで返す:
-      - global: patch が確定するたびに 1 トークンだけ KV cache に追記
-      - local decoder: 現在 patch のプレフィックス (<= max_patch_len トークン) を
-        毎バイト再計算 (極小なのでキャッシュ不要)
+    フルフォワード (1 バイトごとに全系列再計算) と同じ logits を増分計算で返す:
+      - encoder / decoder の byte 層: 全 byte の KV cache を持ち、新しい byte の分だけ計算
+      - patch が確定したら、その byte の encoder 表現から patch query を作って global に 1 つ追記
+      - byte の decoder cross-attention は、その byte が属する patch の global 出力を使う
       - entropy モードは境界判定用 ByteLM にも KV cache を持つ
 
     使い方:
@@ -1666,6 +1534,7 @@ class ArborByteGenerator:
         logits = gen.push(next_id)         # 1 バイト進める
 
     context が max_bytes に達したら後半半分を残して内部で自動的に作り直す。
+    プロンプト中の EOS (文書の切り替え) はフルフォワードと違い分離しない。
     """
 
     def __init__(self, model: ArborModel):
@@ -1679,24 +1548,23 @@ class ArborByteGenerator:
         self.cfg = model.cfg
         p = next(model.parameters())
         self.device, self.dtype = p.device, p.dtype
+        self._hash_span = max(model.hash_emb.sizes) if model.hash_emb is not None else 1
         self.reset()
 
     def reset(self) -> None:
         self.byte_ids: list[int] = []
         self.cur_patch: list[int] = []
-        self.cur_patch_start = 0
         self.n_global = 0
         self.g_caches = [_LayerKVCache() for _ in self.m.global_layers]
-        self.h_cur: torch.Tensor | None = None
+        self.g_cur: torch.Tensor | None = None  # 現 patch の global 出力 (1, 1, k, dl)
         if self.cfg.patching_mode in ENTROPY_MODES:
             self.lm_caches = [_LayerKVCache() for _ in self.m.entropy_model.layers]
             self.prev_entropy = 0.0
             self.prev_rest = 0.0  # char_rest head の予測 (直前に読んだ byte の位置)
             self.prev_char_h: float | None = None  # 1 つ前の文字の H (entropy_char)
-        # byte 層: 全 byte の KV cache を持ち、新しい byte の分だけ増分計算する。
-        # 出力 (decoder 入力) は現 patch 分だけ保持して patch 内 decoder に渡す
-        self.byte_caches = [_LayerKVCache() for _ in self.m.byte_layers]
-        self.cur_dec_in: list[torch.Tensor] = []
+        self.enc_caches = [_LayerKVCache() for _ in self.m.encoder_layers]
+        self.dec_caches = [_LayerKVCache() for _ in self.m.decoder_layers]
+        self.cur_enc: list[list[torch.Tensor]] = [[] for _ in self.m.encoder_layers]  # 現 patch の各層出力
         self._push_global(self.m.global_bos.view(1, 1, -1))
 
     @torch.inference_mode()
@@ -1714,11 +1582,10 @@ class ArborByteGenerator:
     def push(self, byte_id: int) -> torch.Tensor:
         if len(self.byte_ids) >= self.cfg.max_bytes:
             self._rebuild(keep=self.cfg.max_bytes // 2)
-        self._append_byte(byte_id)
-        return self._decode_current()
+        return self._append_byte(byte_id)
 
-    def _append_byte(self, byte_id: int) -> None:
-        """1 byte 進める (patch 確定・ByteLM・byte 層の状態更新)。logits は計算しない."""
+    def _append_byte(self, byte_id: int) -> torch.Tensor:
+        """1 byte 進めて、その位置の next-byte logits (vocab,) を返す."""
         mode = self.cfg.patching_mode
         if mode == "entropy_char":
             # 境界判定にこの byte を読んだ後のエントロピー (多バイト文字の 2 byte 目の予測) も使う
@@ -1741,15 +1608,25 @@ class ArborByteGenerator:
         self.byte_ids.append(byte_id)
         if mode == "entropy":
             self._advance_entropy_lm(byte_id, pos=len(self.byte_ids) - 1)
-        # decoder 入力 = byte_emb + 現 patch の global 文脈 (+ byte 層)。h_cur は patch 確定後の値
+
         pos = len(self.byte_ids) - 1
-        d = self.m.byte_emb(torch.tensor([[byte_id]], dtype=torch.long, device=self.device)) + self.h_cur
-        window = self.cfg.byte_attn_window
-        for layer, cache in zip(self.m.byte_layers, self.byte_caches):
+        window = self.cfg.local_attn_window
+        tail = torch.tensor([self.byte_ids[-self._hash_span:]], dtype=torch.long, device=self.device)
+        x = self.m.embed(tail, torch.zeros_like(tail))[:, -1:].to(self.dtype)
+        for i, (layer, cache) in enumerate(zip(self.m.encoder_layers, self.enc_caches)):
+            if window is not None:
+                cache.trim(max(0, window - 1))
+            x = layer(x, kv_cache=cache, pos_offset=pos)
+            self.cur_enc[i].append(x)
+        d = x
+        patch_id = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        for i, (layer, cache) in enumerate(zip(self.m.decoder_layers, self.dec_caches)):
+            if i < len(self.m.decoder_cross_attn):
+                d = d + self.m.decoder_cross_attn[i].forward_per_byte(d, self.g_cur, patch_id)
             if window is not None:
                 cache.trim(max(0, window - 1))
             d = layer(d, kv_cache=cache, pos_offset=pos)
-        self.cur_dec_in.append(d)
+        return self.m.head(self.m.head_norm(d))[0, -1]
 
     # ----------------------------------------------------------- internal
     def _starts_new_patch(
@@ -1759,14 +1636,12 @@ class ArborByteGenerator:
         run = len(self.cur_patch)
         if run == 0:
             return False
-        cfg = self.cfg
-        if cfg.patching_mode == "static":
-            return run >= cfg.patch_size
-        if run >= cfg.max_patch_len:
+        cfg, m = self.cfg, self.m
+        if run >= m.max_patch_len:
             return True  # 予算ガードの不変条件により常に許される
         if self.byte_ids[-1] == cfg.eos_token_id:
             candidate = True  # 文書先頭は min_len に関係なく区切る
-        elif run < cfg.min_patch_len or cfg.patching_mode == "fixed":
+        elif run < m.min_patch_len or cfg.patching_mode == "static":
             return False
         elif cfg.patching_mode == "utf8":
             candidate = next_byte_id is not None and _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
@@ -1774,8 +1649,7 @@ class ArborByteGenerator:
             candidate = (self.byte_ids[-1] - BYTE_OFFSET) in _SPACE_BYTES
         elif cfg.patching_mode == "entropy_char":
             candidate = rise or (
-                run >= cfg.max_patch_len - _UTF8_MAX_CONT
-                and _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
+                run >= m.patch_reserve and _is_utf8_char_start_byte(next_byte_id - BYTE_OFFSET)
             )
         else:
             candidate = self.prev_entropy > cfg.entropy_threshold
@@ -1784,42 +1658,29 @@ class ArborByteGenerator:
         # 予算ガード: これまでに開いた patch 数 (= n_global、BOS 分を除き現 patch を含む) と
         # 次バイトの位置 len(byte_ids) だけで決まる
         remaining = max(cfg.max_bytes - len(self.byte_ids), 0)
-        reserve = cfg.max_patch_len - (_UTF8_MAX_CONT if cfg.patching_mode == "entropy_char" else 0)
-        return self.n_global + -(-remaining // reserve) <= self.m.max_patches
+        return self.n_global + -(-remaining // m.patch_reserve) <= m.max_patches
 
     def _push_global(self, g_in: torch.Tensor) -> None:
         g = g_in.to(self.dtype)
         for layer, cache in zip(self.m.global_layers, self.g_caches):
             g = layer(g, kv_cache=cache, pos_offset=self.n_global)
         self.n_global += 1
-        self.h_cur = self.m.global_to_local(self.m.global_norm(g))  # (1, 1, dl)
+        out = self.m.global_to_local(self.m.global_norm(g))
+        self.g_cur = out.unflatten(-1, (self.cfg.cross_attn_k, self.cfg.local_hidden_size))
 
     def _commit_patch(self) -> None:
-        ids = torch.tensor([self.cur_patch], dtype=torch.long, device=self.device)
-        x = self.m.byte_emb(ids)
-        pos = 0 if not self.m.dynamic else self.cur_patch_start
-        for layer in self.m.encoder_layers:
-            x = layer(x, pos_offset=pos)
-        pooling = self.cfg.patch_pooling
-        if pooling == "concat":
-            patch_emb = self.m.patch_proj(x.reshape(1, -1))  # (1, p*dl) -> (1, dg)
-        elif pooling == "mean":
-            patch_emb = self.m.patch_proj(x.mean(dim=1))
-        elif pooling == "xattn":
-            patch_emb = self.m.patch_proj(self.m.patch_pool(x))
-        else:
-            patch_emb = self.m.patch_proj(x.amax(dim=1))
-        self._push_global(patch_emb.view(1, 1, -1))
-        self.cur_patch_start += len(self.cur_patch)
+        queries = None
+        for i, states in enumerate(self.cur_enc):
+            h = torch.cat(states, dim=1)                                   # (1, 現 patch 長, dl)
+            if queries is None:
+                queries = self.m.patch_query_proj(h.amax(dim=1)).view(1, self.cfg.cross_attn_k, -1)
+            queries = queries + self.m.encoder_cross_attn[i](queries, h)
+        patch = queries.reshape(1, 1, -1)
+        if self.m.patch_proj is not None:
+            patch = self.m.patch_proj(patch)
+        self._push_global(patch)
         self.cur_patch = []
-        self.cur_dec_in = []
-
-    def _decode_current(self) -> torch.Tensor:
-        d = torch.cat(self.cur_dec_in, dim=1)  # (1, 現 patch 長, dl)
-        pos = 0 if not self.m.dynamic else self.cur_patch_start
-        for layer in self.m.decoder_layers:
-            d = layer(d, pos_offset=pos)  # causal (<= max_patch_len トークン)
-        return self.m.head(self.m.head_norm(d[:, -1]))[0]  # (vocab,)
+        self.cur_enc = [[] for _ in self.m.encoder_layers]
 
     def _advance_entropy_lm(self, byte_id: int, pos: int) -> None:
         lm = self.m.entropy_model
@@ -1841,7 +1702,6 @@ class ArborByteGenerator:
         self.reset()
         for byte_id in tail:
             self._append_byte(byte_id)
-        # 次の push/_decode_current から通常運転
 
 
 def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
@@ -1893,10 +1753,9 @@ def build_arbor(model_cfg: dict[str, Any]) -> ArborModel:
     print(
         f"[arbor] params={counts['total'] / 1e6:.1f}M "
         f"(global={counts['global'] / 1e6:.1f}M local_enc={counts['local_encoder'] / 1e6:.1f}M "
-        f"local_dec={counts['local_decoder'] / 1e6:.1f}M "
-        + (f"byte_layers={cfg.num_byte_layers}x({counts['local_byte'] / max(cfg.num_byte_layers, 1) / 1e6:.1f}M, "
-           f"window={cfg.byte_attn_window or 'doc'}) " if cfg.num_byte_layers else "")
-        + f"emb/head={counts['embedding_head'] / 1e6:.1f}M "
+        f"local_dec={counts['local_decoder'] / 1e6:.1f}M hash_ngram={counts['hash_ngram'] / 1e6:.1f}M "
+        f"emb/head={counts['embedding_head'] / 1e6:.1f}M "
+        f"xattn_k={cfg.cross_attn_k} local_window={cfg.local_attn_window or 'doc'} "
         f"entropy_lm={counts['entropy_model'] / 1e6:.1f}M) "
         f"patching={cfg.patching_mode} bitnet={'ON' if cfg.bitnet else 'OFF'} "
         f"bitlinear_layers={n_bit} "
