@@ -1,4 +1,4 @@
-# 構造 A/B (1B・20k step、ゼロから・同じデータ順): E6s = E6 の global を細くして (2048→1152 次元、層数 20 は維持) global 計算量を A とほぼ同じにしたもの (1152²/2048² × 3 ≈ 0.95)。entropy_threshold は仮 (ByteLM 途中の値)。学習前に最終 ByteLM で scripts/calibrate_entropy_threshold.py --write で校正すること
+# 構造 A/B (1B・20k step、ゼロから・同じデータ順): E6s = E6 の global を細くして (2048→1152 次元、層数 20 は維持) global 計算量を A とほぼ同じにしたもの (1152²/2048² × 3 ≈ 0.95)。entropy_threshold は仮 (ByteLM 途中の値)。値は旧 calibrate スクリプト (平均 patch 数を予算の 0.9 に合わせる、廃止) によるもの
 # 生成元: configs/arbor.yaml (本走) の total_steps / checkpoint + 上記の model 差分だけを変えたもの
 # 実行: python -m src.train.train --config configs/ab_c/e6s_char.yaml
 # data: 本走の混合 + ReazonSpeech 書き起こし 3%、code 9% → 6%・math 6% → 4% (fineweb2_ja 46.5% → 48.5%)。ReazonSpeech は未作成なら学習開始時に自動で用意 (prepare)

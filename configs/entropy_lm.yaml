@@ -237,5 +237,5 @@ validation:
       skip_samples: 20000
 
 logging:
-  log_every_steps: 50
-  throughput_window: 50
+  log_every_steps: 100
+  throughput_window: 100

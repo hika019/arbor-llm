@@ -3,8 +3,10 @@
 # 新規:   python -m src.train.train --config configs/arbor.yaml
 # 再開:   python -m src.train.train --config configs/arbor.yaml --resume latest
 #
-# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。static patching
-# (16 bytes/patch) なので global は512 patches。実効バッチは64 seq=524k bytes/update。
+# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。entropy_char patching
+# (ByteLM の文字単位エントロピーの上昇で区切る) で global は最大 max_patches。
+# 実効バッチは64 seq=524k bytes/update。
+# 閾値ごとの区切り方: python scripts/show_entropy_threshold_stats.py
 #
 # このbranchの既定値はCUDA sm89+専用。非対応deviceへは暗黙フォールバックしない。
 # MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_compute_mode: off を明示する。
@@ -12,7 +14,7 @@
 run_name: arbor2_1b_8k_lowbit
 seed: 42
 
-# model.patching_mode を entropy に変えた時だけ参照する。ByteLM の model 定義を
+# entropy 系の patching_mode で参照する。ByteLM の model 定義を
 # Arbor 側へ複製せず、このファイルから自動読込する。
 entropy_lm_config: entropy_lm.yaml
 
@@ -22,11 +24,11 @@ model:
   #   static       … patch_size byte ごと (と文書先頭) で区切る
   #   utf8 / space … UTF-8 文字先頭 / 空白・改行直後を候補にする (min/max_patch_len 有効)
   #   entropy / entropy_char … ByteLM の予測エントロピーで区切る (entropy_lm_config 必須)
-  patching_mode: static         # choices: static | utf8 | space | entropy | entropy_char
+  patching_mode: entropy_char   # choices: static | utf8 | space | entropy | entropy_char
   patch_size: 16                # static 専用: 1 patch = N byte。8192/16=512 global patches
-  min_patch_len: 3              # static 以外。range: 1..max_patch_len
-  max_patch_len: 16             # static 以外。range: >=min_patch_len
-  entropy_threshold: 2.0        # entropy 系専用 (entropy_char は文字の H の上昇幅)
+  min_patch_len: 1              # static 以外。range: 1..max_patch_len
+  max_patch_len: 32             # static 以外。range: >=min_patch_len
+  entropy_threshold: 2.494983   # entropy 系専用 (entropy_char は文字の H の上昇幅)。BLT-E16 の値 (ByteLM step 81695 用、ByteLM を変えたら決め直す)
   max_bytes: 8192               # 学習 context (bytes)
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
@@ -71,6 +73,11 @@ model:
   #   sdpa … 全 device 対応。 flex … CUDA + torch.compile 必須。
   # 非対応環境での暗黙フォールバックは禁止。必要なら明示的にsdpaへ変更する。
   global_attn_impl: flex        # RTX 4090実測: sdpa比 +3.7% (FP8 bwd併用、8k context)
+  # global に渡す patch 数の上限 (tensor 形状と計算量の上限)。超える系列は後半が予算ガードで
+  # 機械的に区切られる。512 は static 16 byte (8192/16) と global 計算量をそろえた BLT-E16 の値で、
+  # entropy の区切りから決めた値ではない。閾値を決めたら show_entropy_threshold_stats.py の
+  # 「予算超え系列」がほぼ 0 になる値にし、max_bytes を変えたら比例して変える。
+  max_patches: 512
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
 # weight_bytes は行選択確率ではなく、document packing 後の実測 byte 比率に近づくよう

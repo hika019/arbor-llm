@@ -8,7 +8,7 @@
 同じエントロピーから entropy (ByteLM の値そのまま) と entropy_char (文字単位のエントロピーが
 1 つ前の文字より上がった文字の先頭で区切る) の 2 通りの境界を並べて出す。2 つは判定値の尺度が違うので、閾値はモードごとに
 全サンプルの平均 patch 長が --target-avg-len になるよう二分探索する。数文だけでは偏るので、
-学習で使う値は scripts/calibrate_entropy_threshold.py で実データから決め、ここでは
+閾値ごとの実データでの区切り方は scripts/show_entropy_threshold_stats.py で見て、ここでは
 --entropy-threshold / --entropy-char-threshold で固定して見るのが正確。
 表示: `|` = 文字の頭に揃った境界、`¦` = その文字の途中 (UTF-8 マルチバイトの中) に落ちた境界。
 """

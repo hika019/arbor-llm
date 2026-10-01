@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
-"""Entropy patching の entropy_threshold を実データで校正する.
+"""閾値ごとの entropy patching の区切り方を実データで表示する (config は書き換えない).
 
-patch 数の上限 model.max_patches は「global の計算予算」として先に決める値
-(境界規則の予算ガードにより patch 数はこれを超えない)。このスクリプトは
 凍結済み ByteLM を学習データ混合の小サンプルに通し、本体と同じ境界規則
-(min/max patch 長・文書先頭の強制境界・予算ガード。src/model/arbor.py の
-compute_patch_starts) で、平均 patch 数が予算の --target-fill (既定 0.9) になる
-entropy_threshold を二分探索する。
-
-予算を使い切る系列 (ガードが効いて後半が max_patch_len 区切りに寄る系列) の
-割合も表示する。多すぎるなら target-fill を下げるか max_patches を増やす。
+(src/model/arbor.py の compute_patch_starts。予算ガードは掛けない) で閾値ごとに区切って、
+patch 長の分布・系列あたりの patch 数・長さ上限で切れた patch の割合・config の
+max_patches を超える系列の割合を出す。閾値は区切りの細かさ (= global の計算量) を決める
+つまみで、どれを使うかは同じ計算時間あたりの本体 bpb の A/B で決める。
 """
 from __future__ import annotations
 
 import argparse
-import json
-import math
-import re
+import os
 import sys
 from pathlib import Path
 
@@ -29,14 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=Path("configs/arbor.yaml"), help="既定は本走")
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--target-fill", type=float, default=0.9,
-                        help="平均 patch 数 / max_patches の目標 (pad 無駄 = 1 - fill)")
+    parser.add_argument("--thresholds", type=float, nargs="+", default=None,
+                        help="表示する閾値 (既定: entropy_char は -1〜3 を 0.5 刻み + config の値)")
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--binary-search-steps", type=int, default=24)
-    parser.add_argument("--write", action="store_true", help="config の entropy_threshold を更新する")
     return parser.parse_args()
 
 
@@ -75,37 +67,27 @@ def load_entropy_model(
     return model
 
 
-def update_config(path: Path, threshold: float) -> None:
-    text = path.read_text(encoding="utf-8")
-    text, count = re.subn(
-        r"(?m)^(\s*entropy_threshold:\s*)[^\s#]+(.*)$",
-        lambda match: f"{match.group(1)}{threshold:.6f}{match.group(2)}",
-        text,
-        count=1,
-    )
-    if count != 1:
-        raise RuntimeError("entropy_threshold line not found")
-    backup = path.with_suffix(path.suffix + ".before-calibration")
-    if not backup.exists():
-        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-    path.write_text(text, encoding="utf-8")
-
-
-def search_threshold(counts_at, target: float, low: float, high: float, steps: int) -> float:
-    """平均 patch 数が target になる閾値を二分探索する (閾値を上げるほど patch は減る)."""
-    for _ in range(steps):
-        middle = (low + high) / 2.0
-        if float(counts_at(middle).mean()) > target:
-            low = middle
-        else:
-            high = middle
-    return (low + high) / 2.0
+def patch_stats(starts: torch.Tensor, soft_len: int, budget: int | None) -> dict:
+    tokens = starts.size(1)
+    lengths = []
+    for row in starts:
+        pos = torch.nonzero(row).flatten()
+        lengths.append(torch.diff(pos, append=pos.new_tensor([tokens])))
+    lengths = torch.cat(lengths).float()
+    counts = starts.sum(1).float()
+    q = torch.quantile(lengths, lengths.new_tensor([0.1, 0.5, 0.9]))
+    return {
+        "bytes_per_patch": float(lengths.mean()),
+        "len_p10": float(q[0]), "len_p50": float(q[1]), "len_p90": float(q[2]),
+        "patches_mean": float(counts.mean()),
+        "patches_max": int(counts.max()),
+        "capped_ratio": float((lengths >= soft_len).float().mean()),
+        "over_budget_ratio": float((counts > budget).float().mean()) if budget else None,
+    }
 
 
 def main() -> int:
     args = parse_args()
-    if not 0 < args.target_fill <= 1:
-        raise SystemExit("--target-fill must be in (0, 1]")
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     model_cfg = cfg["model"]
     mode = model_cfg.get("patching_mode")
@@ -121,10 +103,7 @@ def main() -> int:
     checkpoint = args.checkpoint or Path(model_cfg["entropy_model_ckpt"])
     max_bytes = int(model_cfg["max_bytes"])
     min_len, max_len = int(model_cfg["min_patch_len"]), int(model_cfg["max_patch_len"])
-    budget = model_cfg.get("max_patches")
-    if not budget:
-        raise SystemExit("model.max_patches (global の計算予算) を先に決めて config に書くこと")
-    budget = int(budget)
+    budget = int(model_cfg["max_patches"]) if model_cfg.get("max_patches") else None
     eos = int(model_cfg.get("eos_token_id", 2))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -147,47 +126,44 @@ def main() -> int:
             ent_list.append(ent.float())
             if rest is not None:
                 rest_list.append(rest.float())
-            print(f"[calibrate] batch={batch_index + 1}/{args.batches} "
+            print(f"[stats] batch={batch_index + 1}/{args.batches} "
                   f"entropy=[{float(ent.min()):.3f}, {float(ent.max()):.3f}]", flush=True)
     ids_all, ent_all = torch.cat(ids_list), torch.cat(ent_list)
     rest_all = torch.cat(rest_list) if rest_list else None
 
-    def counts_at(threshold: float) -> torch.Tensor:
+    if args.thresholds:
+        thresholds = sorted(args.thresholds)
+    elif mode == "entropy_char":
+        thresholds = sorted({x * 0.5 for x in range(-2, 7)} | {float(model_cfg["entropy_threshold"])})
+    else:
+        lo, hi = float(ent_all.min()), float(ent_all.max())
+        thresholds = sorted({lo + (hi - lo) * i / 8 for i in range(1, 8)} | {float(model_cfg["entropy_threshold"])})
+    soft_len = max_len - 3 if mode == "entropy_char" else max_len
+
+    print(f"[stats] {args.config} / ByteLM {checkpoint}")
+    print(f"[stats] {ids_all.size(0)} 系列 x {ids_all.size(1)} byte, min/max_patch_len={min_len}/{max_len}, "
+          f"char_rest={char_rest}, config の閾値={model_cfg['entropy_threshold']}, max_patches={budget}")
+    print(f"{'閾値':>8} {'B/patch':>8} {'長さ p10/p50/p90':>17} {'patch/系列 平均':>15} {'最大':>6} "
+          f"{'上限切れ':>8} {'予算超え系列':>12}")
+    for threshold in thresholds:
         starts = compute_patch_starts(
             ids_all, mode, min_len, max_len, entropy_values=ent_all, rest_values=rest_all,
-            threshold=threshold, eos_token_id=eos, budget=budget, horizon=max_bytes,
+            threshold=threshold, eos_token_id=eos,
         )
-        return starts.sum(1).float()
-
-    # entropy_char の閾値は文字の H (最大 2 byte 分) の 1 つ前の文字からの上昇幅
-    span = float(ent_all.max()) * (2 if mode == "entropy_char" else 1) + 1e-5
-    if rest_all is not None:
-        span += float(rest_all.max())
-    lo = -span if mode == "entropy_char" else float(ent_all.min()) - 1e-5
-    threshold = search_threshold(counts_at, args.target_fill * budget, lo, span, args.binary_search_steps)
-    counts = counts_at(threshold)
-    tokens = ids_all.size(1)
-    result = {
-        "config": str(args.config),
-        "checkpoint": str(checkpoint),
-        "sequences": int(ids_all.size(0)),
-        "max_patches(budget)": budget,
-        "min_budget": math.ceil(max_bytes / max_len),
-        "entropy_threshold": threshold,
-        "patches_per_seq_mean": float(counts.mean()),
-        "fill_mean": float(counts.mean()) / budget,
-        "bytes_per_patch_mean": tokens / float(counts.mean()),
-        "budget_exhausted_ratio": float((counts >= budget).float().mean()),
-        "entropy_char_rest": char_rest,
-        "min_patch_len": min_len,
-        "max_patch_len": max_len,
-    }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    if args.write:
-        update_config(args.config, threshold)
-        print(f"[calibrate] updated entropy_threshold in {args.config}")
+        st = patch_stats(starts, soft_len, budget)
+        over = "-" if st["over_budget_ratio"] is None else f"{st['over_budget_ratio']:.1%}"
+        lens = f"{st['len_p10']:.0f}/{st['len_p50']:.0f}/{st['len_p90']:.0f}"
+        print(f"{threshold:8.3f} {st['bytes_per_patch']:8.2f} {lens:>17} {st['patches_mean']:15.1f} "
+              f"{st['patches_max']:6d} {st['capped_ratio']:8.1%} {over:>12}")
+    print(f"[stats] 上限切れ = 長さ {soft_len} byte 以上の patch (予測しにくさでなく長さで切れたもの)。"
+          "予算超え系列 = max_patches を超える系列 (学習時は後半が予算ガードで機械的に区切られる)")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    rc = main()
+    # 読みかけの HF streaming を interpreter 終了時に破棄すると pyarrow の I/O スレッドが
+    # EBADF の再試行で詰まりクラッシュ・終了待ちになる (src/train/train.py と同じ対処)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)

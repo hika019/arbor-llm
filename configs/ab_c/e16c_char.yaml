@@ -1,4 +1,4 @@
-# 構造 A/B (1B・20k step、ゼロから・同じデータ順): E16c = E16 + entropy_char_rest (3〜4 byte 文字の H に ByteLM の char_rest head による 3 byte 目以降の予測エントロピー推定を足す)。区切り以外は E16 と同一。head は scripts/train_char_rest_head.py で ByteLM の step dir に作る。閾値は scripts/calibrate_entropy_threshold.py --write で校正
+# 構造 A/B (1B・20k step、ゼロから・同じデータ順): E16c = E16 + entropy_char_rest (3〜4 byte 文字の H に ByteLM の char_rest head による 3 byte 目以降の予測エントロピー推定を足す)。区切り以外は E16 と同一。head は scripts/train_char_rest_head.py で ByteLM の step dir に作る。閾値は旧 calibrate スクリプト (平均 patch 数を予算の 0.9 に合わせる、廃止) によるもの
 # 生成元: configs/arbor.yaml (本走) の total_steps / checkpoint + 上記の model 差分だけを変えたもの
 # 実行: python -m src.train.train --config configs/ab_c/e16_char.yaml
 # data: 本走の混合 + ReazonSpeech 書き起こし 3%、code 9% → 6%・math 6% → 4% (fineweb2_ja 46.5% → 48.5%)。ReazonSpeech は未作成なら学習開始時に自動で用意 (prepare)
