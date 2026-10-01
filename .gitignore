@@ -44,12 +44,10 @@ Thumbs.db
 !arbor_launch_gap_analysis.md
 !arbor_gpu_idle_root_cause_20260912.md
 
-# logs
+# logs (実験ログ・ベンチ用 config・プロファイルのトレースなどローカル専用の出力置き場)
 *.log
 nohup.out
-/logs/benchmark_*.jsonl
-# torch profiler の chrome trace (数百MBの巨大バイナリ; 成果物なので追跡しない)
-logs/torch_profile_*.json
+/logs/
 
 .deps/*
 .torch_extensions/
