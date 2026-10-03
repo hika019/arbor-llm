@@ -25,7 +25,8 @@ from src.model.arbor import (
 # 未確定 patch の先頭より前に残す byte 数 (entropy_char は 1 つ前の文字とその直前を見る)
 _LOOKBACK = 8
 
-EntropyFn = Callable[[torch.Tensor], "tuple[torch.Tensor, torch.Tensor | None]"]
+# (chunk (B, T), 各行の実長, 各行の lane の状態) → (エントロピー (B, T), char_rest | None, 新しい状態)
+EntropyFn = Callable[[torch.Tensor, list, list], "tuple[torch.Tensor, torch.Tensor | None, list]"]
 
 
 @dataclass
@@ -33,7 +34,7 @@ class _Lane:
     pending: torch.Tensor                      # まだ系列にしていない byte (int16、CPU)
     lens: list[int] = field(default_factory=list)  # pending の先頭から並ぶ確定 patch の長さ
     open_len: int = 0                          # pending 末尾の未確定 patch の長さ
-    hist: torch.Tensor | None = None           # ByteLM の文脈
+    lm_state: Any = None                       # entropy_fn の流れの状態 (ByteLM は直前の窓の各層 K/V)
     tail_ids: torch.Tensor | None = None       # 未確定 patch と直前 _LOOKBACK byte
     tail_ent: torch.Tensor | None = None
     tail_rest: torch.Tensor | None = None
@@ -83,15 +84,11 @@ class PatchPacker:
         self.chunk_len = int(chunk_len)
         self.device = device
         self.entropy_fn: EntropyFn | None = None
-        self.ctx_len = 0
         if self.mode in ENTROPY_MODES:
-            lm = entropy_model
-            if lm is None:
+            if entropy_fn is None and entropy_model is None:
                 raise ValueError(f"patching_mode={self.mode} には entropy_model が必要")
-            # 窓ぶんの直前の byte を文脈にすれば流れ全体と同じエントロピーになる
-            self.ctx_len = int(lm.attention_window or 512)
-            self.entropy_fn = entropy_fn or _bytelm_entropy_fn(
-                lm, device, compute_dtype, use_autocast, compile_entropy,
+            self.entropy_fn = entropy_fn or ByteLMStream(
+                entropy_model, device, compute_dtype, use_autocast, compile_entropy,
             )
         self.lanes: dict[int, _Lane] = {}
         self.ready_queue: deque[int] = deque()
@@ -103,7 +100,7 @@ class PatchPacker:
         self.source = source
 
     def feed(self, batch: dict[str, Any]) -> None:
-        """chunk の batch を lane に足して区切る (ByteLM 1 回 + host 同期 1 回).
+        """chunk の batch を lane に足して区切る (host 同期 1 回).
 
         同じ source の chunk が batch に複数あれば、並び順に続けた 1 本として区切る。
         """
@@ -123,33 +120,25 @@ class PatchPacker:
             groups.setdefault(key, []).append(r)
             self.lanes.setdefault(key, _Lane(pending=torch.empty(0, dtype=torch.int16)))
 
-        c0 = self.ctx_len
-        x = torch.full((len(rows), c0 + self.chunk_len), self.pad, dtype=torch.long)
-        for key, members in groups.items():
-            hist = self.lanes[key].hist
-            hist = x.new_empty(0) if hist is None else hist
-            for r in members:
-                chunk = rows[r][1]
-                ctx = _last(hist, c0)
-                x[r, c0 - ctx.numel():c0] = ctx
-                x[r, c0:c0 + chunk.numel()] = chunk
-                hist = torch.cat((ctx, chunk))
+        x = torch.full((len(rows), self.chunk_len), self.pad, dtype=torch.long)
+        for r, (_, chunk) in enumerate(rows):
+            x[r, :chunk.numel()] = chunk
         x = x.to(self.device, non_blocking=True)
         ent = rest = None
         if self.entropy_fn is not None:
-            ent, rest = self.entropy_fn(x)
+            ent, rest = self._entropy(x, rows, groups)
 
         starts_dev, walked, seqs = [], [], []
         for key, members in groups.items():
             lane = self.lanes[key]
             tail = 0 if lane.tail_ids is None else lane.tail_ids.numel()
-            spans = [(r, c0 + rows[r][1].numel()) for r in members]
-            seq = torch.cat(([lane.tail_ids] if tail else []) + [x[r, c0:hi] for r, hi in spans])[None]
+            spans = [(r, rows[r][1].numel()) for r in members]
+            seq = torch.cat(([lane.tail_ids] if tail else []) + [x[r, :n] for r, n in spans])[None]
             seq_ent = seq_rest = None
             if ent is not None:
-                seq_ent = _cat_tail(lane.tail_ent, torch.cat([ent[r, c0:hi] for r, hi in spans])[None])
+                seq_ent = _cat_tail(lane.tail_ent, torch.cat([ent[r, :n] for r, n in spans])[None])
                 if rest is not None:
-                    seq_rest = _cat_tail(lane.tail_rest, torch.cat([rest[r, c0:hi] for r, hi in spans])[None])
+                    seq_rest = _cat_tail(lane.tail_rest, torch.cat([rest[r, :n] for r, n in spans])[None])
             raw, force, char_start = patch_candidates(
                 seq, self.mode, seq_ent, seq_rest, self.threshold, self.eos,
             )
@@ -174,9 +163,27 @@ class PatchPacker:
             lane.tail_rest = None if seq_rest is None else seq_rest[:, -keep:]
             new = torch.cat([rows[r][1] for r in members])
             lane.pending = torch.cat((lane.pending, new.to(torch.int16)))
-            hist = new if lane.hist is None else torch.cat((lane.hist, new))
-            lane.hist = _last(hist, c0)
             self._mark_ready(key)
+
+    def _entropy(
+        self, x: torch.Tensor, rows: list, groups: dict[int, list[int]],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """同じ lane の chunk は前の chunk の状態が要るので、lane ごとの k 番目の chunk をまとめて k 回に分ける."""
+        ent = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        rest = None
+        for wave in range(max(len(m) for m in groups.values())):
+            keys = [key for key, m in groups.items() if len(m) > wave]
+            idx = [groups[key][wave] for key in keys]
+            e, r, states = self.entropy_fn(
+                x[idx], [rows[i][1].numel() for i in idx], [self.lanes[key].lm_state for key in keys],
+            )
+            ent[idx] = e
+            if r is not None:
+                rest = torch.zeros_like(ent) if rest is None else rest
+                rest[idx] = r
+            for key, state in zip(keys, states):
+                self.lanes[key].lm_state = state
+        return ent, rest
 
     def flush(self) -> None:
         """流れの終わり: 未確定の最後の patch を確定させる (以後その lane に続きは来ない)."""
@@ -275,7 +282,7 @@ class PatchPacker:
             "lanes": {
                 key: {
                     "pending": lane.pending.clone(), "lens": list(lane.lens), "open_len": lane.open_len,
-                    "hist": cpu(lane.hist), "tail_ids": cpu(lane.tail_ids),
+                    "lm_state": _map_tensors(lane.lm_state, cpu), "tail_ids": cpu(lane.tail_ids),
                     "tail_ent": cpu(lane.tail_ent), "tail_rest": cpu(lane.tail_rest),
                 }
                 for key, lane in self.lanes.items()
@@ -290,7 +297,7 @@ class PatchPacker:
         self.lanes = {
             int(key): _Lane(
                 pending=s["pending"], lens=list(s["lens"]), open_len=int(s["open_len"]),
-                hist=s["hist"], tail_ids=dev(s["tail_ids"]),
+                lm_state=_map_tensors(s["lm_state"], dev), tail_ids=dev(s["tail_ids"]),
                 tail_ent=dev(s["tail_ent"]), tail_rest=dev(s["tail_rest"]),
             )
             for key, s in state["lanes"].items()
@@ -308,20 +315,44 @@ def _last(t: torch.Tensor, n: int) -> torch.Tensor:
     return t[max(t.numel() - n, 0):]
 
 
-def _bytelm_entropy_fn(
-    lm: torch.nn.Module, device: torch.device, compute_dtype: torch.dtype, use_autocast: bool,
-    compile_entropy: bool,
-) -> EntropyFn:
-    def score(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return lm.boundary_entropy(x)
+def _map_tensors(state: Any, fn: Callable[[torch.Tensor], Any]) -> Any:
+    if isinstance(state, torch.Tensor):
+        return fn(state)
+    if isinstance(state, (tuple, list)):
+        return type(state)(_map_tensors(v, fn) for v in state)
+    return state
 
-    if compile_entropy:
-        score = torch.compile(score, dynamic=False)
 
-    def run(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        amp = torch.autocast(device_type=device.type, dtype=compute_dtype) if use_autocast else nullcontext()
-        with torch.no_grad(), amp:
-            ent, rest = score(x)
-        return ent.float(), None if rest is None else rest.float()
+class ByteLMStream:
+    """lane ごとに ByteLM の直前 W 位置の各層 K/V (状態 = (K, V, 有効長)) を持ち、chunk をそれに続けて計算する."""
 
-    return run
+    def __init__(
+        self, lm: torch.nn.Module, device: torch.device, compute_dtype: torch.dtype,
+        use_autocast: bool, compile_entropy: bool,
+    ) -> None:
+        if lm.attention_window is None:
+            raise ValueError("ByteLM の attention_window が必要")
+        attn = lm.layers[0].attn
+        self.w = int(lm.attention_window)
+        self.ctx_shape = (len(lm.layers), attn.n_kv_heads, self.w, attn.head_dim)
+        self.device = device
+        self.amp = (lambda: torch.autocast(device_type=device.type, dtype=compute_dtype)) if use_autocast \
+            else nullcontext
+        self.dtype = compute_dtype if use_autocast else next(lm.parameters()).dtype
+        self.score = torch.compile(lm.boundary_entropy_stream, dynamic=False) if compile_entropy \
+            else lm.boundary_entropy_stream
+
+    def __call__(self, x: torch.Tensor, lengths: list[int], states: list) -> tuple:
+        empty = torch.zeros(self.ctx_shape, dtype=self.dtype, device=self.device)
+        k = torch.stack([empty if s is None else s[0] for s in states], dim=1)
+        v = torch.stack([empty if s is None else s[1] for s in states], dim=1)
+        n_valid = torch.tensor([0 if s is None else s[2] for s in states], device=self.device)
+        valid = torch.arange(self.w, device=self.device) >= (self.w - n_valid).unsqueeze(1)
+        with torch.no_grad(), self.amp():
+            ent, rest, k_new, v_new = self.score(x, k, v, valid)
+        new_states = []
+        for r, n in enumerate(lengths):
+            k_r = torch.cat((k[:, r], k_new[:, r, :, :n].to(self.dtype)), dim=2)[:, :, -self.w:].clone()
+            v_r = torch.cat((v[:, r], v_new[:, r, :, :n].to(self.dtype)), dim=2)[:, :, -self.w:].clone()
+            new_states.append((k_r, v_r, min((0 if states[r] is None else states[r][2]) + n, self.w)))
+        return ent.float(), None if rest is None else rest.float(), new_states

@@ -20,14 +20,19 @@ def _cfg(mode: str, **over) -> ArborConfig:
 
 
 def _fake_entropy(x: torch.Tensor):
-    """因果的で直前 2 byte だけで決まるエントロピー (文脈をつなげば流れ全体と一致する).
-
-    lane の先頭は文脈の代わりに PAD が並ぶので、PAD は流れの先頭の外 (0) と同じに扱う。
-    """
+    """因果的で直前の byte だけで決まるエントロピー."""
     xf = x.float()
     prev = torch.nn.functional.pad(xf[:, :-1], (1, 0))
-    prev = torch.where(prev == PAD, 0.0, prev)
     return ((xf * 7 + prev * 3) % 11) / 4, None
+
+
+def _fake_entropy_stream(x: torch.Tensor, lengths: list[int], states: list):
+    """_fake_entropy を、lane の状態 (直前の chunk の最後の byte) に続けて計算する."""
+    xf = x.float()
+    first = torch.tensor([0.0 if s is None else s for s in states], device=x.device)
+    prev = torch.cat((first[:, None], xf[:, :-1]), dim=1)
+    new = [float(xf[r, n - 1]) for r, n in enumerate(lengths)]
+    return ((xf * 7 + prev * 3) % 11) / 4, None, new
 
 
 def _stream(seed: int, reps: int = 20, text: str = "日本語のテキスト。 Hello world, this is a test. 漢字とかな😀 ") -> torch.Tensor:
@@ -89,7 +94,7 @@ def _want_labels(stream: torch.Tensor) -> torch.Tensor:
 
 
 def _packer(cfg: ArborConfig, device: str, chunk: int = 40, **kw) -> PatchPacker:
-    fn = _fake_entropy if cfg.patching_mode.startswith("entropy") else None
+    fn = _fake_entropy_stream if cfg.patching_mode.startswith("entropy") else None
     lm = ByteLM(dict(hidden_size=16, num_heads=2, num_kv_heads=2, intermediate_size=32,
                      num_hidden_layers=1, max_bytes=256))
     return PatchPacker(cfg, lm, chunk_len=chunk, device=torch.device(device), entropy_fn=fn,
@@ -191,20 +196,52 @@ def test_uncapped_patch_is_cut_by_max_bytes():
     assert max(lens) == 96
 
 
-def test_bytelm_context_makes_entropy_match_whole_stream():
-    """窓付き ByteLM は直前の窓ぶんの byte を文脈にすれば、chunk ごとでも流れ全体と同じ区切り."""
+@pytest.mark.parametrize("chunk", [64, 128])
+@pytest.mark.parametrize("device", DEVICES)
+def test_bytelm_stream_matches_whole_stream(chunk, device):
+    """多層の窓付き ByteLM の各層 K/V を lane に持てば、chunk ごとでも流れ全体と同じ区切り."""
     torch.manual_seed(0)
-    lm = ByteLM(dict(hidden_size=32, num_heads=2, num_kv_heads=2, intermediate_size=64,
-                     num_hidden_layers=1, max_bytes=2048, attention_window=16)).eval()
-    cfg = _cfg("entropy_char", entropy_threshold=0.05)
+    lm = ByteLM(dict(hidden_size=32, num_heads=4, num_kv_heads=2, intermediate_size=64,
+                     num_hidden_layers=3, max_bytes=4096, attention_window=16)).to(device).eval()
+    torch.nn.init.normal_(lm.head.weight, std=0.5)
     stream = _stream(6)
-    packer = PatchPacker(cfg, lm, chunk_len=64, device=torch.device("cpu"), use_autocast=False)
-    out = _run(packer, _batches({0: stream}, 64, 2, [0] * 100))
-    starts = torch.cat([r[1] for r in _split_rows(out)])
     with torch.no_grad():
-        ent, _ = lm.boundary_entropy(stream[None])
+        ent, _ = lm.boundary_entropy(stream[None].to(device))
+    vals = ent.flatten().sort().values
+    lo_i = len(vals) // 3
+    i = lo_i + int(vals[lo_i:2 * lo_i].diff().argmax())
+    threshold = float(vals[i] + vals[i + 1]) / 2  # 丸め誤差で区切りが揺れない値の隙間
+    cfg = _cfg("entropy", entropy_threshold=threshold)
+    packer = PatchPacker(cfg, lm, chunk_len=chunk, device=torch.device(device), use_autocast=False)
+    out = _run(packer, _batches({0: stream}, chunk, 2, [0] * 100))
+    starts = torch.cat([r[1] for r in _split_rows(out)])
     lo, hi = patch_len_bounds(cfg)
-    want = compute_patch_starts(stream[None], "entropy_char", lo, hi, entropy_values=ent,
-                                threshold=0.05, eos_token_id=EOS)[0]
-    assert int(want.sum()) > len(stream) // 8  # 閾値が実際に効く状態で比べる
+    want = compute_patch_starts(stream[None].to(device), "entropy", lo, hi, entropy_values=ent,
+                                threshold=threshold, eos_token_id=EOS)[0].cpu()
     assert torch.equal(starts, want)
+
+
+def test_resume_with_bytelm_state_is_exact():
+    torch.manual_seed(1)
+    lm = ByteLM(dict(hidden_size=32, num_heads=4, num_kv_heads=2, intermediate_size=64,
+                     num_hidden_layers=2, max_bytes=4096, attention_window=16)).eval()
+    torch.nn.init.normal_(lm.head.weight, std=0.5)
+    cfg = _cfg("entropy", entropy_threshold=4.0)
+    streams = {0: _stream(4), 1: _stream(5, reps=9)}
+    batches = list(_batches(streams, 64, 2, [0, 1, 0, 0, 1] * 40))
+
+    def packer():
+        return PatchPacker(cfg, lm, chunk_len=64, device=torch.device("cpu"), use_autocast=False)
+
+    want = _run(packer(), batches)
+    first = packer()
+    first.set_source(iter(batches[:7]))
+    head = [first.next_batch(2) for _ in range(3)]
+    consumed = 7 - sum(1 for _ in first.source)
+    resumed = packer()
+    resumed.load_state_dict(first.state_dict())
+    got = head + _run(resumed, batches[consumed:])
+    assert len(got) == len(want)
+    for a, b in zip(got, want):
+        for k in a:
+            assert torch.equal(a[k], b[k]), k

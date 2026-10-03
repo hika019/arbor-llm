@@ -69,16 +69,17 @@ class WindowMask:
 def _windowed_sdpa(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wm: WindowMask
 ) -> torch.Tensor:
-    """q/k/v: (B, H, T, d), T = n * chunk。戻り値も (B, H, T, d)。"""
+    """q: (B, H, T, d), T = n * chunk。k/v は (B, H, T, d) か、左に w 位置の文脈を足した (B, H, w + T, d)."""
     b, h, t, d = q.shape
     c, w = wm.chunk, wm.w
     right = 0 if wm.causal else w
+    left = w - (k.size(2) - t)
     n = t // c
     win = c + w + right
     qc = q.view(b, h, n, c, d).permute(0, 2, 1, 3, 4).reshape(b * n, h, c, d)
     # kv は左 w (causal でなければ右も w) を pad してから chunk 幅 c でスライドして窓を切り出す
-    kw = F.pad(k, (0, 0, w, right)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
-    vw = F.pad(v, (0, 0, w, right)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
+    kw = F.pad(k, (0, 0, left, right)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
+    vw = F.pad(v, (0, 0, left, right)).unfold(2, win, c).permute(0, 2, 1, 4, 3).reshape(b * n, h, win, d)
     out = F.scaled_dot_product_attention(qc, kw, vw, attn_mask=wm.mask.reshape(b * n, 1, c, win))
     return out.view(b, n, h, c, d).permute(0, 2, 1, 3, 4).reshape(b, h, t, d)
 
@@ -349,6 +350,40 @@ class Attention(nn.Module):
         if self.attn_sub_norm is not None:
             out = self.attn_sub_norm(out)
         return self.wo(out)
+
+
+    def forward_stream(
+        self, x: torch.Tensor, k_ctx: torch.Tensor, v_ctx: torch.Tensor, attn_mask,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """x (B, T, dim) を、直前 W 位置の K/V (RoPE 前、(B, Hkv, W, hd)) に続けて attend する.
+
+        戻り値は (出力, x の K, x の V)。K/V は RoPE 前。
+        """
+        b, t, _ = x.shape
+        w = k_ctx.size(2)
+        q = self.wq(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        k_new = self.wk(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v_new = self.wv(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        k = torch.cat((k_ctx.to(k_new.dtype), k_new), dim=2)
+        v = torch.cat((v_ctx.to(v_new.dtype), v_new), dim=2)
+        cos, sin = self.rope.cos[:w + t].to(q.dtype), self.rope.sin[:w + t].to(q.dtype)
+        q, k = _apply_rope(q, cos[w:], sin[w:]), _apply_rope(k, cos, sin)
+        n_rep = self.n_heads // self.n_kv_heads
+        if _is_block_mask(attn_mask):
+            from torch.nn.attention.flex_attention import flex_attention
+
+            out = flex_attention(q, k, v, block_mask=attn_mask, enable_gqa=n_rep > 1)
+        else:
+            if n_rep > 1:
+                k, v = k.repeat_interleave(n_rep, dim=1), v.repeat_interleave(n_rep, dim=1)
+            if isinstance(attn_mask, WindowMask):
+                out = _windowed_sdpa(q, k, v, attn_mask)
+            else:
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(b, t, -1)
+        if self.attn_sub_norm is not None:
+            out = self.attn_sub_norm(out)
+        return self.wo(out), k_new, v_new
 
 
 class FeedForward(nn.Module):
@@ -881,6 +916,60 @@ class ByteLM(nn.Module):
         q = torch.arange(t, device=input_ids.device).unsqueeze(1)
         k = torch.arange(t, device=input_ids.device).unsqueeze(0)
         return ((k <= q) & (q - k < w)).view(1, 1, t, t)
+
+    def _stream_mask(self, ctx_valid: torch.Tensor, t: int):
+        """chunk (長さ t) の query と、直前 W 位置 (有効は ctx_valid (B, W)) + chunk の key の窓付き causal マスク."""
+        b, w = ctx_valid.shape
+        win = int(self.attention_window)
+        dev = ctx_valid.device
+        if ctx_valid.is_cuda and torch.compiler.is_compiling():
+            from torch.nn.attention.flex_attention import create_block_mask
+
+            def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+                kv_pos = kv_idx - w
+                valid = (kv_idx >= w) | ctx_valid[b_idx, torch.clamp(kv_idx, max=w - 1)]
+                return (kv_pos <= q_idx) & (q_idx - kv_pos < win) & valid
+
+            return create_block_mask(mask_mod, B=b, H=None, Q_LEN=t, KV_LEN=w + t, device=dev)
+        c = _WINDOW_CHUNK
+        if w == win and t % c == 0:
+            ar_q = torch.arange(c, device=dev).view(1, 1, c, 1)
+            ar_k = torch.arange(c + w, device=dev).view(1, 1, 1, c + w)
+            chunk_start = (torch.arange(t // c, device=dev) * c).view(1, -1, 1, 1)
+            q_pos, k_pos = chunk_start + ar_q, chunk_start - w + ar_k
+            ctx_ok = ctx_valid[:, (w + k_pos).clamp(0, w - 1).flatten()].view(b, -1, 1, c + w)
+            mask = ((k_pos >= 0) | ctx_ok) & (k_pos <= q_pos) & (q_pos - k_pos < win)
+            return WindowMask(mask, c, w, causal=True)
+        q_pos = torch.arange(t, device=dev).view(1, t, 1)
+        k_pos = torch.arange(w + t, device=dev).view(1, 1, w + t) - w
+        ok = torch.cat((ctx_valid, torch.ones(b, t, dtype=torch.bool, device=dev)), dim=1).unsqueeze(1)
+        return ((k_pos <= q_pos) & (q_pos - k_pos < win) & ok).unsqueeze(1)
+
+    @torch.no_grad()
+    def boundary_entropy_stream(
+        self, input_ids: torch.Tensor, k_ctx: torch.Tensor, v_ctx: torch.Tensor, ctx_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        """boundary_entropy を、直前 W 位置の各層 K/V (RoPE 前、(L, B, Hkv, W, hd)) に続けて計算する.
+
+        流れ全体を一度に通したのと同じ値になる。後ろの 2 つは input_ids の各層 K/V (L, B, Hkv, T, hd)。
+        """
+        if self.attention_window is None:
+            raise ValueError("boundary_entropy_stream は attention_window が必要")
+        x = self.embed(input_ids)
+        if torch.is_autocast_enabled(x.device.type):
+            x = x.to(torch.get_autocast_dtype(x.device.type))
+        mask = self._stream_mask(ctx_valid, input_ids.size(1))
+        ks, vs = [], []
+        for i, layer in enumerate(self.layers):
+            h, k, v = layer.attn.forward_stream(layer.attn_norm(x), k_ctx[i], v_ctx[i], mask)
+            x = x + h
+            x = x + layer.ffn(layer.ffn_norm(x))
+            ks.append(k)
+            vs.append(v)
+        x = self.norm(x)
+        logp = F.log_softmax(self.head(x).float(), dim=-1)
+        ent = -(logp.exp() * logp).sum(-1)
+        return ent, self.char_rest_from_hidden(x), torch.stack(ks), torch.stack(vs)
 
     @torch.no_grad()
     def next_byte_entropy(self, input_ids: torch.Tensor) -> torch.Tensor:

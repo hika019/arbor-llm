@@ -1749,7 +1749,7 @@ def main() -> int:
         print(
             f"[train] patch_packer=ON seq_patches={base_model.cfg.seq_patches} "
             f"max_bytes={base_model.cfg.max_bytes} chunk={data_cfg['context_length']} "
-            f"bytelm_context={packer.ctx_len if packer.entropy_fn is not None else 0}"
+            f"bytelm_stream={packer.entropy_fn is not None}"
         )
 
     # ---- 学習ループ ----

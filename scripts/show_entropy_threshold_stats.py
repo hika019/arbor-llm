@@ -79,12 +79,13 @@ class CachedEntropy:
     def rewind(self) -> None:
         self.calls = 0
 
-    def __call__(self, x: torch.Tensor):
-        if self.calls == len(self.cache):
-            self.cache.append(self.fn(x))
-        out = self.cache[self.calls]
+    def __call__(self, x: torch.Tensor, lengths: list, states: list):
         self.calls += 1
-        return out
+        if self.calls > len(self.cache):
+            ent, rest, new_states = self.fn(x, lengths, states)
+            self.cache.append((ent, rest))
+            return ent, rest, new_states
+        return (*self.cache[self.calls - 1], [None] * len(states))
 
 
 def pack_rows(packer, batches: list[dict], rows: int) -> list[dict]:
