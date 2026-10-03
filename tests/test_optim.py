@@ -684,3 +684,24 @@ def test_scheduler_wsd_validation():
                               "decay_end_ratio": 0.8})
     with pytest.raises(ValueError, match="decay_shape"):
         build_scheduler(opt, {"scheduler": "wsd", "total_steps": 100, "decay_shape": "exp"})
+
+
+def test_wsd_decay_and_weight_decay_follow_byte_progress():
+    import io
+
+    consumed = {"bytes": 0}
+    p = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.SGD([p], lr=1.0, weight_decay=0.1)
+    cfg = {"scheduler": "wsd", "warmup_steps": 2, "decay_start_ratio": 0.5, "decay_end_ratio": 1.0,
+           "min_lr_ratio": 0.0, "decay_shape": "linear", "weight_decay": 0.1, "weight_decay_decay_phase": 0.0}
+    sched = build_scheduler(opt, cfg, progress=lambda step: min(1.0, consumed["bytes"] / 100))
+    seen = []
+    for b in (10, 10, 20, 20, 20, 20):
+        opt.step()
+        consumed["bytes"] += b
+        sched.step()
+        seen.append((consumed["bytes"], opt.param_groups[0]["lr"], opt.param_groups[0]["weight_decay"]))
+    assert seen[2] == (40, 1.0, 0.1)
+    assert seen[3][0] == 60 and seen[3][1] == pytest.approx(0.8) and seen[3][2] == 0.0
+    assert seen[5][0] == 100 and seen[5][1] == pytest.approx(0.0)
+    torch.save(sched.state_dict(), io.BytesIO())

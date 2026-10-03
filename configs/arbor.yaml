@@ -173,8 +173,7 @@ optim:
   weight_decay_decay_phase: 0.0 # wsd: decay 区間の weight decay (BitNet 公式は 0)
   min_lr_ratio: 0.02            # lr 下限 = ピークの 2% (0 で従来の完全減衰)
   warmup_steps: 1000
-  total_steps: 230000           # grad_accum_steps の schedule 込みで 105GB (= 旧 200k step × 524k bytes)。
-                                # 延長するなら decay 開始 (step ~194k) より前に増やす
+  total_bytes: 105000000000     # 消費 byte 数で LR の進行と終了を決める。延長は decay 開始 (84GB) より前に
 
 # ---- スループット ----
 speed:

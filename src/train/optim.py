@@ -797,13 +797,7 @@ def build_optimizer(
 
 
 class WeightDecaySwitchLR(torch.optim.lr_scheduler.LambdaLR):
-    """LambdaLR + 指定 step 以降で weight decay を切り替える scheduler.
-
-    WSD の decay 区間で WD を 0 にする (BitNet b1.58 公式レシピの後半 WD=0 に対応) ために
-    使う。LambdaLR を継承するので base_lrs / lr_lambdas / state_dict / get_last_lr /
-    rebase_scheduler_lr との互換をそのまま保つ。WD は last_epoch (= step) から毎 step
-    再計算して optimizer.param_groups へ書き戻す (state を増やさない)。
-    """
+    """LambdaLR + in_decay(step) が真の step から weight decay を切り替える scheduler (WSD の decay 区間で WD=0)."""
 
     def __init__(
         self,
@@ -812,19 +806,21 @@ class WeightDecaySwitchLR(torch.optim.lr_scheduler.LambdaLR):
         *,
         wd_before: float,
         wd_after: float,
-        switch_step: int,
+        in_decay: Callable[[int], bool],
     ) -> None:
         self._wd_before = float(wd_before)
         self._wd_after = float(wd_after)
-        self._switch_step = int(switch_step)
+        self._in_decay = in_decay
         super().__init__(optimizer, lr_lambda)
         self._apply_weight_decay()
 
-    def _current_weight_decay(self) -> float:
-        return self._wd_after if self.last_epoch >= self._switch_step else self._wd_before
+    def state_dict(self) -> dict:
+        state = super().state_dict()
+        state.pop("_in_decay", None)
+        return state
 
     def _apply_weight_decay(self) -> None:
-        wd = self._current_weight_decay()
+        wd = self._wd_after if self._in_decay(self.last_epoch) else self._wd_before
         for group in self.optimizer.param_groups:
             group["weight_decay"] = wd
 
@@ -836,21 +832,16 @@ class WeightDecaySwitchLR(torch.optim.lr_scheduler.LambdaLR):
 _WSD_DECAY_SHAPES = ("inv_sqrt", "linear", "cosine")
 
 
-def _scheduler_common(cfg: dict) -> tuple[int, int, float, float]:
-    """warmup / total / min_lr_ratio / decay_end_ratio を検証して返す."""
+def _scheduler_common(cfg: dict) -> tuple[int, float, float]:
+    """warmup / min_lr_ratio / decay_end_ratio を検証して返す."""
     warmup = cfg.get("warmup_steps", 0)
-    total = cfg["total_steps"]
-    # 最終 step での lr 下限 (ピーク lr に対する比率)。0 で従来どおり 0 まで減衰。
-    # 下限を残すと total_steps を増やした resume での加学習が素直に効く。
     min_ratio = float(cfg.get("min_lr_ratio", 0.0))
     if not 0.0 <= min_ratio < 1.0:
         raise ValueError(f"min_lr_ratio は [0, 1) で指定: {min_ratio}")
-    # cosine 減衰を total_steps のどの時点で終えるか (比率)。0.8 なら総 step の
-    # 80% で min_lr に到達し、残り 20% は min_lr で一定 (終盤の lr を低く保つ)。
     decay_end_ratio = float(cfg.get("decay_end_ratio", 1.0))
     if not 0.0 < decay_end_ratio <= 1.0:
         raise ValueError(f"decay_end_ratio は (0, 1] で指定: {decay_end_ratio}")
-    return warmup, total, min_ratio, decay_end_ratio
+    return warmup, min_ratio, decay_end_ratio
 
 
 def build_scheduler(
@@ -859,48 +850,30 @@ def build_scheduler(
     lr_scale: Callable[[int], float] = lambda step: 1.0,
     progress: Callable[[int], float] | None = None,
 ):
-    """lr_scale(step) は lr_lambda に乗算する係数 (batch size warmup の √(accum/final))。
-    progress(step) は学習の進行 [0,1] (消費 bytes 割合。省略時は step/total)。cosine /
-    decay_start_ratio / decay_end_ratio はこの進行で測るので、accum が変わる run でも
-    固定 accum と「同じ bytes で同じ lr」になる。warmup は step。LambdaLR の base_lrs /
-    state_dict / rebase_scheduler_lr との互換はそのまま。"""
+    """lr_scale(step) は batch size warmup の係数。progress(step) は学習の進行 [0, 1]
+    (省略時は step / total_steps)。warmup は step、cosine と decay 区間は進行で測る."""
     name = cfg.get("scheduler", "cosine_warmup")
-    warmup, total, min_ratio, decay_end_ratio = _scheduler_common(cfg)
+    warmup, min_ratio, decay_end_ratio = _scheduler_common(cfg)
     if progress is None:
+        total = int(cfg["total_steps"])
         progress = lambda step: min(1.0, step / total)  # noqa: E731
-
-    def step_at(ratio: float, after: int) -> int:
-        """進行が ratio に最初に達する step (after より後)。"""
-        return next((k for k in range(after + 1, total + 1) if progress(k) >= ratio), total)
-
-    def segment(step: int, start: int, end: int) -> float:
-        """[start, end] 区間内の進行 [0,1] (進行の差で測る)。"""
-        f0, f1 = progress(start), progress(end)
-        return min(1.0, max(0.0, (progress(step) - f0) / max(1e-9, f1 - f0)))
 
     def cosine(p: float, hi: float, lo: float) -> float:
         return lo + (hi - lo) * 0.5 * (1.0 + math.cos(math.pi * p))
 
     if name == "cosine_warmup":
-        decay_end = step_at(decay_end_ratio, warmup)
+        p0 = progress(warmup)
 
         def lr_lambda(step: int) -> float:
             if step < warmup:
                 return step / max(1, warmup)
-            return cosine(segment(step, warmup, decay_end), 1.0, min_ratio)
+            p = (progress(step) - p0) / max(1e-9, decay_end_ratio - p0)
+            return cosine(min(1.0, max(0.0, p)), 1.0, min_ratio)
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_lambda(step) * lr_scale(step))
 
     if name == "wsd":
-        # Warmup-Stable-Decay (MiniCPM / Hägele+ 2024 "Scaling Laws and Compute-Optimal
-        # Training Beyond Fixed Training Durations")。warmup 後は decay_start_ratio まで
-        # ピーク lr で一定 (stable)、そこから decay_end_ratio まで min_lr_ratio へ decay、
-        # 以後は下限で一定。stable 区間は lr が定数なので total_steps を増やしても過去の
-        # lr 履歴と矛盾せず、run を後から延長できる (cosine では不可)。
-        # stable 区間の任意 checkpoint から短い decay を枝分かれさせて「今止めたらどれ
-        # くらいか」を測ることもできる (効率化メモ §3 の anneal ×N)。
-        # weight decay は stable 区間 weight_decay、decay 区間 weight_decay_decay_phase
-        # (BitNet 公式の後半 WD=0 に対応)。
+        # Warmup-Stable-Decay (MiniCPM / Hägele+ 2024)。stable 区間は lr が一定なので後から延長できる
         decay_start_ratio = float(cfg.get("decay_start_ratio", 0.8))
         if not 0.0 < decay_start_ratio < decay_end_ratio:
             raise ValueError(
@@ -916,28 +889,28 @@ def build_scheduler(
         wd_decay = float(cfg.get("weight_decay_decay_phase", 0.0))
         if wd_decay < 0:
             raise ValueError(f"weight_decay_decay_phase は非負で指定: {wd_decay}")
-        ds = step_at(decay_start_ratio, warmup)
-        decay_end = step_at(decay_end_ratio, ds)
 
         def decay(p: float) -> float:
             if decay_shape == "inv_sqrt":
-                # 1-sqrt: 序盤に速く落として終盤を長く低 lr で回す。Hägele+ 2024 が
-                # cosine / linear より僅かに良いと報告した形。
                 return min_ratio + (1.0 - min_ratio) * (1.0 - math.sqrt(p))
             if decay_shape == "linear":
                 return min_ratio + (1.0 - min_ratio) * (1.0 - p)
             return cosine(p, 1.0, min_ratio)
 
+        def in_decay(step: int) -> bool:
+            return step >= warmup and progress(step) >= decay_start_ratio
+
         def lr_lambda(step: int) -> float:
             if step < warmup:
                 return step / max(1, warmup)
-            if step < ds:
+            p = progress(step)
+            if p < decay_start_ratio:
                 return 1.0
-            return decay(segment(step, ds, decay_end))
+            return decay(min(1.0, (p - decay_start_ratio) / (decay_end_ratio - decay_start_ratio)))
 
         return WeightDecaySwitchLR(
             optimizer, lambda step: lr_lambda(step) * lr_scale(step),
-            wd_before=wd_stable, wd_after=wd_decay, switch_step=ds,
+            wd_before=wd_stable, wd_after=wd_decay, in_decay=in_decay,
         )
 
     raise ValueError(f"unknown scheduler: {name}")

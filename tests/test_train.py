@@ -1103,3 +1103,46 @@ def test_resolve_param_dtype():
         resolve_param_dtype("bf16", torch.float32)                          # 計算より低精度は不可
     with pytest.raises(ValueError):
         resolve_param_dtype("int8", torch.bfloat16)
+
+
+def test_training_length_requires_exactly_one_of_bytes_or_steps():
+    from src.train.train import training_length
+
+    assert training_length({"total_bytes": 1000}) == (1000, None)
+    assert training_length({"total_steps": 10}) == (None, 10)
+    for bad in ({}, {"total_bytes": 1, "total_steps": 1}):
+        with pytest.raises(ValueError, match="どちらか一方"):
+            training_length(bad)
+
+
+@pytest.mark.parametrize("max_norm", [None, 0.05])
+def test_microbatches_with_different_valid_labels_match_one_batch(max_norm):
+    """固定分母の backward + 有効 label 数の補正 = 全 byte を等重みにした 1 batch の勾配 (clip 込み)."""
+    from src.train.train import scale_and_clip_grads_
+
+    torch.manual_seed(0)
+    head = torch.nn.Linear(8, 5)
+    x = torch.randn(3, 6, 8)
+    labels = torch.randint(0, 5, (3, 6))
+    labels[0, 1:] = -100   # micro 0 は有効 1 個、micro 2 は 6 個
+    labels[1, 3:] = -100
+
+    ref = torch.nn.functional.cross_entropy(head(x).flatten(0, 1), labels.flatten(), ignore_index=-100)
+    ref_grads = torch.autograd.grad(ref, list(head.parameters()))
+    if max_norm:
+        norm = torch.linalg.vector_norm(torch.stack([g.norm() for g in ref_grads]))
+        ref_grads = [g * min(1.0, max_norm / (float(norm) + 1e-6)) for g in ref_grads]
+
+    head.zero_grad()
+    grad_accum = labels.size(0)
+    valid = None
+    for m in range(grad_accum):
+        loss = torch.nn.functional.cross_entropy(
+            head(x[m]), labels[m], ignore_index=-100, reduction="sum",
+        ) / (grad_accum * labels[m].numel())
+        loss.backward()
+        n = (labels[m] != -100).sum()
+        valid = n if valid is None else valid + n
+    scale_and_clip_grads_(head.parameters(), grad_accum * labels[0].numel() / valid.float(), max_norm)
+    for p, want in zip(head.parameters(), ref_grads):
+        assert torch.allclose(p.grad, want, atol=1e-6)

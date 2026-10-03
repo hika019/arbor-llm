@@ -194,7 +194,7 @@ def main() -> None:
         from src.train.optim import build_optimizer, build_scheduler
 
         opt = build_optimizer(model.parameters(), cfg["optim"], model=model)
-        scheduler = build_scheduler(opt, cfg["optim"])
+        scheduler = build_scheduler(opt, cfg["optim"], progress=lambda step: 0.0)
         print(
             f"[bench] optimizer=config:{type(opt).__name__} "
             f"scheduler={type(scheduler).__name__}"

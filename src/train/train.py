@@ -389,6 +389,26 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def scale_and_clip_grads_(params, scale: torch.Tensor, max_norm: float | None) -> None:
+    """勾配を scale 倍してから max_norm で clip する (乗算は 1 回)."""
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return
+    coef = scale
+    if max_norm:
+        norm = torch.nn.utils.get_total_norm(grads) * scale
+        coef = scale * (max_norm / (norm + 1e-6)).clamp(max=1.0)
+    torch._foreach_mul_(grads, coef.to(grads[0].device))
+
+
+def training_length(optim_cfg: dict) -> tuple[int | None, int | None]:
+    """(total_bytes, total_steps)。どちらか一方だけを指定する (total_bytes は実際に消費した byte 数)."""
+    total_bytes, total_steps = optim_cfg.get("total_bytes"), optim_cfg.get("total_steps")
+    if (total_bytes is None) == (total_steps is None):
+        raise ValueError("optim.total_bytes と optim.total_steps はどちらか一方だけ指定する")
+    return (int(total_bytes), None) if total_bytes is not None else (None, int(total_steps))
+
+
 def load_config(path: Path) -> dict:
     with path.open() as f:
         return yaml.safe_load(f)
@@ -1572,12 +1592,13 @@ def main() -> int:
     timing_mark("optimizer_created", device)
     # batch size warmup: accum が定常値未満の区間は lr を √(accum/final) 倍する
     accum_schedule = GradAccumSchedule.from_speed_cfg(cfg["speed"])
-    # lr schedule の進行は消費 bytes 割合 (accum が変わっても固定 accum と同じ bytes で同じ lr)
+    total_bytes, total_steps = training_length(cfg["optim"])
+    consumed = {"bytes": 0}
     scheduler = build_scheduler(
         optimizer,
         cfg["optim"],
         lr_scale=accum_schedule.lr_scale_at,
-        progress=accum_schedule.bytes_fraction_fn(int(cfg["optim"]["total_steps"])),
+        progress=(lambda step: min(1.0, consumed["bytes"] / total_bytes)) if total_bytes else None,
     )
     timing_mark("scheduler_created", device)
 
@@ -1675,6 +1696,10 @@ def main() -> int:
                 print(f"[train] bitnet_weight_cache refreshed after resume layers={refreshed}")
         global_step = meta.global_step
         best_loss = meta.best_loss
+        if total_bytes:
+            if "consumed_bytes" not in meta.extra:
+                raise SystemExit("[train] ERROR: checkpoint に consumed_bytes が無く optim.total_bytes の進行を復元できない")
+            consumed["bytes"] = int(meta.extra["consumed_bytes"])
         pending_prefetch_batch = None
         pending_cpu_batches = None
         pending_packer_state = None
@@ -1751,7 +1776,6 @@ def main() -> int:
         cpu_prefetch_depth = 0
     log_every = cfg["logging"].get("log_every_steps", 20)
     byte_kind_metrics = bool(cfg["logging"].get("byte_kind_metrics", False))
-    total_steps = cfg["optim"]["total_steps"]
     if benchmark_mode:
         total_steps = global_step + int(args.benchmark_steps)
         print(
@@ -1906,6 +1930,7 @@ def main() -> int:
             ),
             "validation": validation_results,
             "validation_status": validation_status,
+            "consumed_bytes": consumed["bytes"],
         }
         if packed_tune_payload is not None:
             extra["packed_ternary_tuning"] = packed_tune_payload
@@ -2107,7 +2132,12 @@ def main() -> int:
     first_step_in_process = True
     first_step_t0 = time.perf_counter()
     data_iter = make_data_iter()
-    while global_step < total_steps:
+    def training_done() -> bool:
+        if total_steps is not None:
+            return global_step >= total_steps
+        return consumed["bytes"] >= total_bytes
+
+    while not training_done():
         try:
             if (
                 nsys_wait is not None
@@ -2148,6 +2178,9 @@ def main() -> int:
             step_t0 = time.perf_counter()
             bytes_this_step = 0
             grad_accum = accum_schedule.accum_at(global_step)
+            # 固定の分母で backward し、optimizer の前に有効 label 数で補正する (全 byte を等重みに)
+            loss_denom = 0
+            valid_labels = None
             for micro in range(grad_accum):
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_next_batch", device)
@@ -2222,9 +2255,7 @@ def main() -> int:
                         # flat_losses[valid].mean() は boolean インデックスで
                         # device→host 同期するため、マスク乗算 + sum で同値を取る
                         valid_f = (labels.flatten() != -100).to(flat_losses.dtype)
-                        loss = (flat_losses * valid_f).sum() / (
-                            valid_f.sum().clamp_min(1.0) * grad_accum
-                        )
+                        loss = (flat_losses * valid_f).sum() / (grad_accum * labels.numel())
                         stats = byte_kind_loss_stats(flat_losses, labels, cpu=False)
                         for key, value in stats.items():
                             if not torch.is_tensor(value):
@@ -2232,8 +2263,11 @@ def main() -> int:
                             interval_byte_kind[key] = interval_byte_kind.get(key, value.new_zeros(())) + value
                     else:
                         loss = torch.nn.functional.cross_entropy(
-                            out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100
-                        ) / grad_accum
+                            out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100, reduction="sum",
+                        ) / (grad_accum * labels.numel())
+                loss_denom = grad_accum * labels.numel()
+                n_valid = (labels != -100).sum()
+                valid_labels = n_valid if valid_labels is None else valid_labels + n_valid
                 if global_step == 0:
                     timing_mark(f"step0_micro{micro}_before_backward", device)
                 bwd_start = start_gpu_section("backward")
@@ -2259,10 +2293,10 @@ def main() -> int:
                     )
                     stop_notice_printed = True
 
-            if cfg["optim"].get("grad_clip"):
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), cfg["optim"]["grad_clip"]
-                )
+            grad_scale = loss_denom / valid_labels.clamp_min(1).float()
+            accum_loss_tensor = accum_loss_tensor * grad_scale
+            scale_and_clip_grads_(model.parameters(), grad_scale, cfg["optim"].get("grad_clip"))
+            consumed["bytes"] += bytes_this_step
             if fused_grad_accum:
                 verify_fused_grad_accum_buffers(base_model)
             opt_start = start_gpu_section("optimizer")
@@ -2300,7 +2334,7 @@ def main() -> int:
             if first_step_in_process:
                 first_step_in_process = False
                 print(f"[train] 初回 step 完了 ({time.perf_counter() - first_step_t0:.1f}s)。"
-                      f"次のログは step={min((global_step // log_every + 1) * log_every, total_steps)}",
+                      f"次のログは step={(global_step // log_every + 1) * log_every}",
                       flush=True)
             if device.type == "cuda" and sync_each_step:
                 torch.cuda.synchronize()
@@ -2371,9 +2405,9 @@ def main() -> int:
             should_save = not benchmark_mode and (
                 global_step % save_every == 0
                 or stop_now
-                or global_step >= total_steps
+                or training_done()
             )
-            benchmark_done = benchmark_mode and global_step >= total_steps
+            benchmark_done = benchmark_mode and training_done()
             need_loss_scalar = (
                 global_step % log_every == 0
                 or should_save
@@ -2557,7 +2591,7 @@ def main() -> int:
                     recovery_meta,
                     config=effective_cfg,
                     is_best=is_best,
-                    is_final=global_step >= total_steps,
+                    is_final=training_done(),
                     force_sync=stop_save,
                 )
                 ckpt.wait_for_pending_save()
