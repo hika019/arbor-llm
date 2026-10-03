@@ -25,6 +25,7 @@ __pycache__/
 /data/*
 !/data/probes/
 !/data/probes/tiny_ja.txt
+!/data/eval_split/
 *.safetensors
 *.pt
 *.bin

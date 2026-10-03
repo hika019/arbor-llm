@@ -21,6 +21,7 @@ from typing import Any, Iterator
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
+from src.data.eval_split import doc_hash
 from src.data.text_filter import evaluate_text_filter
 from src.data.text_filter import resolve_text_filter_config
 
@@ -129,7 +130,8 @@ class ByteStreamDataset(IterableDataset):
                  revision: str | None = None,
                  sft_loss_on: str = "completion",
                  sft_add_eos: bool = True,
-                 contiguous: bool = False) -> None:
+                 contiguous: bool = False,
+                 exclude_doc_hashes: frozenset[bytes] | None = None) -> None:
         """byte_offset: バイト値 b を token id (b + offset) に写す.
 
         BLT は 0..3 を BOE/BOS/EOS/BPE の特殊 ID として使い, 生バイトは
@@ -170,6 +172,8 @@ class ByteStreamDataset(IterableDataset):
         if contiguous and packing != "document":
             raise ValueError("contiguous は packing=document 専用")
         self.contiguous = bool(contiguous)
+        # 評価文書の内容ハッシュ (src/data/eval_split.py)。一致する文書は読まない
+        self.exclude_doc_hashes = exclude_doc_hashes or frozenset()
         # True なら各 source の準備 (shard 取得 + shuffle buffer 充填) の開始/完了を print
         self.verbose = False
         # 複数 source の open と初回充填 (shuffle buffer) を並列化する
@@ -578,6 +582,7 @@ class ByteStreamDataset(IterableDataset):
                 "emitted_source_bytes": emitted_source_bytes,
                 "emitted_source_docs": emitted_source_docs,
                 "source_epochs": source_epochs,
+                "eval_excluded_docs": dict(self._state.extra.get("eval_excluded_docs", {})),
             }
             self._state.extra["source_stats"] = stats
             self._state.extra["emitted_source_bytes"] = emitted_source_bytes
@@ -673,6 +678,11 @@ class ByteStreamDataset(IterableDataset):
                         continue
                 text = row.get("text")
                 if not text:
+                    continue
+                if self.exclude_doc_hashes and doc_hash(text) in self.exclude_doc_hashes:
+                    excluded = self._state.extra.setdefault("eval_excluded_docs", {})
+                    key = specs[source_idx].get("id") or str(source_idx)
+                    excluded[key] = excluded.get(key, 0) + 1
                     continue
                 if text_filter is not None:
                     decision = evaluate_text_filter(text, text_filter)
@@ -827,7 +837,9 @@ class _ResumableLoader(DataLoader):
         return dict(stats) if isinstance(stats, dict) else None
 
 
-def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
+def build_byte_dataloader(
+    cfg: dict, split: str = "train", exclude_doc_hashes: frozenset[bytes] | None = None,
+) -> _ResumableLoader:
     ds = ByteStreamDataset(
         source=cfg.get("source"),
         sources=cfg.get("sources"),
@@ -846,6 +858,7 @@ def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
         sft_loss_on=cfg.get("sft_loss_on", "completion"),
         sft_add_eos=cfg.get("sft_add_eos", True),
         contiguous=cfg.get("contiguous", False),
+        exclude_doc_hashes=exclude_doc_hashes,
     )
     ds.verbose = split == "train"
     num_workers = cfg.get("num_workers", 4)

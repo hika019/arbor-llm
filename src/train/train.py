@@ -1542,7 +1542,13 @@ def main() -> int:
     if device.type != "cuda" and data_cfg.get("pin_memory", False):
         print(f"[train] pin_memory=OFF (device={device.type}: CUDA 以外は無効)")
         data_cfg["pin_memory"] = False
-    train_loader = build_byte_dataloader(data_cfg, split="train")
+    eval_hashes = None
+    if cfg.get("validation", {}).get("enabled", False) and not benchmark_mode:
+        from src.data.eval_split import eval_doc_hashes
+
+        eval_hashes = eval_doc_hashes(cfg["validation"], data_cfg)
+        print(f"[train] 評価文書 {len(eval_hashes)} 件を学習から除外 (data/eval_split/)")
+    train_loader = build_byte_dataloader(data_cfg, split="train", exclude_doc_hashes=eval_hashes)
     timing_mark("dataloader_object_created", device)
 
     validation_cfg = cfg.get("validation", {})

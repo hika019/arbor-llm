@@ -473,3 +473,19 @@ def test_parquet_stream_is_picklable(tmp_path):
     ds = _load_hf_streaming("parquet", None, "train", {"data_files": str(tmp_path / "part-*.parquet")})
     restored = pickle.loads(pickle.dumps(ds))
     assert [row["text"] for row in restored] == ["abc", "def", "ghi"]
+
+
+def test_document_packing_skips_eval_documents(monkeypatch):
+    from src.data.eval_split import doc_hash
+
+    spec = {"id": "web", "path": "a", "weight_bytes": 1.0, "max_epochs": 1}
+    ds = ByteStreamDataset(
+        sources=[spec], context_length=4, byte_offset=0, packing="document",
+        eos_token_id=2, pad_token_id=3, contiguous=True, exclude_doc_hashes=frozenset({doc_hash("evalx")}),
+    )
+    monkeypatch.setattr(ds, "_build_hf_source_streams",
+                        lambda: ([[{"text": "abc"}, {"text": "evalx"}, {"text": "de"}]], [spec]))
+    ds.parallel_source_init = False
+    flat = [t for smp in ds._iter_hf_document_packed() for t in smp["input_ids"].tolist()]
+    assert flat == [ord(c) for c in "abc"] + [2] + [ord(c) for c in "de"] + [2, 3]
+    assert ds.state_dict()["extra"]["eval_excluded_docs"] == {"web": 1}
