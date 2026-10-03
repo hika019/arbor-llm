@@ -655,11 +655,15 @@ def evaluate_validation(
 class CudaBatchPrefetcher:
     """Move the next CPU batch to CUDA on a side stream while the current step runs."""
 
-    def __init__(self, source_iter, device: torch.device, initial_batch: dict | None = None):
+    def __init__(
+        self, source_iter, device: torch.device, initial_batch: dict | None = None,
+        cpu_keys: tuple[str, ...] = (),
+    ):
         if device.type != "cuda":
             raise ValueError("CudaBatchPrefetcher requires a CUDA device")
         self.source_iter = source_iter
         self.device = device
+        self.cpu_keys = frozenset(cpu_keys)  # host で読む値 (GPU に送ると読むたびに同期する)
         self.stream = torch.cuda.Stream(device=device)
         self.next_batch: dict[str, torch.Tensor] | None = None
         if initial_batch is None:
@@ -680,7 +684,7 @@ class CudaBatchPrefetcher:
         torch.cuda.current_stream(self.device).wait_stream(self.stream)
         batch = self.next_batch
         for value in batch.values():
-            if torch.is_tensor(value):
+            if torch.is_tensor(value) and value.is_cuda:
                 value.record_stream(torch.cuda.current_stream(self.device))
         self._preload()
         return batch
@@ -696,7 +700,8 @@ class CudaBatchPrefetcher:
     def _stage(self, batch: dict) -> None:
         with torch.cuda.stream(self.stream):
             self.next_batch = {
-                key: value.to(self.device, non_blocking=True) if torch.is_tensor(value) else value
+                key: value.to(self.device, non_blocking=True)
+                if torch.is_tensor(value) and key not in self.cpu_keys else value
                 for key, value in batch.items()
             }
 
@@ -1709,16 +1714,19 @@ def main() -> int:
         pending_prefetch_batch = None
         pending_cpu_batches = None
         pending_packer_state = None
+        pending_packed_batches = None
         if dl_state is not None:
             if isinstance(dl_state, dict):
                 pending_prefetch_batch = dl_state.pop("_cuda_prefetch_next_batch", None)
                 pending_cpu_batches = dl_state.pop("_cpu_prefetch_pending", None)
                 pending_packer_state = dl_state.pop("_patch_packer", None)
-                if pending_prefetch_batch is not None or pending_cpu_batches:
+                pending_packed_batches = dl_state.pop("_packed_pending", None)
+                if pending_prefetch_batch is not None or pending_cpu_batches or pending_packed_batches:
                     print(
-                        "[train] resume in-flight batches: cuda_staged={} cpu_pending={}".format(
+                        "[train] resume in-flight batches: cuda_staged={} cpu_pending={} packed_pending={}".format(
                             int(pending_prefetch_batch is not None),
                             len(pending_cpu_batches or []),
+                            len(pending_packed_batches or []),
                         )
                     )
             if not should_restore_dataloader_state(saved_data_cfg, data_cfg):
@@ -1730,6 +1738,7 @@ def main() -> int:
                 pending_prefetch_batch = None
                 pending_cpu_batches = None
                 pending_packer_state = None
+                pending_packed_batches = None
             else:
                 train_loader.load_state_dict(dl_state)
         print(f"[train] resumed from step={global_step}, best_loss={best_loss:.4f}")
@@ -1737,10 +1746,11 @@ def main() -> int:
         pending_prefetch_batch = None
         pending_cpu_batches = None
         pending_packer_state = None
+        pending_packed_batches = None
 
     packer = None
     if use_packer:
-        from src.data.patch_packer import PatchPacker
+        from src.data.patch_packer import PatchPacker, PrefetchedPacker
 
         def make_packer(compile_entropy: bool = False) -> PatchPacker:
             return PatchPacker(
@@ -1772,10 +1782,7 @@ def main() -> int:
     if not accum_schedule.is_constant:
         print(f"[train] grad_accum_steps={accum_schedule.describe()}")
     sync_each_step = bool(cfg["speed"].get("sync_each_step", False))
-    # PatchPacker は CPU の chunk を自分で GPU (ByteLM) に送り、系列は CPU で組む
-    cuda_prefetch = (
-        bool(cfg["speed"].get("cuda_prefetch", False)) and device.type == "cuda" and packer is None
-    )
+    cuda_prefetch = bool(cfg["speed"].get("cuda_prefetch", False)) and device.type == "cuda"
     # CPU 側 packing の先読み深さ。num_workers>0 なら DataLoader が既に並列なので無効。
     cpu_prefetch_depth = int(cfg["speed"].get("cpu_prefetch_depth", 3))
     if int(data_cfg.get("num_workers", 0)) != 0:
@@ -2049,10 +2056,15 @@ def main() -> int:
         return values
 
     cpu_prefetcher: ThreadedBatchPrefetcher | None = None
+    packer_prefetcher = None
 
     def make_data_iter():
         nonlocal pending_prefetch_batch, pending_cpu_batches, cpu_prefetcher
+        nonlocal packer_prefetcher, pending_packed_batches
         timing_mark("make_data_iter_start", device)
+        if packer_prefetcher is not None:
+            packer_prefetcher.close()
+            packer_prefetcher = None
         if cpu_prefetcher is not None:
             cpu_prefetcher.close()
             cpu_prefetcher = None
@@ -2071,13 +2083,19 @@ def main() -> int:
         timing_mark("train_loader_iter_created", device)
         if packer is not None:
             packer.set_source(source_iter)
-            rows = int(data_cfg["micro_batch_size"])
-            return iter(lambda: packer.next_batch(rows), None)
+            packer_prefetcher = PrefetchedPacker(
+                packer, int(data_cfg["micro_batch_size"]), depth=max(cpu_prefetch_depth, 1),
+                initial_batches=pending_packed_batches, device=device,
+            )
+            pending_packed_batches = None
+            source_iter = packer_prefetcher
         if not cuda_prefetch:
             return source_iter
         initial_batch = pending_prefetch_batch
         pending_prefetch_batch = None
-        data_iter = CudaBatchPrefetcher(source_iter, device, initial_batch=initial_batch)
+        data_iter = CudaBatchPrefetcher(
+            source_iter, device, initial_batch=initial_batch, cpu_keys=("n_bytes", "n_patches"),
+        )
         timing_mark("make_data_iter_done", device)
         return data_iter
 
@@ -2551,13 +2569,19 @@ def main() -> int:
                     print(
                         "[train] stop checkpoint: skipping validation for fast shutdown"
                     )
-                if cpu_prefetcher is not None:
+                def loader_state():
                     # loader state と未消費 batch を同一瞬間のペアで取る (排他は内部 lock)
-                    dl_state, pending_cpu = cpu_prefetcher.state_dict()
-                    if dl_state is not None and pending_cpu:
-                        dl_state["_cpu_prefetch_pending"] = pending_cpu
+                    if cpu_prefetcher is not None:
+                        return cpu_prefetcher.state_dict()
+                    return (train_loader.state_dict() if hasattr(train_loader, "state_dict") else None), []
+
+                packed_state = packed_pending = None
+                if packer_prefetcher is not None:
+                    (dl_state, pending_cpu), packed_state, packed_pending = packer_prefetcher.state_dict(loader_state)
                 else:
-                    dl_state = train_loader.state_dict() if hasattr(train_loader, "state_dict") else None
+                    dl_state, pending_cpu = loader_state()
+                if dl_state is not None and pending_cpu:
+                    dl_state["_cpu_prefetch_pending"] = pending_cpu
                 if (
                     dl_state is not None
                     and cuda_prefetch
@@ -2566,9 +2590,9 @@ def main() -> int:
                     prefetched = data_iter.state_dict()
                     if prefetched is not None:
                         dl_state["_cuda_prefetch_next_batch"] = prefetched
-                if dl_state is not None and packer is not None:
-                    # packer が読んだがまだ系列にしていない byte
-                    dl_state["_patch_packer"] = packer.state_dict()
+                if dl_state is not None and packed_state is not None:
+                    dl_state["_patch_packer"] = packed_state
+                    dl_state["_packed_pending"] = packed_pending
 
                 # P0: validation開始前に、このoptimizer stepのmodel/optimizer/
                 # scheduler/dataloader stateをrecovery checkpointとして確定する。
@@ -2681,6 +2705,8 @@ def main() -> int:
 
     if isinstance(data_iter, CudaBatchPrefetcher):
         data_iter.close()
+    if packer_prefetcher is not None:
+        packer_prefetcher.close()
     if cpu_prefetcher is not None:
         cpu_prefetcher.close()
     data_iter = None

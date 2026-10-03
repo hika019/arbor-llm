@@ -245,3 +245,71 @@ def test_resume_with_bytelm_state_is_exact():
     for a, b in zip(got, want):
         for k in a:
             assert torch.equal(a[k], b[k]), k
+
+
+def _drain_iter(it) -> list[dict]:
+    out = []
+    try:
+        while True:
+            out.append(next(it))
+    except StopIteration:
+        return out
+
+
+def test_prefetched_packer_yields_same_batches():
+    from src.data.patch_packer import PrefetchedPacker
+
+    cfg = _cfg("space")
+    batches = list(_batches({0: _stream(9), 1: _stream(10, reps=12)}, 40, 2, [0, 1, 1, 0] * 30))
+    plain = _packer(cfg, "cpu")
+    plain.set_source(iter(batches))
+    want = _drain_iter(iter(lambda: plain.next_batch(2), None))
+    packer = _packer(cfg, "cpu")
+    packer.set_source(iter(batches))
+    pre = PrefetchedPacker(packer, 2, depth=3)
+    got = _drain_iter(pre)
+    pre.close()
+    assert len(got) == len(want)
+    for a, b in zip(got, want):
+        for k in a:
+            assert torch.equal(a[k], b[k]), k
+
+
+def test_prefetched_packer_state_dict_resumes_without_gaps():
+    from src.data.patch_packer import PrefetchedPacker
+
+    cfg = _cfg("entropy_char")
+    batches = list(_batches({0: _stream(11), 1: _stream(12, reps=12)}, 40, 2, [0, 1, 0, 0, 1] * 30))
+    plain = _packer(cfg, "cpu")
+    plain.set_source(iter(batches))
+    want = _drain_iter(iter(lambda: plain.next_batch(2), None))
+
+    class Source:
+        pos = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.pos >= len(batches):
+                raise StopIteration
+            self.pos += 1
+            return batches[self.pos - 1]
+
+    source = Source()
+    first = _packer(cfg, "cpu")
+    first.set_source(source)
+    pre = PrefetchedPacker(first, 2, depth=3)
+    head = [next(pre) for _ in range(4)]
+    pos, packer_state, pending = pre.state_dict(lambda: source.pos)
+    pre.close()
+    resumed = _packer(cfg, "cpu")
+    resumed.load_state_dict(packer_state)
+    resumed.set_source(iter(batches[pos:]))
+    pre2 = PrefetchedPacker(resumed, 2, depth=3, initial_batches=pending)
+    got = head + _drain_iter(pre2)
+    pre2.close()
+    assert len(got) == len(want)
+    for a, b in zip(got, want):
+        for k in a:
+            assert torch.equal(a[k], b[k]), k

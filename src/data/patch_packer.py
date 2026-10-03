@@ -6,6 +6,7 @@ dataloader の chunk を source ごとの lane につないで区切り、1 lane
 """
 from __future__ import annotations
 
+import threading
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -303,6 +304,96 @@ class PatchPacker:
             for key, s in state["lanes"].items()
         }
         self.ready_queue = deque(int(k) for k in state["ready_queue"])
+
+
+class PrefetchedPacker:
+    """packer.next_batch を別スレッド・別 CUDA stream で depth 個先まで作る (ByteLM と packing を学習と重ねる)."""
+
+    def __init__(
+        self, packer: PatchPacker, rows: int, depth: int = 3,
+        initial_batches: list[dict] | None = None, device: torch.device | None = None,
+    ) -> None:
+        self.packer, self.rows, self.depth = packer, int(rows), max(1, int(depth))
+        self.stream = torch.cuda.Stream(device) if device is not None and device.type == "cuda" else None
+        self._replay = deque(initial_batches or [])
+        self._buf: deque = deque()
+        self._cond = threading.Condition()
+        self._pack_lock = threading.Lock()  # packing 中は state_dict を取らない
+        self._stop = self._exhausted = False
+        self._exc: BaseException | None = None
+        if self.stream is not None:
+            # load_state_dict で現 stream 上に置いた lane の状態を、別 stream で使い・解放する
+            self.stream.wait_stream(torch.cuda.current_stream(device))
+            for lane in packer.lanes.values():
+                for t in (lane.tail_ids, lane.tail_ent, lane.tail_rest, *(lane.lm_state or ())):
+                    if isinstance(t, torch.Tensor) and t.is_cuda:
+                        t.record_stream(self.stream)
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="patch-packer")
+        self._thread.start()
+
+    def _worker(self) -> None:
+        stream_ctx = torch.cuda.stream(self.stream) if self.stream is not None else nullcontext()
+        with stream_ctx:
+            while True:
+                with self._cond:
+                    while len(self._buf) >= self.depth and not self._stop:
+                        self._cond.wait()
+                    if self._stop:
+                        return
+                with self._pack_lock:
+                    try:
+                        batch = self.packer.next_batch(self.rows)
+                    except StopIteration:
+                        batch, done = None, True
+                    except BaseException as exc:  # noqa: BLE001 - 消費側で再送出
+                        with self._cond:
+                            self._exc = exc
+                            self._cond.notify_all()
+                        return
+                    else:
+                        done = False
+                    with self._cond:
+                        if done:
+                            self._exhausted = True
+                        else:
+                            self._buf.append(batch)
+                        self._cond.notify_all()
+                if done:
+                    return
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> dict:
+        if self._replay:
+            return self._replay.popleft()
+        with self._cond:
+            while not self._buf and not self._exhausted and self._exc is None:
+                self._cond.wait()
+            if self._buf:
+                batch = self._buf.popleft()
+                self._cond.notify_all()
+                return batch
+            if self._exc is not None:
+                raise self._exc
+            raise StopIteration
+
+    def state_dict(self, source_state: Callable[[], Any] | None = None) -> tuple[Any, dict, list[dict]]:
+        """(source の状態, packer の状態, 未消費の系列) を同じ瞬間でそろえて返す."""
+        with self._pack_lock:
+            if self.stream is not None:
+                self.stream.synchronize()
+            source = source_state() if source_state is not None else None
+            packer_state = self.packer.state_dict()
+            with self._cond:
+                pending = list(self._replay) + list(self._buf)
+        return source, packer_state, pending
+
+    def close(self) -> None:
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+        self._thread.join(timeout=30.0)
 
 
 def _cat_tail(prev: torch.Tensor | None, new: torch.Tensor) -> torch.Tensor:
