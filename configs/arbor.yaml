@@ -3,10 +3,8 @@
 # 新規:   python -m src.train.train --config configs/arbor.yaml
 # 再開:   python -m src.train.train --config configs/arbor.yaml --resume latest
 #
-# 8192 bytes ≈ 2k BPE トークン等価 (日本語 ~2,700 文字)。entropy_char patching
-# (ByteLM の文字単位エントロピーの上昇で区切る) で global は最大 max_patches。
-# 実効バッチは64 seq=524k bytes/update。
-# 閾値ごとの区切り方: python scripts/show_entropy_threshold_stats.py
+# entropy patching (BLT と同じ絶対値判定、長さ上限なし)。1 系列は seq_patches 個の patch。
+# 閾値ごとの統計: python scripts/show_entropy_threshold_stats.py
 #
 # このbranchの既定値はCUDA sm89+専用。非対応deviceへは暗黙フォールバックしない。
 # MPS/CPUで使う場合は global_attn_impl: sdpa / bitlinear_compute_mode: off を明示する。
@@ -24,12 +22,13 @@ model:
   #   static       … patch_size byte ごと (と文書先頭) で区切る
   #   utf8 / space … UTF-8 文字先頭 / 空白・改行直後を候補にする (min/max_patch_len 有効)
   #   entropy / entropy_char … ByteLM の予測エントロピーで区切る (entropy_lm_config 必須)
-  patching_mode: entropy_char   # choices: static | utf8 | space | entropy | entropy_char
-  patch_size: 16                # static 専用: 1 patch = N byte。8192/16=512 global patches
+  patching_mode: entropy        # choices: static | utf8 | space | entropy | entropy_char
+  patch_size: 16                # static 専用: 1 patch = N byte
   min_patch_len: 1              # static 以外。range: 1..max_patch_len
-  max_patch_len: 32             # static 以外。range: >=min_patch_len
-  entropy_threshold: 2.494983   # entropy 系専用 (entropy_char は文字の H の上昇幅)。BLT-E16 の値 (ByteLM step 81695 用、ByteLM を変えたら決め直す)
-  max_bytes: 8192               # 学習 context (bytes)
+  max_patch_len: null           # static 以外。null = 上限なし
+  entropy_threshold: 2.0        # entropy 系専用。ByteLM を変えたら決め直す
+  seq_patches: 512              # global の系列長
+  max_bytes: 8192               # 1 系列の byte の枠。系列 byte の p99 (閾値 2.0 で約 7900)
   # ---- global (patch 階層, BitLinear) ----
   hidden_size: 2048
   num_heads: 16
@@ -51,7 +50,7 @@ model:
   hash_ngram_sizes: [3, 4, 5, 6, 7, 8]
   hash_ngram_vocab: 50000       # n ごとの表の行数
   # ---- 共通 ----
-  # RoPE。global は max_patches (static 8k/patch16 = 512) 位置しか見ないため、
+  # RoPE。global は seq_patches (512) 位置しか見ないため、
   # 128k 長文脈向けの theta=500000 は大半の次元の波長が文脈長を桁で超え、位置
   # 分解能を潰す (#1: 長距離一貫性が育たない疑い)。系列長相応の値へ下げる。
   #   A/B: 旧挙動へ戻すなら rope_theta_global を 500000.0 にする。
@@ -73,11 +72,6 @@ model:
   #   sdpa … 全 device 対応。 flex … CUDA + torch.compile 必須。
   # 非対応環境での暗黙フォールバックは禁止。必要なら明示的にsdpaへ変更する。
   global_attn_impl: flex        # RTX 4090実測: sdpa比 +3.7% (FP8 bwd併用、8k context)
-  # global に渡す patch 数の上限 (tensor 形状と計算量の上限)。超える系列は後半が予算ガードで
-  # 機械的に区切られる。512 は static 16 byte (8192/16) と global 計算量をそろえた BLT-E16 の値で、
-  # entropy の区切りから決めた値ではない。閾値を決めたら show_entropy_threshold_stats.py の
-  # 「予算超え系列」がほぼ 0 になる値にし、max_bytes を変えたら比例して変える。
-  max_patches: 512
 
 # ---- データ (streaming 前提; 一括ロードは禁止) ----
 # weight_bytes は行選択確率ではなく、document packing 後の実測 byte 比率に近づくよう
@@ -137,7 +131,7 @@ data:
   eos_token_id: 2
   pad_token_id: 3
   shuffle_buffer: 2000
-  context_length: 8192          # bytes
+  context_length: 8192          # dataloader の chunk の byte 数 (系列の長さは model.seq_patches / max_bytes)
   num_workers: 0                # 正確 resume は単一プロセス前提
   pin_memory: true
 

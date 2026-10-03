@@ -61,7 +61,7 @@ def main() -> int:
                    help="entropy_char の固定閾値 (1 つ前の文字からの上昇幅、nats)")
     p.add_argument("--target-avg-len", default=6.0, type=float, help="閾値を合わせる平均 patch 長 (byte)")
     p.add_argument("--min-patch-len", default=1, type=int)
-    p.add_argument("--max-patch-len", default=32, type=int)
+    p.add_argument("--max-patch-len", default=None, type=int, help="既定は上限なし")
     p.add_argument("--text", action="append", default=None, help="複数指定可")
     p.add_argument("--char-rest", action="store_true",
                    help="entropy_char の H に char_rest head (3 byte 目以降の推定) を足す")

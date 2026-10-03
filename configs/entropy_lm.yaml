@@ -12,7 +12,7 @@
 # 32768 で再学習するのが確実)。
 
 run_name: entropy_lm
-seed: 2
+seed: 4
 
 model:
   arch: byte_lm             # 小型 causal バイト LM (Arbor 本体ではない)

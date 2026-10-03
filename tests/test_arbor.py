@@ -14,7 +14,7 @@ from src.model.arbor import (
 )
 
 TINY = dict(
-    vocab_size=260, patch_size=4, max_bytes=64,
+    vocab_size=260, patch_size=4, max_bytes=64, seq_patches=16,
     hidden_size=64, num_heads=4, num_kv_heads=2, intermediate_size=128,
     num_hidden_layers=2,
     local_hidden_size=32, local_num_heads=2, local_num_kv_heads=2,
@@ -139,29 +139,6 @@ def test_document_attention_isolation(monkeypatch):
         lb_leak = m(b).logits
     assert not torch.allclose(la_leak[:, 8:], lb_leak[:, 8:], atol=1e-5), (
         "マスク無効化でも doc2 が不変。テストが leak を検出できていない"
-    )
-
-
-def test_document_isolation_with_padding_to_patch_boundary():
-    """短いdocをPADでpatch境界へ揃えた場合も、前文書が次文書へ漏れないこと.
-
-    patch_size=4, docA=[0,1,EOS], PAD=[3], docB starts at index 4。
-    packing側のpatch_align=4が生成する形を直接モデルへ通す regression test。
-    """
-    torch.manual_seed(7)
-    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static"))).eval()
-    a = torch.randint(4, 260, (1, 12))
-    a[0, 2] = 2  # doc A EOS
-    a[0, 3] = 3  # patch boundary までの alignment PAD
-    a[0, 9] = 2  # doc B EOS
-    b = a.clone()
-    b[0, 0] = (a[0, 0] - 4 + 1) % 256 + 4
-    with torch.inference_mode():
-        la = m(a).logits
-        lb = m(b).logits
-    assert not torch.allclose(la[:, :3], lb[:, :3], atol=1e-5)
-    assert torch.allclose(la[:, 4:], lb[:, 4:], atol=1e-5), (
-        "patch境界へalignしたdoc Aの変更がdoc Bへ漏れている"
     )
 
 
@@ -365,18 +342,6 @@ def test_generator_context_rebuild():
     assert len(gen.byte_ids) <= 16
 
 
-def test_pad_patches_get_no_nan_gradients():
-    """byte の無い pad patch (予算に対して patch が少ない) があっても勾配は有限."""
-    torch.manual_seed(7)
-    m = ArborModel(ArborConfig.from_dict(dict(tiny_cfg("space"), min_patch_len=1, max_patch_len=8)))
-    assert m.max_patches > 30
-    x = torch.randint(4, 260, (2, 30))
-    x[:, ::5] = 0x20 + 4
-    m(x).logits.float().square().mean().backward()
-    bad = [n for n, par in m.named_parameters() if par.grad is not None and not torch.isfinite(par.grad).all()]
-    assert not bad, bad
-
-
 def test_byte_lm_forward_and_entropy():
     torch.manual_seed(0)
     lm = ByteLM(dict(TINY_ENTROPY_LM, max_bytes=64))
@@ -475,53 +440,29 @@ def test_global_attn_flex_matches_sdpa():
     )
 
 
-# ---------------------------------------------------------------- 境界: 文書先頭の強制区切り + 予算ガード
-def _check_patch_rules(starts, raw, force, min_len, max_len, budget, horizon):
+# ---------------------------------------------------------------- 境界: 文書先頭の強制区切り
+def _check_patch_rules(starts, raw, force, min_len, max_len):
     """_patch_starts_reference の出力が規則を満たすこと (独立な検査)."""
     for r in range(starts.size(0)):
         pos = starts[r].nonzero().flatten().tolist()
         assert pos[0] == 0
         lens = [b - a for a, b in zip(pos, pos[1:] + [starts.size(1)])]
         assert max(lens) <= max_len
-        if budget:
-            assert len(pos) <= budget
         for c, p in enumerate(pos[1:], start=1):  # c = p より前に開いていた patch 数
             if lens[c - 1] == max_len:
                 continue  # max_len 到達の強制境界
             assert force[r, p] or (raw[r, p] and lens[c - 1] >= min_len)
-            if budget:
-                assert c + -(-max(horizon - p, 0) // max_len) <= budget
+        assert all(starts[r][force[r]].tolist())  # 文書先頭は必ず境界
 
 
-@pytest.mark.parametrize("budget", [0, 9, 12, 20])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_patch_starts_force_and_budget_rules(budget, seed):
+def test_patch_starts_force_rules(seed):
     from src.model.arbor import _patch_starts_reference
 
     g = torch.Generator().manual_seed(seed)
     raw = torch.rand(3, 64, generator=g) < 0.5
     force = torch.rand(3, 64, generator=g) < 0.05
-    starts = _patch_starts_reference(raw, force, 2, 8, budget, 64)
-    _check_patch_rules(starts, raw, force, 2, 8, budget, 64)
-    if budget == 0:
-        assert all(starts[force].tolist())  # 予算無しなら文書先頭は必ず境界
-
-
-def test_patch_budget_binds_and_never_overflows():
-    """全位置が候補でも patch 数は budget ちょうどに収まる (上限超えのエラーが起きない)."""
-    from src.model.arbor import _patch_starts_reference
-
-    raw = torch.ones(2, 64, dtype=torch.bool)
-    force = torch.zeros_like(raw)
-    starts = _patch_starts_reference(raw, force, 1, 16, 10, 64)
-    assert starts.sum(1).tolist() == [10, 10]
-    free = _patch_starts_reference(raw, force, 1, 16, 0, 64)
-    assert free.sum(1).tolist() == [64, 64]
-
-
-def test_budget_rejects_infeasible_max_patches():
-    with pytest.raises(ValueError, match="max_patches"):
-        ArborModel(ArborConfig.from_dict(dict(tiny_cfg("space"), max_patches=2, max_patch_len=16)))
+    _check_patch_rules(_patch_starts_reference(raw, force, 2, 8), raw, force, 2, 8)
 
 
 def test_document_start_forces_patch_boundary():
@@ -533,32 +474,28 @@ def test_document_start_forces_patch_boundary():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("budget", [0, 16, 30])
-def test_patch_starts_cuda_matches_reference_with_force_and_budget(budget):
+def test_patch_starts_cuda_matches_reference_with_force():
     from src.model.arbor import _patch_starts_reference
     from src.model.patch_starts_cuda import patch_starts_cuda
 
     g = torch.Generator().manual_seed(7)
     raw = torch.rand(4, 173, generator=g) < 0.4
     force = torch.rand(4, 173, generator=g) < 0.03
-    want = _patch_starts_reference(raw, force, 3, 12, budget, 180)
-    got = patch_starts_cuda(raw.cuda(), force.cuda(), 3, 12, budget, 180).cpu()
+    want = _patch_starts_reference(raw, force, 3, 12)
+    got = patch_starts_cuda(raw.cuda(), force.cuda(), 3, 12).cpu()
     assert torch.equal(got, want)
 
 
-def _tight_dynamic_cfg(mode):
-    # max_bytes=64, max_patch_len=8 → 予算の下限 8 (entropy_char は単位 5 で 13)。下限の少し上に置き、
-    # 候補の大半を予算で削らせる
-    return dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=8, patch_size=8,
-                max_patches=14 if mode == "entropy_char" else 10, entropy_threshold=0.0)
+def _dynamic_cfg(mode, max_len=8):
+    return dict(tiny_cfg(mode), min_patch_len=1, max_patch_len=max_len, patch_size=8, entropy_threshold=0.0)
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
 @pytest.mark.parametrize("pos", [5, 20, 40])
-def test_causality_with_budget_and_documents(mode, pos):
-    """予算ガードが効き、文書境界がある状態でも未来のバイトが過去の logits に漏れない."""
+def test_causality_with_documents(mode, pos):
+    """文書境界がある状態でも未来のバイトが過去の logits に漏れない."""
     torch.manual_seed(11)
-    m = ArborModel(ArborConfig.from_dict(_tight_dynamic_cfg(mode))).eval()
+    m = ArborModel(ArborConfig.from_dict(_dynamic_cfg(mode))).eval()
     a = torch.randint(4, 260, (1, 60))
     a[0, ::3] = 0x20 + 4
     a[0, 30] = 2  # EOS: 位置 31 から次の文書
@@ -569,14 +506,15 @@ def test_causality_with_budget_and_documents(mode, pos):
     assert torch.allclose(la[:, :pos], lb[:, :pos], atol=1e-5)
 
 
+@pytest.mark.parametrize("max_len", [8, None])
 @pytest.mark.parametrize("mode", ALL_MODES)
-def test_generator_matches_full_forward_with_budget(mode):
-    """逐次生成器の境界判定 (予算ガードが効く状態) がフルフォワードと一致すること.
+def test_generator_matches_full_forward_dynamic(mode, max_len):
+    """逐次生成器の境界判定がフルフォワードと一致すること (短い patch が多い設定).
 
     EOS は入れない: 生成器は文書分離を実装しておらず、プロンプト中の EOS ではフルフォワードと一致しない。
     """
     torch.manual_seed(12)
-    m = ArborModel(ArborConfig.from_dict(dict(_tight_dynamic_cfg(mode), bitnet=False))).eval()
+    m = ArborModel(ArborConfig.from_dict(dict(_dynamic_cfg(mode, max_len), bitnet=False))).eval()
     ids = torch.randint(4, 260, (50,))
     ids[ids == 2] = 5
     ids[::3] = 0x20 + 4
@@ -586,6 +524,94 @@ def test_generator_matches_full_forward_with_budget(mode):
             inc = gen.push(int(ids[i]))
             full = m(ids[: i + 1].unsqueeze(0)).logits[0, -1]
             assert torch.allclose(inc, full, atol=2e-4), f"mode={mode} pos={i}"
+
+
+# ---------------------------------------------------------------- 学習の系列 (patch_starts 指定・PAD の枠)
+@pytest.mark.parametrize("max_len", [8, None])
+@pytest.mark.parametrize("mode", ALL_MODES)
+def test_explicit_patch_starts_match_internal_boundaries(mode, max_len):
+    """patch_starts を渡した forward (global は seq_patches 位置) は、その場で区切った forward と同じ."""
+    torch.manual_seed(21)
+    m = ArborModel(ArborConfig.from_dict(dict(_dynamic_cfg(mode, max_len), bitnet=False, seq_patches=60))).eval()
+    x = torch.randint(4, 260, (2, 48))
+    x[:, ::4] = 0x20 + 4
+    x[1, 20] = 2
+    with torch.inference_mode():
+        starts = m.compute_patch_starts(x)
+        assert int(starts.sum(1).max()) < 60
+        assert torch.allclose(m(x).logits, m(x, starts).logits, atol=1e-5)
+
+
+def test_pad_frame_does_not_change_real_bytes():
+    """系列の枠の余り (PAD) は実 byte の logits を変えない."""
+    torch.manual_seed(22)
+    m = ArborModel(ArborConfig.from_dict(dict(_dynamic_cfg("space"), bitnet=False))).eval()
+    x = torch.randint(4, 260, (1, 37))
+    x[:, ::5] = 0x20 + 4
+    with torch.inference_mode():
+        starts = m.compute_patch_starts(x)
+        framed = torch.full((1, 64), 3)
+        framed[:, :37] = x
+        framed_starts = torch.zeros((1, 64), dtype=torch.bool)
+        framed_starts[:, :37] = starts
+        want = m(x, starts).logits
+        got = m(framed, framed_starts).logits[:, :37]
+    assert torch.allclose(want, got, atol=1e-5)
+
+
+def test_pad_patches_and_pad_bytes_get_no_nan_gradients():
+    """byte の無い pad patch と枠の余りの PAD があっても勾配は有限."""
+    torch.manual_seed(7)
+    m = ArborModel(ArborConfig.from_dict(dict(_dynamic_cfg("space"), seq_patches=30)))
+    x = torch.full((2, 64), 3)
+    x[:, :30] = torch.randint(4, 260, (2, 30))
+    starts = torch.zeros((2, 64), dtype=torch.bool)
+    starts[:, 0:30:5] = True  # 6 patch (< seq_patches)
+    m(x, starts).logits.float().square().mean().backward()
+    bad = [n for n, par in m.named_parameters() if par.grad is not None and not torch.isfinite(par.grad).all()]
+    assert not bad, bad
+
+
+def test_encoder_cross_attention_segments_match_per_patch_attention():
+    """長い patch・byte の無い pad patch・枠の余りの PAD を含む."""
+    torch.manual_seed(5)
+    m = ArborModel(ArborConfig.from_dict(dict(_dynamic_cfg("space", None), bitnet=False))).eval()
+    xattn = m.encoder_cross_attn[0]
+    b, t, k, kq, dl = 2, 64, 7, TINY["cross_attn_k"], TINY["local_hidden_size"]
+    lens = [[3, 40, 1, 9], [20, 2, 30, 1, 1]]
+    patch_id = torch.zeros(b, t, dtype=torch.long)
+    is_byte = torch.zeros(b, t, dtype=torch.bool)
+    for r, ls in enumerate(lens):
+        ids = torch.repeat_interleave(torch.arange(len(ls)), torch.tensor(ls))
+        patch_id[r, :len(ids)], is_byte[r, :len(ids)] = ids, True
+        patch_id[r, len(ids):] = torch.arange(t - len(ids)) % k
+    h = torch.randn(b, t, dl)
+    queries = torch.randn(b, k, kq, dl)
+    with torch.inference_mode():
+        got = xattn.forward_segments(queries, h, patch_id, is_byte)
+        for r, ls in enumerate(lens):
+            for j in range(k):
+                sel = is_byte[r] & (patch_id[r] == j)
+                if j < len(ls):
+                    want = xattn(queries[r, j][None], h[r, sel][None])[0]
+                    assert torch.allclose(got[r, j], want, atol=1e-5), (r, j)
+                else:
+                    assert torch.equal(got[r, j], torch.zeros_like(got[r, j]))
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_no_max_patch_len_cuts_only_at_candidates(device):
+    ids = torch.tensor([list(b"x" * 150 + b" ab cd" + b"y" * 90)]) + 4
+    ids[0, 200] = 2
+    starts = compute_patch_starts(ids.to(device), "space", 1, None, eos_token_id=2).cpu()
+    prev = ids[0, :-1] - 4
+    want = torch.cat((torch.tensor([True]), (prev == 0x20) | (ids[0, :-1] == 2)))
+    assert torch.equal(starts[0], want)
+
+
+def test_removed_max_patches_key_is_error():
+    with pytest.raises(ValueError, match="max_patches"):
+        ArborConfig.from_dict(dict(tiny_cfg("space"), max_patches=16))
 
 
 # ---------------------------------------------------------------- local の byte 層 (文書内 causal、窓)
@@ -791,32 +817,29 @@ def test_entropy_char_cuts_where_char_entropy_rises():
     g = torch.Generator().manual_seed(1)
     ent = torch.rand(ids.shape, generator=g) * 5
     e = ent[0].tolist()
-    expected, prev_h, pos = [0], None, 0
+    expected, prev_h, prev_pos, pos = [0], None, 0, 0
     for ch in text:
         n = len(ch.encode())
         h = (e[pos - 1] if pos > 0 else 0.0) + (e[pos] if n > 1 else 0.0)
-        if prev_h is not None and h - prev_h > 1.0:
+        # 先頭の文字は直前の予測エントロピーが無いので比較の基準にしない
+        if prev_h is not None and prev_pos > 0 and h - prev_h > 1.0:
             expected.append(pos)
-        prev_h, pos = h, pos + n
+        prev_h, prev_pos, pos = h, pos, pos + n
     st = compute_patch_starts(ids, "entropy_char", 1, 1000, entropy_values=ent, threshold=1.0)[0]
     assert st.nonzero().flatten().tolist() == expected
     assert len(expected) > 3
 
 
-def test_entropy_char_soft_boundary_before_max_len_and_budget():
-    from src.model.arbor import _patch_starts_reference
-
+def test_entropy_char_soft_boundary_before_max_len():
     ids = _ja_ids("あ" * 60)
     ent = torch.zeros(ids.shape)  # 閾値を超えない → 最長付近の文字先頭でだけ区切る
     cur = ids - 4
     cont = (cur & 0xC0) == 0x80
-    st = compute_patch_starts(ids, "entropy_char", 1, 16, entropy_values=ent, threshold=10.0,
-                              budget=15, horizon=180)[0]
+    st = compute_patch_starts(ids, "entropy_char", 1, 16, entropy_values=ent, threshold=10.0)[0]
     pos = st.nonzero().flatten().tolist()
     lens = [b - a for a, b in zip(pos, pos[1:] + [ids.size(1)])]
     assert not bool((st & cont[0]).any())
     assert max(lens) <= 16 and all(ln >= 13 for ln in lens[:-1])
-    assert len(pos) <= 15
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
@@ -825,19 +848,17 @@ def test_entropy_char_cuda_matches_reference():
     text = "日本語のテキストとEnglish words、数字123と記号!?を混ぜた文章です。" * 4
     ids = _ja_ids(text)
     ent = torch.rand(ids.shape, generator=g) * 5
-    for budget in (0, 40):
-        for threshold in (0.0, 1.5):
-            kw = dict(entropy_values=ent, threshold=threshold, eos_token_id=2, budget=budget,
-                      horizon=ids.size(1))
-            cpu = compute_patch_starts(ids, "entropy_char", 1, 12, **kw)
-            gpu = compute_patch_starts(ids.cuda(), "entropy_char", 1, 12,
-                                       **dict(kw, entropy_values=ent.cuda())).cpu()
-            assert torch.equal(cpu, gpu)
+    for threshold in (0.0, 1.5):
+        kw = dict(entropy_values=ent, threshold=threshold, eos_token_id=2)
+        cpu = compute_patch_starts(ids, "entropy_char", 1, 12, **kw)
+        gpu = compute_patch_starts(ids.cuda(), "entropy_char", 1, 12,
+                                   **dict(kw, entropy_values=ent.cuda())).cpu()
+        assert torch.equal(cpu, gpu)
 
 
 def test_generator_matches_full_forward_entropy_char_japanese():
     torch.manual_seed(13)
-    cfg = dict(tiny_cfg("entropy_char"), min_patch_len=1, max_patch_len=8, max_patches=40,
+    cfg = dict(tiny_cfg("entropy_char"), min_patch_len=1, max_patch_len=8,
                entropy_threshold=1.0, bitnet=False, max_bytes=128)
     m = ArborModel(ArborConfig.from_dict(cfg)).eval()
     ids = _ja_ids("今日は天気が良いので散歩に行きました。明日も晴れるといいな。")[0][:90]
@@ -851,7 +872,7 @@ def test_generator_matches_full_forward_entropy_char_japanese():
 
 # ---------------------------------------------------------------- entropy_char_rest (3 byte 目以降の推定)
 def _rest_cfg(**over):
-    cfg = dict(_tight_dynamic_cfg("entropy_char"), entropy_char_rest=True)
+    cfg = dict(_dynamic_cfg("entropy_char"), entropy_char_rest=True)
     cfg.update(over)
     return cfg
 
@@ -872,7 +893,7 @@ def _utf8_heavy_ids(n, seed):
 
 
 def test_char_rest_head_changes_boundaries_only_at_3_4_byte_leads():
-    ids = torch.tensor([[0x41, 0xE3, 0x81, 0xAF, 0x42, 0xC3, 0xA9, 0xF0, 0x9F, 0x98, 0x80]]) + 4
+    ids = torch.tensor([[0x41, 0x41, 0xE3, 0x81, 0xAF, 0x42, 0xC3, 0xA9, 0xF0, 0x9F, 0x98, 0x80]]) + 4
     ent = torch.zeros(ids.shape)
     rest = torch.full(ids.shape, 5.0)
     base = compute_patch_starts(ids, "entropy_char", 1, 32, entropy_values=ent, threshold=1.0)
@@ -880,7 +901,7 @@ def test_char_rest_head_changes_boundaries_only_at_3_4_byte_leads():
                                      rest_values=rest, threshold=1.0)
     assert not base[0, 1:].any()
     # rest は 3 byte (E3) と 4 byte (F0) の 1 byte 目だけに足され、2 byte (C3)・ASCII には効かない
-    assert with_rest[0].nonzero().flatten().tolist() == [0, 1, 7]
+    assert with_rest[0].nonzero().flatten().tolist() == [0, 2, 8]
 
 
 def test_char_rest_requires_entropy_char_mode():

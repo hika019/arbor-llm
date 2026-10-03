@@ -17,16 +17,22 @@ def _module():
     return module
 
 
-def test_patch_stats_covers_every_byte_and_counts_caps_and_budget():
+def test_stats_counts_patch_lengths_caps_and_row_bytes():
     module = _module()
-    starts = torch.zeros(2, 12, dtype=torch.bool)
-    starts[0, [0, 4, 8]] = True
-    starts[1, [0, 2, 3, 4, 5, 6]] = True
-    st = module.patch_stats(starts, soft_len=6, budget=4)
-    assert st["patches_mean"] == 4.5 and st["patches_max"] == 6
+    starts = torch.zeros(2, 16, dtype=torch.bool)
+    starts[0, [0, 4, 8]] = True          # 3 patch / 12 byte (系列 byte の対象)
+    starts[1, [0, 2, 3, 4, 5, 6]] = True  # 6 patch / 12 byte (seq_patches 未満なので系列 byte に入れない)
+    batch = {"input_ids": torch.zeros(2, 16), "patch_starts": starts,
+             "n_bytes": torch.tensor([12, 12]), "n_patches": torch.tensor([3, 6])}
+    st = module.stats([batch], seq_patches=3, soft_len=6, frame=10)
     assert abs(st["bytes_per_patch"] - 24 / 9) < 1e-6
-    assert abs(st["capped_ratio"] - 1 / 9) < 1e-6
-    assert st["over_budget_ratio"] == 0.5
+    assert abs(st["capped_patches"] - 1 / 9) < 1e-6      # 長さ 6 の 1 patch
+    assert abs(st["capped_bytes"] - 6 / 24) < 1e-6
+    assert st["rows"] == 1 and st["row_max"] == 12
+    assert st["over_frame"] == 1.0 and st["frame_pad"] == 0.0
+    assert st["len_max"] == 6
+    uncapped = module.stats([batch], seq_patches=3, soft_len=None, frame=10)
+    assert uncapped["capped_patches"] == 0.0 and uncapped["capped_bytes"] == 0.0
 
 
 def test_patch_starts_begin_at_position_zero():

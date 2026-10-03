@@ -72,13 +72,12 @@ def _load_extension():
 
 def patch_starts_cuda(
     raw: torch.Tensor, force: torch.Tensor, min_len: int, max_len: int,
-    budget: int = 0, horizon: int = 0, char_start: torch.Tensor | None = None,
-    soft_len: int = 0, reserve: int | None = None,
+    char_start: torch.Tensor | None = None, soft_len: int = 0,
 ) -> torch.Tensor:
-    """規則は src/model/arbor.py の _patch_starts_reference と同一 (budget=0 で予算ガード無し)."""
+    """規則は src/model/arbor.py の _patch_starts_reference と同一."""
     if char_start is None:
         char_start = torch.ones_like(raw)
     return _load_extension().patch_starts_cuda(
         raw.contiguous(), force.contiguous(), char_start.contiguous(), int(min_len), int(max_len),
-        int(budget), int(horizon), int(soft_len), int(reserve or max_len),
+        int(soft_len),
     )

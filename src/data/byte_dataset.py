@@ -129,7 +129,7 @@ class ByteStreamDataset(IterableDataset):
                  revision: str | None = None,
                  sft_loss_on: str = "completion",
                  sft_add_eos: bool = True,
-                 patch_align: int = 1) -> None:
+                 contiguous: bool = False) -> None:
         """byte_offset: バイト値 b を token id (b + offset) に写す.
 
         BLT は 0..3 を BOE/BOS/EOS/BPE の特殊 ID として使い, 生バイトは
@@ -166,13 +166,10 @@ class ByteStreamDataset(IterableDataset):
         self.skip_samples = skip_samples
         self.sft_loss_on = sft_loss_on          # completion | all
         self.sft_add_eos = sft_add_eos
-        # static patching では document 境界が patch 境界を跨ぐと、local encoder が
-        # 1 patch 内で 2 文書の byte を混ぜ pooling で圧縮するため document isolation
-        # が local 階層で壊れる。>1 のとき、新 document を開始する前に現在の pack を
-        # PAD で patch_align の倍数まで埋め、各文書が必ず patch 境界から始まるようにする。
-        if int(patch_align) < 1:
-            raise ValueError(f"patch_align must be >= 1, got {patch_align}")
-        self.patch_align = int(patch_align)
+        # True: 各 sample を source の流れの連続した context_length byte にする (PatchPacker 用、labels なし)
+        if contiguous and packing != "document":
+            raise ValueError("contiguous は packing=document 専用")
+        self.contiguous = bool(contiguous)
         # True なら各 source の準備 (shard 取得 + shuffle buffer 充填) の開始/完了を print
         self.verbose = False
         # 複数 source の open と初回充填 (shuffle buffer) を並列化する
@@ -538,7 +535,7 @@ class ByteStreamDataset(IterableDataset):
         active = [True for _ in specs]
         rng = random.Random(self.seed + self._state.samples_emitted)
         off = self.byte_offset
-        block = self.context_length + 1
+        block = self.context_length + (0 if self.contiguous else 1)
         source_names = [
             s.get("id") or s.get("name") or s.get("path") or f"source_{i}"
             for i, s in enumerate(specs)
@@ -703,6 +700,16 @@ class ByteStreamDataset(IterableDataset):
                     raise RuntimeError("internal error: attempted to emit a short non-final pack")
                 seq.extend([self.pad_token_id] * (block - len(seq)))
                 raw_flags.extend([False] * (block - len(raw_flags)))
+            if self.contiguous:
+                pack = pack[block:]
+                pack_is_raw_byte = pack_is_raw_byte[block:]
+                boundary_label_positions = []  # labels は patch_packer が作る
+                return {
+                    "input_ids": torch.tensor(seq, dtype=torch.long),
+                    "source_id": torch.tensor(source_idx, dtype=torch.long),
+                    "fill_ratio": torch.tensor(fill_tokens / max(self.context_length, 1), dtype=torch.float32),
+                    "_source_bytes": sum(raw_flags),
+                }
             ids = torch.tensor(seq[:-1], dtype=torch.long)
             labels = torch.tensor(seq[1:], dtype=torch.long)
             for pos in boundary_label_positions:
@@ -734,12 +741,6 @@ class ByteStreamDataset(IterableDataset):
             tokens = [b + off for b in raw]
             doc_seq = tokens + [self.eos_token_id]
             if pack:
-                # document 境界を patch 境界へ align する (static patch の isolation)。
-                # EOS の後を PAD で patch_align の倍数まで埋め、次文書を境界から始める。
-                if self.patch_align > 1 and (len(pack) % self.patch_align) != 0:
-                    pad_n = (-len(pack)) % self.patch_align
-                    pack.extend([self.pad_token_id] * pad_n)
-                    pack_is_raw_byte.extend([False] * pad_n)
                 boundary_label_positions.append(len(pack) - 1)
             pack.extend(doc_seq)
             pack_is_raw_byte.extend([True] * len(tokens) + [False])
@@ -844,7 +845,7 @@ def build_byte_dataloader(cfg: dict, split: str = "train") -> _ResumableLoader:
         skip_samples=cfg.get("skip_samples", 0),
         sft_loss_on=cfg.get("sft_loss_on", "completion"),
         sft_add_eos=cfg.get("sft_add_eos", True),
-        patch_align=cfg.get("patch_align", 1),
+        contiguous=cfg.get("contiguous", False),
     )
     ds.verbose = split == "train"
     num_workers = cfg.get("num_workers", 4)
