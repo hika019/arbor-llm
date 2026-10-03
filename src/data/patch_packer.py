@@ -349,10 +349,12 @@ class ByteLMStream:
         n_valid = torch.tensor([0 if s is None else s[2] for s in states], device=self.device)
         valid = torch.arange(self.w, device=self.device) >= (self.w - n_valid).unsqueeze(1)
         with torch.no_grad(), self.amp():
-            ent, rest, k_new, v_new = self.score(x, k, v, valid)
-        new_states = []
-        for r, n in enumerate(lengths):
-            k_r = torch.cat((k[:, r], k_new[:, r, :, :n].to(self.dtype)), dim=2)[:, :, -self.w:].clone()
-            v_r = torch.cat((v[:, r], v_new[:, r, :, :n].to(self.dtype)), dim=2)[:, :, -self.w:].clone()
-            new_states.append((k_r, v_r, min((0 if states[r] is None else states[r][2]) + n, self.w)))
+            ent, rest, k_keep, v_keep = self.score(
+                x, k, v, valid, torch.tensor(lengths, device=self.device),
+            )
+        new_states = [
+            (k_keep[:, r].to(self.dtype), v_keep[:, r].to(self.dtype),
+             min((0 if states[r] is None else states[r][2]) + n, self.w))
+            for r, n in enumerate(lengths)
+        ]
         return ent.float(), None if rest is None else rest.float(), new_states

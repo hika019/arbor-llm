@@ -353,11 +353,11 @@ class Attention(nn.Module):
 
 
     def forward_stream(
-        self, x: torch.Tensor, k_ctx: torch.Tensor, v_ctx: torch.Tensor, attn_mask,
+        self, x: torch.Tensor, k_ctx: torch.Tensor, v_ctx: torch.Tensor, attn_mask, keep: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """x (B, T, dim) を、直前 W 位置の K/V (RoPE 前、(B, Hkv, W, hd)) に続けて attend する.
 
-        戻り値は (出力, x の K, x の V)。K/V は RoPE 前。
+        戻り値は (出力, 次の文脈の K, V)。次の文脈は [文脈, x] の keep (B, W) 位置の RoPE 前の K/V。
         """
         b, t, _ = x.shape
         w = k_ctx.size(2)
@@ -366,6 +366,8 @@ class Attention(nn.Module):
         v_new = self.wv(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
         k = torch.cat((k_ctx.to(k_new.dtype), k_new), dim=2)
         v = torch.cat((v_ctx.to(v_new.dtype), v_new), dim=2)
+        idx = keep[:, None, :, None].expand(-1, self.n_kv_heads, -1, self.head_dim)
+        k_keep, v_keep = k.gather(2, idx), v.gather(2, idx)
         cos, sin = self.rope.cos[:w + t].to(q.dtype), self.rope.sin[:w + t].to(q.dtype)
         q, k = _apply_rope(q, cos[w:], sin[w:]), _apply_rope(k, cos, sin)
         n_rep = self.n_heads // self.n_kv_heads
@@ -383,7 +385,7 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).reshape(b, t, -1)
         if self.attn_sub_norm is not None:
             out = self.attn_sub_norm(out)
-        return self.wo(out), k_new, v_new
+        return self.wo(out), k_keep, v_keep
 
 
 class FeedForward(nn.Module):
@@ -948,10 +950,12 @@ class ByteLM(nn.Module):
     @torch.no_grad()
     def boundary_entropy_stream(
         self, input_ids: torch.Tensor, k_ctx: torch.Tensor, v_ctx: torch.Tensor, ctx_valid: torch.Tensor,
+        lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """boundary_entropy を、直前 W 位置の各層 K/V (RoPE 前、(L, B, Hkv, W, hd)) に続けて計算する.
 
-        流れ全体を一度に通したのと同じ値になる。後ろの 2 つは input_ids の各層 K/V (L, B, Hkv, T, hd)。
+        流れ全体を一度に通したのと同じ値になる。後ろの 2 つは各行の実長 lengths (B,) までを読んだ後の
+        直前 W 位置の各層 K/V (L, B, Hkv, W, hd)。
         """
         if self.attention_window is None:
             raise ValueError("boundary_entropy_stream は attention_window が必要")
@@ -959,9 +963,11 @@ class ByteLM(nn.Module):
         if torch.is_autocast_enabled(x.device.type):
             x = x.to(torch.get_autocast_dtype(x.device.type))
         mask = self._stream_mask(ctx_valid, input_ids.size(1))
+        w = ctx_valid.size(1)
+        keep = lengths.unsqueeze(1) + torch.arange(w, device=lengths.device)
         ks, vs = [], []
         for i, layer in enumerate(self.layers):
-            h, k, v = layer.attn.forward_stream(layer.attn_norm(x), k_ctx[i], v_ctx[i], mask)
+            h, k, v = layer.attn.forward_stream(layer.attn_norm(x), k_ctx[i], v_ctx[i], mask, keep)
             x = x + h
             x = x + layer.ffn(layer.ffn_norm(x))
             ks.append(k)
