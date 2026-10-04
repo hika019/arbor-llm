@@ -313,3 +313,23 @@ def test_prefetched_packer_state_dict_resumes_without_gaps():
     for a, b in zip(got, want):
         for k in a:
             assert torch.equal(a[k], b[k]), k
+
+
+def test_byte_buckets_pad_each_batch_to_smallest_fitting_frame():
+    cfg = _cfg("space", max_bytes=96, seq_patches=10)
+    stream = _stream(13)
+    packer = _packer(cfg, "cpu", byte_buckets=[32, 64, 96])
+    out = _run(packer, _batches({0: stream}, 40, 2, [0] * 100))
+    widths = set()
+    for b in out:
+        t = b["input_ids"].size(1)
+        longest = int(b["n_bytes"].max())
+        assert t == min(w for w in (32, 64, 96) if w >= longest)
+        widths.add(t)
+    assert len(widths) > 1
+    assert torch.equal(torch.cat([r[0] for r in _split_rows(out)]), stream)
+
+
+def test_byte_buckets_must_end_at_max_bytes():
+    with pytest.raises(ValueError, match="byte_buckets"):
+        _packer(_cfg("space", max_bytes=96), "cpu", byte_buckets=[32, 64])

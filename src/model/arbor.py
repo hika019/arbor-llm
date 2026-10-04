@@ -1355,15 +1355,18 @@ class ArborModel(nn.Module):
             self.entropy_model = None
 
     # ------------------------------------------------------------- pieces
-    def _byte_doc_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _byte_doc_ids(self, input_ids: torch.Tensor, is_byte: torch.Tensor | None = None) -> torch.Tensor:
         """各バイトが属する文書番号 (B, T) を返す.
 
         packing='document' は文書を EOS 区切りで連結する。EOS の「次」の
         バイトから文書番号が 1 増える (EOS 自身は直前の文書に属す)。判定は
-        過去バイトのみに依存するので causal (未来を見ない)。
+        過去バイトのみに依存するので causal (未来を見ない)。PAD (is_byte が偽) は
+        1 つずつ別の文書にして、local attention で実 byte と互いに見ないようにする。
         """
-        prev_is_eos = F.pad(input_ids == self.cfg.eos_token_id, (1, 0), value=False)[:, :-1]
-        return prev_is_eos.to(torch.long).cumsum(dim=1)
+        new_doc = F.pad(input_ids == self.cfg.eos_token_id, (1, 0), value=False)[:, :-1]
+        if is_byte is not None:
+            new_doc = new_doc | ~is_byte
+        return new_doc.to(torch.long).cumsum(dim=1)
 
     def embed(self, input_ids: torch.Tensor, doc: torch.Tensor) -> torch.Tensor:
         """byte 埋め込み + hash n-gram 埋め込み。BLT 論文どおり n-gram の種類数 + 1 で割る."""
@@ -1521,7 +1524,7 @@ class ArborModel(nn.Module):
         # PAD を 1 つの patch に集めると scatter_add が同じ番地に集中して遅いので散らす
         ar = torch.arange(t, device=input_ids.device)
         patch_id = torch.where(is_byte, (patch_starts.long().cumsum(1) - 1).clamp_min(0), ar % k)
-        doc = self._byte_doc_ids(input_ids)                    # (B, T)
+        doc = self._byte_doc_ids(input_ids, is_byte)
         mask = self._byte_attn_mask(input_ids, doc)
 
         h = self.embed(input_ids, doc)

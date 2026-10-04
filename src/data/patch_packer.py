@@ -72,11 +72,16 @@ class PatchPacker:
         threshold: float | None = None,
         seq_patches: int | None = None,
         max_bytes: int | None = None,
+        byte_buckets: list[int] | None = None,
     ) -> None:
         self.mode = cfg.patching_mode
         self.threshold = float(cfg.entropy_threshold if threshold is None else threshold)
         self.seq_patches = int(seq_patches or cfg.seq_patches)
         self.max_bytes = int(max_bytes or cfg.max_bytes)
+        # 系列の byte 長の枠。batch ごとに最長の行が入る最小の枠へ PAD する (最後は max_bytes)
+        self.byte_buckets = sorted(int(b) for b in (byte_buckets or [self.max_bytes]))
+        if self.byte_buckets[-1] != self.max_bytes:
+            raise ValueError(f"byte_buckets の最大 {self.byte_buckets[-1]} は max_bytes {self.max_bytes} と一致させる")
         self.min_len, max_len = patch_len_bounds(cfg)
         self.soft_len = soft_patch_len(self.mode, max_len)
         # 枠より長い patch は系列に入らない
@@ -256,7 +261,8 @@ class PatchPacker:
         return {"input_ids": ids, "labels": labels, "patch_starts": starts, "n_patches": n}
 
     def _collate(self, rows: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        b, t = len(rows), self.max_bytes
+        longest = max(row["input_ids"].numel() for row in rows)
+        b, t = len(rows), next(n for n in self.byte_buckets if n >= longest)
         ids = torch.full((b, t), self.pad, dtype=torch.long)
         labels = torch.full((b, t), -100, dtype=torch.long)
         starts = torch.zeros((b, t), dtype=torch.bool)

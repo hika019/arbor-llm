@@ -1203,7 +1203,8 @@ def apply_compile_settings(
         f"[train] torch_compile=ON mode={mode} "
         f"compile_threads={os.environ.get('TORCHINDUCTOR_COMPILE_THREADS')}"
     )
-    return torch.compile(model, mode=mode)
+    # byte_buckets で入力長が数通りあるので、長さごとに静的なグラフにする
+    return torch.compile(model, mode=mode, dynamic=False)
 
 
 def build_validation_model(
@@ -1756,6 +1757,7 @@ def main() -> int:
             return PatchPacker(
                 base_model.cfg, base_model.entropy_model, chunk_len=int(data_cfg["context_length"]), device=device,
                 compute_dtype=compute_dtype, use_autocast=use_autocast, compile_entropy=compile_entropy,
+                byte_buckets=cfg["speed"].get("byte_buckets"),
             )
 
         packer = make_packer(compile_entropy=bool(cfg["speed"].get("torch_compile", False)) and device.type == "cuda")
@@ -2004,6 +2006,7 @@ def main() -> int:
     interval_patches = 0
     interval_rows = 0
     interval_short_rows = 0
+    interval_frame_bytes = 0
     interval_fill_ratio_tensor: torch.Tensor | None = None
     interval_fill_samples = 0
     interval_byte_kind: dict[str, torch.Tensor] = {}
@@ -2099,6 +2102,9 @@ def main() -> int:
         timing_mark("make_data_iter_done", device)
         return data_iter
 
+    loss_unit = int(data_cfg["micro_batch_size"]) * (
+        packer.max_bytes if packer is not None else int(data_cfg["context_length"])
+    )
     if cuda_prefetch:
         print("[train] cuda_prefetch=ON")
     if cpu_prefetch_depth > 0:
@@ -2202,7 +2208,8 @@ def main() -> int:
             step_t0 = time.perf_counter()
             bytes_this_step = 0
             grad_accum = accum_schedule.accum_at(global_step)
-            # 固定の分母で backward し、optimizer の前に有効 label 数で補正する (全 byte を等重みに)
+            # step 内で共通の固定分母 (枠の長さが micro-batch ごとに違っても同じ) で backward し、
+            # optimizer の前に有効 label 数で補正する (全 byte を等重みに)
             loss_denom = 0
             valid_labels = None
             for micro in range(grad_accum):
@@ -2234,6 +2241,7 @@ def main() -> int:
                     timing_mark(f"step0_micro{micro}_batch_on_device", device)
                 if "n_bytes" in batch:
                     batch_bytes = int(batch["n_bytes"].sum())
+                    interval_frame_bytes += inputs.numel()
                     interval_patches += int(batch["n_patches"].sum())
                     interval_rows += int(batch["n_patches"].numel())
                     interval_short_rows += int((batch["n_patches"] < packer.seq_patches).sum())
@@ -2279,7 +2287,7 @@ def main() -> int:
                         # flat_losses[valid].mean() は boolean インデックスで
                         # device→host 同期するため、マスク乗算 + sum で同値を取る
                         valid_f = (labels.flatten() != -100).to(flat_losses.dtype)
-                        loss = (flat_losses * valid_f).sum() / (grad_accum * labels.numel())
+                        loss = (flat_losses * valid_f).sum() / (grad_accum * loss_unit)
                         stats = byte_kind_loss_stats(flat_losses, labels, cpu=False)
                         for key, value in stats.items():
                             if not torch.is_tensor(value):
@@ -2288,8 +2296,8 @@ def main() -> int:
                     else:
                         loss = torch.nn.functional.cross_entropy(
                             out.logits.flatten(0, 1), labels.flatten(), ignore_index=-100, reduction="sum",
-                        ) / (grad_accum * labels.numel())
-                loss_denom = grad_accum * labels.numel()
+                        ) / (grad_accum * loss_unit)
+                loss_denom = grad_accum * loss_unit
                 n_valid = (labels != -100).sum()
                 valid_labels = n_valid if valid_labels is None else valid_labels + n_valid
                 if global_step == 0:
@@ -2451,7 +2459,8 @@ def main() -> int:
                 bytes_per_patch = interval_bytes / interval_patches if interval_patches else 0.0
                 patches_per_seq = interval_patches / interval_rows if interval_rows else 0.0
                 bytes_per_seq = interval_bytes / interval_rows if interval_rows else 0.0
-                frame_fill = bytes_per_seq / packer.max_bytes if packer is not None else 0.0
+                frame_fill = interval_bytes / interval_frame_bytes if interval_frame_bytes else 0.0
+                frame_len = interval_frame_bytes / interval_rows if interval_rows else 0.0
                 short_rows = interval_short_rows / interval_rows if interval_rows else 0.0
                 phase = (
                     "steady"
@@ -2501,7 +2510,7 @@ def main() -> int:
                 patch_text = (
                     f"patches/s={cur_patches_s:.0f} bytes/patch={bytes_per_patch:.2f} "
                     f"bytes/seq={bytes_per_seq:.0f} patches/seq={patches_per_seq:.1f} "
-                    f"frame_fill={frame_fill * 100:.1f}% short_rows={short_rows * 100:.1f}% "
+                    f"frame={frame_len:.0f} frame_fill={frame_fill * 100:.1f}% short_rows={short_rows * 100:.1f}% "
                     if packer is not None
                     else ""
                 )
@@ -2527,6 +2536,7 @@ def main() -> int:
                         "patches_per_seq": round(patches_per_seq, 6),
                         "bytes_per_seq": round(bytes_per_seq, 3),
                         "frame_fill": round(frame_fill, 6),
+                        "frame_len": round(frame_len, 1),
                         "short_rows": round(short_rows, 6),
                         "pack_fill": round(avg_fill_ratio, 6),
                         "fwd_ms": round(fwd_ms, 3),
@@ -2547,6 +2557,7 @@ def main() -> int:
                 interval_patches = 0
                 interval_rows = 0
                 interval_short_rows = 0
+                interval_frame_bytes = 0
                 interval_fill_ratio_tensor = None
                 interval_fill_samples = 0
                 interval_byte_kind = {}

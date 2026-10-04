@@ -1146,3 +1146,30 @@ def test_microbatches_with_different_valid_labels_match_one_batch(max_norm):
     scale_and_clip_grads_(head.parameters(), grad_accum * labels[0].numel() / valid.float(), max_norm)
     for p, want in zip(head.parameters(), ref_grads):
         assert torch.allclose(p.grad, want, atol=1e-6)
+
+
+def test_fixed_denominator_weights_bytes_equally_across_frame_lengths():
+    """枠の長さが違う micro-batch でも、step 共通の固定分母 + 有効 label 数の補正で全 byte 等重み."""
+    from src.train.train import scale_and_clip_grads_
+
+    torch.manual_seed(1)
+    head = torch.nn.Linear(8, 5)
+    micro = [(torch.randn(1, 4, 8), torch.randint(0, 5, (1, 4))),
+             (torch.randn(1, 9, 8), torch.randint(0, 5, (1, 9)))]
+    micro[1][1][0, 6:] = -100
+    xs = torch.cat([x.flatten(0, 1) for x, _ in micro])
+    ys = torch.cat([y.flatten() for _, y in micro])
+    ref = torch.nn.functional.cross_entropy(head(xs), ys, ignore_index=-100)
+    ref_grads = torch.autograd.grad(ref, list(head.parameters()))
+
+    head.zero_grad()
+    denom = len(micro) * 9  # grad_accum × 行数 × max_bytes
+    valid = None
+    for x, y in micro:
+        loss = torch.nn.functional.cross_entropy(head(x[0]), y[0], ignore_index=-100, reduction="sum") / denom
+        loss.backward()
+        n = (y != -100).sum()
+        valid = n if valid is None else valid + n
+    scale_and_clip_grads_(head.parameters(), denom / valid.float(), None)
+    for p, want in zip(head.parameters(), ref_grads):
+        assert torch.allclose(p.grad, want, atol=1e-6)

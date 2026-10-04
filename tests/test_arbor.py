@@ -946,3 +946,11 @@ def test_char_rest_generator_runs_in_bf16_without_autocast():
         for b in _utf8_heavy_ids(12, 5).tolist():
             gen.push(b)
     assert gen.prev_rest != 0.0
+
+
+def test_pad_bytes_get_their_own_documents():
+    m = ArborModel(ArborConfig.from_dict(tiny_cfg("static")))
+    ids = torch.tensor([[10, 11, 2, 12, 13, 3, 3, 3]])
+    doc = m._byte_doc_ids(ids, ids != 3)
+    assert doc[0, :5].tolist() == [0, 0, 0, 1, 1]
+    assert len(set(doc[0, 5:].tolist())) == 3 and int(doc[0, 5:].min()) > 1

@@ -207,6 +207,7 @@ speed:
   bitnet_weight_cache_min_numel: 0
   sync_each_step: false         # 毎 step synchronize しない (ログ/保存時の scalar 化で同期)
   micro_batch_size: 2           # patch16 + local 1/2層で余裕があれば 4 も A/B 候補
+  byte_buckets: [4096, 6144, 8192]  # 系列の byte 長の枠 (最後は model.max_bytes)。batch の最長の行が入る最小の枠へ PAD
   # 固定値 (例: 32) か [[step, accum], ...] の step 関数 (batch size warmup, Ai2 "Critical Batch Size
   # Revisited": 序盤は臨界 batch が小さいので小さく始める)。VRAM には影響しない (micro_batch_size が決める)。
   # lr schedule の進行は消費 bytes 割合で測る。ByteLM A/B (2026-09-14): 1→2→4 warmup は固定より bpb -0.043。
